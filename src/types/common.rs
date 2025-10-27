@@ -68,6 +68,16 @@ pub struct L1BlockInfo {
     pub timestamp: Timestamp,
 }
 
+/// Minimal information needed to identify an L1 block and check for reorgs.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct L1BlockId {
+    /// The hash of this block.
+    pub hash: BlockHash,
+
+    /// The parent of this block, used for reorg detection.
+    pub parent: BlockHash,
+}
+
 /// Information about the exiting of a node from the node set.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct NodeExit {
