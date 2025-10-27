@@ -452,7 +452,7 @@ pub trait L1Persistence {
         &self,
         block: L1BlockId,
         timestamp: Timestamp,
-        node_set_diff: impl IntoIterator<Item = &'a FullNodeSetDiff>,
-        wallets_diff: impl IntoIterator<Item = (Address, &'a WalletDiff)>,
+        node_set_diff: impl IntoIterator<Item = &'a FullNodeSetDiff> + Send,
+        wallets_diff: impl IntoIterator<Item = (Address, &'a WalletDiff)> + Send,
     ) -> impl Send + Future<Output = Result<()>>;
 }
