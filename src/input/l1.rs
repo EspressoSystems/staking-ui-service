@@ -22,6 +22,9 @@ use crate::{
     },
 };
 
+mod rpc_stream;
+pub use rpc_stream::RpcStream;
+
 /// In-memory state populated by the L1 input source.
 #[derive(Clone, Debug)]
 pub struct State<S> {

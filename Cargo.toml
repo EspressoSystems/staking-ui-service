@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 alloy = "1.0"
 async-lock = "3.0"
+clap = "4.4"
 derive_more = "2.0"
 futures = "0.3"
 hotshot-contract-adapter = { git = "https://github.com/EspressoSystems/espresso-network.git" }
@@ -13,4 +14,5 @@ im = { version = "15", features = ["serde"] }
 serde = { version = "1.0", features = ["derive"] }
 tagged-base64 = "0.4"
 tide-disco = "0.9"
+tokio = "1"
 tracing = "0.1"

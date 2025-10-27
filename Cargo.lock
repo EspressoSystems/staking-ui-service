@@ -6399,6 +6399,7 @@ version = "0.1.0"
 dependencies = [
  "alloy",
  "async-lock 3.4.1",
+ "clap",
  "derive_more 2.0.1",
  "futures",
  "hotshot-contract-adapter",
@@ -6406,6 +6407,7 @@ dependencies = [
  "serde",
  "tagged-base64",
  "tide-disco",
+ "tokio",
  "tracing",
 ]
 
