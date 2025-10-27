@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct FullNodeSetSnapshot {
     /// The list of registered nodes.
-    pub nodes: Vec<NodeSetEntry>,
+    pub nodes: im::Vector<NodeSetEntry>,
 
     /// The block at which this snapshot was taken
     pub l1_block: L1BlockInfo,
@@ -45,7 +45,7 @@ pub struct ActiveNodeSetSnapshot {
     pub espresso_block: EpochAndBlock,
 
     /// The list of active nodes.
-    pub nodes: Vec<ActiveNodeSetEntry>,
+    pub nodes: im::Vector<ActiveNodeSetEntry>,
 }
 
 /// A change to the active node set.
