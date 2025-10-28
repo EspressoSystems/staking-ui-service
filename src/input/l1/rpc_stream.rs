@@ -320,7 +320,7 @@ impl Stream for RpcStream {
                     self.last_finalized.clone(),
                 );
 
-                self.reconnecting = Some(Box::pin(reconnect_future));
+                self.reconnecting = Some(reconnect_future);
 
                 Poll::Pending
             }
@@ -346,17 +346,8 @@ mod tests {
         let anvil = Anvil::new().block_time(1).spawn();
         let url = anvil.endpoint().parse::<Url>().unwrap();
 
-        let options = L1ClientOptions {
-            http_providers: vec![url],
-            l1_ws_provider: None,
-            l1_retry_delay: Duration::from_secs(1),
-            l1_polling_interval: Duration::from_secs(1),
-            subscription_timeout: Duration::from_secs(120),
-            l1_frequent_failure_tolerance: Duration::from_secs(60),
-            l1_consecutive_failure_tolerance: 10,
-            l1_failover_revert: Duration::from_secs(1800),
-            l1_rate_limit_delay: None,
-        };
+        let mut options = L1ClientOptions::default();
+        options.http_providers = vec![http_url];
 
         let mut stream = RpcStream::new(options).await.unwrap();
 
