@@ -18,3 +18,7 @@ build profile="dev" features="":
 
 test *args:
     cargo nextest run --locked --workspace --verbose {{args}}
+
+coverage:
+    cargo llvm-cov nextest
+    cargo llvm-cov report --html
