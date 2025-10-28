@@ -51,6 +51,13 @@ impl Error {
             status: StatusCode::GONE,
         }
     }
+
+    pub fn internal() -> Self {
+        Self {
+            message: "internal server error".to_string(),
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
 }
 
 impl Display for Error {
