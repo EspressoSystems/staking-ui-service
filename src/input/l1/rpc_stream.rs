@@ -347,7 +347,7 @@ mod tests {
         let url = anvil.endpoint().parse::<Url>().unwrap();
 
         let mut options = L1ClientOptions::default();
-        options.http_providers = vec![http_url];
+        options.http_providers = vec![url];
 
         let mut stream = RpcStream::new(options).await.unwrap();
 
