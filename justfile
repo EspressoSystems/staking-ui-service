@@ -11,7 +11,7 @@ fix *args:
     cargo clippy --fix {{args}}
 
 lint *args:
-    cargo clippy {{args}} -- -D warnings
+    cargo clippy --all-targets {{args}} -- -D warnings
 
 build profile="dev" features="":
     cargo build --profile {{profile}} {{features}}

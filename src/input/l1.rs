@@ -7,10 +7,9 @@ use std::{
 
 use alloy::primitives::BlockHash;
 use async_lock::{RwLock, RwLockUpgradableReadGuard, RwLockWriteGuard};
+use espresso_types::v0_3::StakeTableEvent;
 use futures::stream::{Stream, StreamExt};
-use hotshot_contract_adapter::sol_types::{
-    RewardClaim::RewardClaimEvents, StakeTableV2::StakeTableV2Events,
-};
+use hotshot_contract_adapter::sol_types::RewardClaim::RewardClaimEvents;
 use tracing::instrument;
 
 use crate::{
@@ -245,11 +244,16 @@ impl<S: L1Persistence> State<S> {
         Ok(())
     }
 
+    /// Reset the state back to the last persisted finalized state.
     async fn reorg(&mut self, _stream: &mut impl ResettableStream) -> Result<()> {
         tracing::warn!("reorg detected");
         todo!()
     }
 
+    /// Handle a new finalized block.
+    ///
+    /// The caller must ensure that `finalized` is in the range `0..self.blocks.len()`, and that the
+    /// corresponding block is indeed finalized.
     async fn finalize(&mut self, finalized: u64) -> Result<()> {
         tracing::info!(?finalized, "new finalized block");
 
@@ -293,8 +297,10 @@ impl<S: L1Persistence> State<S> {
 
     /// Garbage collect in-memory blocks.
     ///
-    /// Brings thee new `finalized` block to the front of the `blocks` list, deleting all blocks
+    /// Brings the new `finalized` block to the front of the `blocks` list, deleting all blocks
     /// before it.
+    ///
+    /// The caller must ensure that `finalized` is in the range `0..self.blocks.len()`.
     fn garbage_collect(&mut self, finalized: u64) {
         // Bring the new finalized block to the front of the list, shifting all now-old blocks to
         // the end.
@@ -309,7 +315,7 @@ impl<S: L1Persistence> State<S> {
 }
 
 /// Snapshots and updates for each L1 block.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 struct BlockData {
     /// The L1 block.
     block: L1BlockId,
@@ -371,11 +377,20 @@ impl BlockData {
 
         // Keep track of changes we apply.
         let mut node_set_update = vec![];
-        let mut wallets_update = BTreeMap::default();
+        let mut wallets_update = BTreeMap::<Address, Vec<WalletDiff>>::default();
 
-        for _event in &input.events {
-            // TODO convert contract events into either node set or wallet updates, and apply
-            // updates to state snapshots.
+        for event in &input.events {
+            // Convert contract events into either node set or wallet updates, and apply updates
+            // to state snapshots.
+            let (nodes_diff, wallets_diff) = event.diffs();
+            for diff in nodes_diff {
+                apply_node_set_diff(&mut node_set, &diff);
+                node_set_update.push(diff);
+            }
+            for (address, diff) in wallets_diff {
+                apply_wallet_diff(&mut wallets, address, &diff);
+                wallets_update.entry(address).or_default().push(diff);
+            }
         }
 
         Self {
@@ -389,8 +404,16 @@ impl BlockData {
     }
 }
 
+fn apply_node_set_diff(_snapshot: &mut FullNodeSetSnapshot, _diff: &FullNodeSetDiff) {
+    // TODO
+}
+
+fn apply_wallet_diff(_snapshot: &mut WalletsSnapshot, _address: Address, _diff: &WalletDiff) {
+    // TODO
+}
+
 /// The minimal data we need in order to ingest a new L1 block.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct BlockInput {
     /// The L1 block.
     pub block: L1BlockId,
@@ -406,14 +429,21 @@ pub struct BlockInput {
 }
 
 /// The set of L1 events that we care about.
-#[derive(Clone, derive_more::Debug)]
+#[derive(Clone, Debug)]
 pub enum L1Event {
     /// An event emitted by the reward claim contract.
     Reward(Arc<RewardClaimEvents>),
 
     /// An event emitted by the stake table contract.
-    #[debug("StakeTableV2Events")]
-    StakeTable(Arc<StakeTableV2Events>),
+    StakeTable(Arc<StakeTableEvent>),
+}
+
+impl L1Event {
+    /// Extract changes to our state snapshot caused by this event.
+    pub fn diffs(&self) -> (Vec<FullNodeSetDiff>, Vec<(Address, WalletDiff)>) {
+        // TODO
+        (vec![], vec![])
+    }
 }
 
 /// A stream of information incoming from the L1.
@@ -455,4 +485,504 @@ pub trait L1Persistence {
         node_set_diff: impl IntoIterator<Item = &'a FullNodeSetDiff> + Send,
         wallets_diff: impl IntoIterator<Item = (Address, &'a WalletDiff)> + Send,
     ) -> impl Send + Future<Output = Result<()>>;
+}
+
+#[cfg(test)]
+mod test {
+    use std::{
+        pin::Pin,
+        task::{Context, Poll},
+        time::{Duration, Instant},
+    };
+
+    use alloy::primitives::keccak256;
+    use espresso_types::v0::validators_from_l1_events;
+    use tagged_base64::TaggedBase64;
+    use tide_disco::{Error as _, StatusCode};
+
+    use crate::types::common::{Delegation, NodeSetEntry, Ratio};
+
+    use super::*;
+
+    /// Easy-setup storage that just uses memory.
+    #[derive(Clone, Debug)]
+    struct MemoryStorage {
+        snapshot: Arc<RwLock<PersistentSnapshot>>,
+    }
+
+    impl Default for MemoryStorage {
+        fn default() -> Self {
+            let block = block_id(0);
+            Self {
+                snapshot: Arc::new(RwLock::new(PersistentSnapshot {
+                    block,
+                    timestamp: 0,
+                    node_set: FullNodeSetSnapshot {
+                        nodes: Default::default(),
+                        l1_block: L1BlockInfo {
+                            number: block.number,
+                            hash: block.hash,
+                            timestamp: 0,
+                        },
+                    },
+                    wallets: Default::default(),
+                })),
+            }
+        }
+    }
+
+    impl L1Persistence for MemoryStorage {
+        async fn finalized_snapshots(&self) -> Result<PersistentSnapshot> {
+            Ok(self.snapshot.read().await.clone())
+        }
+
+        async fn apply_events<'a>(
+            &self,
+            block: L1BlockId,
+            timestamp: Timestamp,
+            node_set_diff: impl IntoIterator<Item = &'a FullNodeSetDiff> + Send,
+            wallets_diff: impl IntoIterator<Item = (Address, &'a WalletDiff)> + Send,
+        ) -> Result<()> {
+            let mut snapshot = self.snapshot.write().await;
+
+            for diff in node_set_diff {
+                apply_node_set_diff(&mut snapshot.node_set, diff);
+            }
+            for (address, diff) in wallets_diff {
+                apply_wallet_diff(&mut snapshot.wallets, address, diff);
+            }
+            snapshot.block = block;
+            snapshot.timestamp = timestamp;
+
+            Ok(())
+        }
+    }
+
+    /// Storage that always fails.
+    #[derive(Clone, Copy, Debug, Default)]
+    struct FailStorage;
+
+    impl L1Persistence for FailStorage {
+        async fn finalized_snapshots(&self) -> Result<PersistentSnapshot> {
+            Err(Error::catch_all(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "FailStorage".into(),
+            ))
+        }
+
+        async fn apply_events<'a>(
+            &self,
+            _block: L1BlockId,
+            _timestamp: Timestamp,
+            _node_set_diff: impl IntoIterator<Item = &'a FullNodeSetDiff> + Send,
+            _wallets_diff: impl IntoIterator<Item = (Address, &'a WalletDiff)> + Send,
+        ) -> Result<()> {
+            Err(Error::catch_all(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "FailStorage".into(),
+            ))
+        }
+    }
+
+    /// Resettable stream that yields a predefined list of inputs.
+    #[derive(Clone, Debug, Default)]
+    struct VecStream {
+        inputs: Vec<BlockInput>,
+        pos: usize,
+    }
+
+    impl Stream for VecStream {
+        type Item = BlockInput;
+
+        fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            assert!(
+                self.pos < self.inputs.len(),
+                "reached end of predefined input stream"
+            );
+            let poll = Poll::Ready(Some(self.inputs[self.pos].clone()));
+            self.pos += 1;
+            poll
+        }
+    }
+
+    impl ResettableStream for VecStream {
+        async fn reset(&mut self, number: u64) {
+            self.pos = self
+                .inputs
+                .iter()
+                .position(|input| input.block.number == number)
+                .unwrap_or_else(|| panic!("cannot reset to unknown block height {number}"));
+        }
+    }
+
+    /// Generate a block ID for testing.
+    fn block_id(number: u64) -> L1BlockId {
+        let parent = keccak256(number.saturating_sub(1).to_le_bytes());
+        let hash = keccak256(number.to_le_bytes());
+        L1BlockId {
+            number,
+            hash,
+            parent,
+        }
+    }
+
+    /// Generate a test L1 block with no staking-related data.
+    fn empty_block(number: u64) -> BlockData {
+        let block = block_id(number);
+        let timestamp = 12 * number;
+        BlockData {
+            block,
+            timestamp,
+            node_set: FullNodeSetSnapshot {
+                nodes: Default::default(),
+                l1_block: L1BlockInfo {
+                    number,
+                    hash: block.hash,
+                    timestamp,
+                },
+            },
+            node_set_update: Some(Default::default()),
+            wallets: Default::default(),
+            wallets_update: Some(Default::default()),
+        }
+    }
+
+    /// Generate a test [`State`] from a list of L1 blocks.
+    fn from_blocks<S: Default>(blocks: impl IntoIterator<Item = BlockData>) -> State<S> {
+        let mut state = State::<S> {
+            blocks: Default::default(),
+            blocks_by_hash: Default::default(),
+            storage: S::default(),
+        };
+        for block in blocks {
+            state
+                .blocks_by_hash
+                .insert(block.block.hash, block.block.number);
+            state.blocks.push(block);
+        }
+        state
+    }
+
+    /// Generate an arbitrary node for testing.
+    fn make_node(i: usize) -> NodeSetEntry {
+        let address = Address::random();
+        let staking_key = TaggedBase64::new("KEY", &i.to_le_bytes()).unwrap();
+        NodeSetEntry {
+            address,
+            staking_key,
+            stake: i.try_into().unwrap(),
+            commission: Ratio::new(5, 100),
+        }
+    }
+
+    /// Generate an empty wallet snapshot for testing.
+    fn empty_wallet(l1_block: L1BlockInfo) -> WalletSnapshot {
+        WalletSnapshot {
+            l1_block,
+            nodes: Default::default(),
+            pending_exits: Default::default(),
+            pending_undelegations: Default::default(),
+            claimed_rewards: Default::default(),
+        }
+    }
+
+    /// Generate a random L1 input for testing.
+    fn random_block_input(number: u64) -> BlockInput {
+        BlockInput {
+            block: block_id(number),
+            finalized: block_id(0),
+            timestamp: 12 * number,
+            events: vec![], // TODO generate random events
+        }
+    }
+
+    #[test_log::test]
+    fn test_gc() {
+        for finalized in 0..3 {
+            tracing::info!(finalized, "test garbage collection");
+            let blocks = (0..3).map(empty_block).collect::<Vec<_>>();
+            let mut state = from_blocks::<MemoryStorage>(blocks.clone());
+
+            state.garbage_collect(finalized as u64);
+
+            assert_eq!(&state.blocks, &blocks[finalized..]);
+            assert_eq!(state.blocks.len(), state.blocks_by_hash.len());
+            for block in &state.blocks {
+                assert_eq!(state.blocks_by_hash[&block.block.hash], block.block.number);
+            }
+        }
+    }
+
+    #[test_log::test]
+    fn test_api_l1_block() {
+        let block = empty_block(1);
+        let state = from_blocks::<MemoryStorage>([block.clone()]);
+
+        // Query for old block.
+        let err = state.l1_block(0).unwrap_err();
+        assert_eq!(err.status(), StatusCode::GONE);
+
+        // Query for future block.
+        let err = state.l1_block(2).unwrap_err();
+        assert_eq!(err.status(), StatusCode::NOT_FOUND);
+
+        // Query for known block.
+        assert_eq!(state.l1_block(1).unwrap(), block.block);
+        assert_eq!(state.latest_l1_block(), block.block);
+    }
+
+    #[test_log::test]
+    fn test_api_node_set() {
+        let mut finalized = empty_block(0);
+        finalized.node_set_update = None;
+
+        let mut block = empty_block(1);
+        let node = make_node(0);
+        block.node_set.nodes.push_back(node.clone());
+        block.node_set_update = Some(vec![FullNodeSetDiff::NodeUpdate(node)]);
+
+        let state = from_blocks::<MemoryStorage>([finalized.clone(), block.clone()]);
+
+        // Query for unknown block.
+        let unknown = empty_block(2).block.hash;
+        let err = state.full_node_set(unknown).unwrap_err();
+        assert_eq!(err.status(), StatusCode::NOT_FOUND);
+        let err = state.full_node_set_update(unknown).unwrap_err();
+        assert_eq!(err.status(), StatusCode::NOT_FOUND);
+
+        // Query for deleted update.
+        let err = state
+            .full_node_set_update(finalized.block.hash)
+            .unwrap_err();
+        assert_eq!(err.status(), StatusCode::GONE);
+
+        // Query for known block.
+        assert_eq!(
+            state.full_node_set(block.block.hash).unwrap(),
+            block.node_set
+        );
+        let update = state.full_node_set_update(block.block.hash).unwrap();
+        assert_eq!(&update.diff, block.node_set_update.as_ref().unwrap());
+        assert_eq!(update.l1_block, block.block_info());
+    }
+
+    #[test_log::test]
+    fn test_api_wallet() {
+        let mut finalized = empty_block(0);
+        finalized.wallets_update = None;
+
+        let address = Address::random();
+        let delegation = Delegation {
+            delegator: address,
+            node: Address::random(),
+            amount: Default::default(),
+            effective: Default::default(),
+        };
+        let wallet = WalletSnapshot {
+            nodes: vec![delegation].into(),
+            ..empty_wallet(finalized.block_info())
+        };
+
+        let mut block = empty_block(1);
+        block.wallets.insert(address, wallet.clone());
+        block
+            .wallets_update
+            .as_mut()
+            .unwrap()
+            .insert(address, vec![WalletDiff::DelegatedToNode(delegation)]);
+        // Let `address` be known even in the finalized snapshot, so we can test queries for a known
+        // wallet in a block whose update field has been deleted.
+        finalized.wallets = block.wallets.clone();
+        // Insert a second wallet that is not updated by this block, so we can test queries for
+        // updates for a known wallet with no non-trivial update.
+        let not_updated = Address::random();
+        let not_updated_wallet = empty_wallet(finalized.block_info());
+        block
+            .wallets
+            .insert(not_updated, not_updated_wallet.clone());
+
+        let state = from_blocks::<MemoryStorage>([finalized.clone(), block.clone()]);
+
+        // Query for unknown block.
+        let unknown = empty_block(2).block.hash;
+        let err = state.wallet(address, unknown).unwrap_err();
+        assert_eq!(err.status(), StatusCode::NOT_FOUND);
+        let err = state.wallet_update(address, unknown).unwrap_err();
+        assert_eq!(err.status(), StatusCode::NOT_FOUND);
+
+        // Query for unknown address.
+        let err = state
+            .wallet(Address::random(), block.block.hash)
+            .unwrap_err();
+        assert_eq!(err.status(), StatusCode::NOT_FOUND);
+        let err = state
+            .wallet_update(Address::random(), block.block.hash)
+            .unwrap_err();
+        assert_eq!(err.status(), StatusCode::NOT_FOUND);
+
+        // Query for known address with no updates.
+        assert_eq!(
+            state.wallet(not_updated, block.block.hash).unwrap(),
+            not_updated_wallet
+        );
+        assert_eq!(
+            state.wallet_update(not_updated, block.block.hash).unwrap(),
+            WalletUpdate {
+                l1_block: block.block_info(),
+                diff: vec![]
+            }
+        );
+
+        // Query for deleted update.
+        let err = state
+            .wallet_update(address, finalized.block.hash)
+            .unwrap_err();
+        assert_eq!(err.status(), StatusCode::GONE);
+
+        // Query for known wallet.
+        assert_eq!(state.wallet(address, block.block.hash).unwrap(), wallet);
+        let update = state.wallet_update(address, block.block.hash).unwrap();
+        assert_eq!(&update.diff, &[WalletDiff::DelegatedToNode(delegation)]);
+        assert_eq!(update.l1_block, block.block_info());
+    }
+
+    #[test_log::test]
+    fn test_replay_consistency() {
+        let mut block = empty_block(0);
+        let mut events = vec![];
+
+        let inputs = (0..100).map(random_block_input);
+        for input in inputs {
+            // Compute the full node set snapshot as the staking UI service would do it.
+            block = block.next(&input);
+
+            // Compute the Espresso validator set as the protocol does it.
+            events.extend(input.events.iter().filter_map(|event| match event {
+                L1Event::StakeTable(ev) => Some(ev.as_ref().clone()),
+                _ => None,
+            }));
+            let validators = validators_from_l1_events(events.iter().cloned()).unwrap().0;
+            assert_eq!(validators.len(), block.node_set.nodes.len());
+            for node in &block.node_set.nodes {
+                let validator = &validators[&node.address];
+                assert_eq!(node.address, validator.account);
+                assert_eq!(
+                    node.commission,
+                    Ratio::new(validator.commission.into(), 10_000),
+                );
+                assert_eq!(node.stake, validator.stake);
+                assert_eq!(node.staking_key, validator.stake_table_key.into());
+            }
+        }
+    }
+
+    #[test_log::test]
+    fn test_large_state() {
+        let mut block = empty_block(0);
+
+        // Realistically large state: 500 registered validators, 10000 delegators, each delegating
+        // to 10 different nodes.
+        for i in 0..500 {
+            block.node_set.nodes.push_back(make_node(i));
+        }
+        for i in 0..10_000 {
+            let delegator = Address::random();
+            let mut wallet = empty_wallet(block.block_info());
+            for j in 0..10 {
+                let node = block.node_set.nodes[(i + j) % block.node_set.nodes.len()].address;
+                let delegation = Delegation {
+                    delegator,
+                    node,
+                    amount: 1.try_into().unwrap(),
+                    effective: Default::default(),
+                };
+                wallet.nodes.push_back(delegation);
+            }
+            block.wallets.insert(delegator, wallet);
+        }
+
+        // Apply random events. It should take on average no more than 12 seconds (although in
+        // practice it should be much less), since that is how long we have to process an L1 block
+        // in the real world.
+        let inputs = (0..100).map(random_block_input);
+        let start = Instant::now();
+        for input in inputs {
+            block = block.next(&input);
+        }
+        let elapsed = start.elapsed();
+        tracing::info!(?elapsed, avg_duration = ?elapsed / 100, "processed 100 inputs");
+        assert!(elapsed / 100 < Duration::from_secs(12));
+    }
+
+    #[test_log::test(tokio::test(flavor = "multi_thread"))]
+    async fn test_finalize_success() {
+        let inputs = (1..3).map(random_block_input).collect::<Vec<_>>();
+        let stream = &mut VecStream::default();
+
+        // Start with just the finalized state.
+        let state = RwLock::new(from_blocks::<MemoryStorage>([empty_block(0)]));
+
+        // Apply blocks without finalizing a new block.
+        for input in &inputs {
+            State::handle_block(state.upgradable_read().await, stream, input)
+                .await
+                .unwrap();
+        }
+
+        // Apply a finalized block.
+        let mut finalized = random_block_input(3);
+        finalized.finalized = block_id(2);
+        State::handle_block(state.upgradable_read().await, stream, &finalized)
+            .await
+            .unwrap();
+
+        // Check that the new block has been added and state has been garbage collected.
+        let state = state.read().await;
+        assert_eq!(state.blocks.len(), 2);
+        assert_eq!(state.blocks[0].block, block_id(2));
+        assert_eq!(state.blocks[1].block, block_id(3));
+        assert_eq!(state.blocks_by_hash.len(), 2);
+        assert_eq!(
+            state.blocks_by_hash[&finalized.finalized.hash],
+            finalized.finalized.number
+        );
+        assert_eq!(
+            state.blocks_by_hash[&finalized.block.hash],
+            finalized.block.number
+        );
+
+        // Check that the finalized snapshot has been persisted.
+        assert_eq!(
+            state.storage.finalized_snapshots().await.unwrap().block,
+            finalized.finalized
+        );
+    }
+
+    #[test_log::test(tokio::test(flavor = "multi_thread"))]
+    async fn test_finalize_storage_failure() {
+        let inputs = (1..3).map(random_block_input).collect::<Vec<_>>();
+        let stream = &mut VecStream::default();
+
+        // Start with just the finalized state.
+        let state = RwLock::new(from_blocks::<FailStorage>([empty_block(0)]));
+
+        // Apply blocks without finalizing a new block.
+        for input in &inputs {
+            State::handle_block(state.upgradable_read().await, stream, input)
+                .await
+                .unwrap();
+        }
+
+        // Apply a finalized block. Storing the finalized snapshot will fail, and on failure the
+        // state should not be modified.
+        let initial_state = { state.read().await.clone() };
+        let mut finalized = random_block_input(3);
+        finalized.finalized = block_id(2);
+        State::handle_block(state.upgradable_read().await, stream, &finalized)
+            .await
+            .unwrap_err();
+        let final_state = state.read().await;
+        assert_eq!(initial_state.blocks, final_state.blocks);
+        assert_eq!(initial_state.blocks_by_hash, final_state.blocks_by_hash);
+    }
 }

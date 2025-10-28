@@ -6,7 +6,7 @@ use super::common::{
 use serde::{Deserialize, Serialize};
 
 /// A snapshot of the full node set, according to the staking contract, at a point in time.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub struct FullNodeSetSnapshot {
     /// The list of registered nodes.
     pub nodes: im::Vector<NodeSetEntry>,
@@ -16,7 +16,7 @@ pub struct FullNodeSetSnapshot {
 }
 
 /// A change to the full node set.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub struct FullNodeSetUpdate {
     /// The block at which this change occurred.
     pub l1_block: L1BlockInfo,
@@ -26,7 +26,7 @@ pub struct FullNodeSetUpdate {
 }
 
 /// A single update to the full node set.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub enum FullNodeSetDiff {
     /// A change in information about a specific node.
     ///
@@ -39,7 +39,7 @@ pub enum FullNodeSetDiff {
 }
 
 /// A snapshot of the active node set, according to the Espresso, at a point in time.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub struct ActiveNodeSetSnapshot {
     /// The block at which this snapshot was taken.
     pub espresso_block: EpochAndBlock,
@@ -49,7 +49,7 @@ pub struct ActiveNodeSetSnapshot {
 }
 
 /// A change to the active node set.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub struct ActiveNodeSetUpdate {
     /// The block at which this change occurred.
     pub espresso_block: EpochAndBlock,
@@ -59,7 +59,7 @@ pub struct ActiveNodeSetUpdate {
 }
 
 /// A single update to the active node set.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub enum ActiveNodeSetDiff {
     /// An update to the leader participation change of the relevant nodes.
     LeaderParticipationChange(Vec<ParticipationChange>),

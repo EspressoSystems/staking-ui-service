@@ -1,7 +1,5 @@
 //! Primitive types.
 
-use std::cmp::Ordering;
-
 use serde::{Deserialize, Serialize};
 
 pub use alloy::primitives::{Address, BlockHash, U256};
@@ -17,30 +15,14 @@ pub type Timestamp = u64;
 #[derive(Clone, Copy, Debug, PartialEq, Deserialize, Serialize)]
 pub struct Ratio(f32);
 
-// We enforce that a ratio is never infinite or NaN, so the comparison caveats for the underlying
-// floating point type do not apply for `Ratio`.
-impl Eq for Ratio {}
-
-impl Ord for Ratio {
-    fn cmp(&self, other: &Self) -> Ordering {
-        if self < other {
-            Ordering::Less
-        } else if self > other {
-            Ordering::Greater
-        } else {
-            Ordering::Equal
-        }
-    }
-}
-
-impl PartialOrd for Ratio {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
+impl Ratio {
+    pub fn new(num: usize, den: usize) -> Self {
+        Self((num as f32) / (den as f32))
     }
 }
 
 /// An entry in the full node set.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub struct NodeSetEntry {
     /// Node's Ethereum address.
     pub address: Address,
@@ -95,7 +77,7 @@ pub struct NodeExit {
 }
 
 /// Information about the current "time" on the Espresso chain.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub struct EpochAndBlock {
     /// The current epoch of the Espresso chain
     pub epoch: u64,
@@ -108,7 +90,7 @@ pub struct EpochAndBlock {
 }
 
 /// An entry in the active node set.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Deserialize, Serialize)]
 pub struct ActiveNodeSetEntry {
     /// The node's address.
     pub address: Address,
@@ -121,7 +103,7 @@ pub struct ActiveNodeSetEntry {
 }
 
 /// A general participation percentage change for a node.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Deserialize, Serialize)]
 pub struct ParticipationChange {
     /// The address of the node whose participation percentage is changing.
     pub address: Address,
