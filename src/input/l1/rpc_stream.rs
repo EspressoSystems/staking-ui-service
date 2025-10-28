@@ -25,6 +25,8 @@ use std::{
 use tide_disco::Url;
 use tokio::time::sleep;
 
+type ReconnectFuture = Pin<Box<dyn Future<Output = Result<BoxStream<'static, BlockInput>>> + Send>>;
+
 /// An L1 event stream based on a standard JSON-RPC server.
 pub struct RpcStream {
     /// Current block stream
@@ -41,8 +43,7 @@ pub struct RpcStream {
     /// todo:
     last_finalized: Arc<RwLock<L1BlockId>>,
     /// Pending reconnection future
-    reconnecting:
-        Option<Pin<Box<dyn Future<Output = Result<BoxStream<'static, BlockInput>>> + Send>>>,
+    reconnecting: Option<ReconnectFuture>,
 }
 
 impl std::fmt::Debug for RpcStream {
@@ -219,7 +220,7 @@ impl RpcStream {
         ws_urls: Option<Vec<Url>>,
         opt: L1ClientOptions,
         last_finalized: Arc<RwLock<L1BlockId>>,
-    ) -> Pin<Box<dyn Future<Output = Result<BoxStream<'static, BlockInput>>> + Send>> {
+    ) -> ReconnectFuture {
         Box::pin(async move {
             let retry_delay = opt.l1_retry_delay;
             let polling_interval = opt.l1_polling_interval;
@@ -286,11 +287,12 @@ impl Stream for RpcStream {
     type Item = BlockInput;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        if let Some(mut reconnect_future) = self.reconnecting.take() {
+        if let Some(reconnect_future) = self.reconnecting.as_mut() {
             match reconnect_future.as_mut().poll(cx) {
                 Poll::Ready(Ok(new_stream)) => {
                     tracing::info!("Successfully reconnected to L1 block stream");
                     self.stream = new_stream;
+                    self.reconnecting = None;
                 }
                 Poll::Ready(Err(err)) => {
                     panic!(
@@ -298,7 +300,6 @@ impl Stream for RpcStream {
                     );
                 }
                 Poll::Pending => {
-                    self.reconnecting = Some(reconnect_future);
                     return Poll::Pending;
                 }
             }
@@ -346,8 +347,10 @@ mod tests {
         let anvil = Anvil::new().block_time(1).spawn();
         let url = anvil.endpoint().parse::<Url>().unwrap();
 
-        let mut options = L1ClientOptions::default();
-        options.http_providers = vec![url];
+        let options = L1ClientOptions {
+            http_providers: vec![url],
+            ..Default::default()
+        };
 
         let mut stream = RpcStream::new(options).await.unwrap();
 
@@ -368,9 +371,11 @@ mod tests {
         let http_url = anvil.endpoint().parse::<Url>().unwrap();
         let ws_url = anvil.ws_endpoint().parse::<Url>().unwrap();
 
-        let mut options = L1ClientOptions::default();
-        options.http_providers = vec![http_url];
-        options.l1_ws_provider = Some(vec![ws_url]);
+        let options = L1ClientOptions {
+            http_providers: vec![http_url],
+            l1_ws_provider: Some(vec![ws_url]),
+            ..Default::default()
+        };
 
         let mut stream = RpcStream::new(options).await.unwrap();
 
@@ -396,20 +401,22 @@ mod tests {
         let anvil2 = Anvil::new().block_time(1).spawn();
         let http_url2 = anvil2.endpoint().parse::<Url>().unwrap();
 
-        let mut options = L1ClientOptions::default();
-        options.http_providers = vec![http_url1.clone(), http_url2.clone()];
-        options.l1_retry_delay = Duration::from_millis(100);
+        let options = L1ClientOptions {
+            http_providers: vec![http_url1.clone(), http_url2.clone()],
+            l1_retry_delay: Duration::from_millis(100),
+            ..Default::default()
+        };
 
         let mut stream = RpcStream::new(options).await.unwrap();
 
-        for i in 1..=3 {
+        for _i in 1..=3 {
             let block_input = stream.next().await.unwrap();
             assert!(block_input.block.number > 0);
         }
 
         drop(anvil1);
 
-        for i in 1..=5 {
+        for _i in 1..=5 {
             let block_input = stream.next().await.unwrap();
 
             assert!(block_input.block.number > 0);
