@@ -368,9 +368,6 @@ mod tests {
         let http_url = anvil.endpoint().parse::<Url>().unwrap();
         let ws_url = anvil.ws_endpoint().parse::<Url>().unwrap();
 
-        println!("HTTP URL: {}", http_url);
-        println!("WS URL: {}", ws_url);
-
         let mut options = L1ClientOptions::default();
         options.http_providers = vec![http_url];
         options.l1_ws_provider = Some(vec![ws_url]);
@@ -387,6 +384,35 @@ mod tests {
             assert!(block_input.block.number == last_block_number + 1);
             last_block_number = block_input.block.number;
             println!("Received block {i}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_l1_stream_reconnect() {
+        // Start two Anvil instances
+        let anvil1 = Anvil::new().block_time(1).spawn();
+        let http_url1 = anvil1.endpoint().parse::<Url>().unwrap();
+
+        let anvil2 = Anvil::new().block_time(1).spawn();
+        let http_url2 = anvil2.endpoint().parse::<Url>().unwrap();
+
+        let mut options = L1ClientOptions::default();
+        options.http_providers = vec![http_url1.clone(), http_url2.clone()];
+        options.l1_retry_delay = Duration::from_millis(100);
+
+        let mut stream = RpcStream::new(options).await.unwrap();
+
+        for i in 1..=3 {
+            let block_input = stream.next().await.unwrap();
+            assert!(block_input.block.number > 0);
+        }
+
+        drop(anvil1);
+
+        for i in 1..=5 {
+            let block_input = stream.next().await.unwrap();
+
+            assert!(block_input.block.number > 0);
         }
     }
 }
