@@ -2,16 +2,19 @@
 
 use std::{
     collections::{BTreeMap, HashMap},
+    future::Future,
     sync::Arc,
 };
 
 use alloy::primitives::BlockHash;
 use async_lock::{RwLock, RwLockUpgradableReadGuard, RwLockWriteGuard};
 use futures::stream::{Stream, StreamExt};
-use hotshot_contract_adapter::sol_types::{
-    RewardClaim::RewardClaimEvents, StakeTableV2::StakeTableV2Events,
-};
 use tracing::instrument;
+
+#[derive(Clone, Debug)]
+pub struct RewardClaimEvents;
+#[derive(Clone, Debug)]
+pub struct StakeTableV2Events;
 
 use crate::{
     error::{Error, Result, ensure},
@@ -406,13 +409,12 @@ pub struct BlockInput {
 }
 
 /// The set of L1 events that we care about.
-#[derive(Clone, derive_more::Debug)]
+#[derive(Clone, Debug)]
 pub enum L1Event {
     /// An event emitted by the reward claim contract.
     Reward(Arc<RewardClaimEvents>),
 
     /// An event emitted by the stake table contract.
-    #[debug("StakeTableV2Events")]
     StakeTable(Arc<StakeTableV2Events>),
 }
 
