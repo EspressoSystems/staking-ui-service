@@ -21,8 +21,10 @@ runs:
     - uses: rui314/setup-mold@v1
     - uses: extractions/setup-just@v3
 
-    - name: Enable Rust Caching
-      uses: Swatinem/rust-cache@v2
+    - uses: Swatinem/rust-cache@v2
+      with:
+        save-if: ${{ github.ref == 'refs/heads/main'  }}
+        shared-key: build-${{ inputs.platform }}
 
     - name: Cargo Build
       shell: bash
