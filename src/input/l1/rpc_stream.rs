@@ -506,22 +506,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    #[test_log::test]
-    async fn test_rpc_stream_reset() {
-        let anvil = Anvil::new()
-            .block_time(2)
-            .args(["--slots-in-an-epoch", "0"])
-            .spawn();
-        let url = anvil.endpoint().parse::<Url>().unwrap();
-
-        let options = L1ClientOptions {
-            http_providers: vec![url],
-            ..Default::default()
-        };
-
-        let mut stream = RpcStream::new(options).await.unwrap();
-
+    /// Helper function to test reset functionality for RpcStream
+    async fn test_reset_logic(stream: &mut RpcStream) {
         let mut last_block_number = 0;
         for i in 1..=10 {
             println!("Waiting for block {i}");
@@ -545,7 +531,7 @@ mod tests {
             assert_eq!(block_input.block.number, i, "Expected block {i}");
         }
 
-        println!(" Reset to genesis");
+        println!("Reset to genesis");
         stream.reset(0).await;
         let block = stream.next().await.expect("Stream ended unexpectedly");
         assert_eq!(
@@ -553,7 +539,7 @@ mod tests {
             "Expected block 1 after reset to genesis"
         );
 
-        println!(" Reset to block 1");
+        println!("Reset to block 1");
         stream.reset(1).await;
         let block = stream.next().await.expect("Stream ended unexpectedly");
         assert_eq!(
@@ -561,7 +547,7 @@ mod tests {
             "Expected block 2 after reset to block 1"
         );
 
-        println!(" Reset to current block");
+        println!("Reset to current block");
         for _ in 3..=10 {
             stream.next().await.expect("Stream ended unexpectedly");
         }
@@ -591,7 +577,7 @@ mod tests {
 
         for expected in 11..=20 {
             let block = stream.next().await.expect("Stream ended unexpectedly");
-            assert_eq!(block.block.number, expected,);
+            assert_eq!(block.block.number, expected);
         }
 
         println!("Reset to future block");
@@ -601,5 +587,47 @@ mod tests {
             block.block.number, 51,
             "Expected block 51 after reset to block 50"
         );
+    }
+
+    #[tokio::test]
+    #[test_log::test]
+    async fn test_rpc_stream_reset_http() {
+        let anvil = Anvil::new()
+            .block_time(2)
+            .args(["--slots-in-an-epoch", "0"])
+            .spawn();
+        let url = anvil.endpoint().parse::<Url>().unwrap();
+
+        let options = L1ClientOptions {
+            http_providers: vec![url],
+            ..Default::default()
+        };
+
+        let mut stream = RpcStream::new(options).await.unwrap();
+        println!("Testing HTTP stream reset");
+
+        test_reset_logic(&mut stream).await;
+    }
+
+    #[tokio::test]
+    #[test_log::test]
+    async fn test_rpc_stream_reset_websocket() {
+        let anvil = Anvil::new()
+            .block_time(2)
+            .args(["--slots-in-an-epoch", "0"])
+            .spawn();
+        let http_url = anvil.endpoint().parse::<Url>().unwrap();
+        let ws_url = anvil.ws_endpoint().parse::<Url>().unwrap();
+
+        let options = L1ClientOptions {
+            http_providers: vec![http_url],
+            l1_ws_provider: Some(vec![ws_url]),
+            ..Default::default()
+        };
+
+        let mut stream = RpcStream::new(options).await.unwrap();
+        println!("Testing WebSocket stream reset");
+
+        test_reset_logic(&mut stream).await;
     }
 }
