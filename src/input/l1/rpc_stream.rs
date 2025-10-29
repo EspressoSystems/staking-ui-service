@@ -106,6 +106,7 @@ impl RpcStreamBuilder {
             tracing::warn!("Failed to subscribe to blocks: {err:#}");
             crate::Error::internal().context(format!("Failed to subscribe using ws: {err}"))
         })?;
+        tracing::info!(%url, "Successfully connected to WebSocket provider and subscribed to blocks");
 
         let provider = self.provider.clone();
         let last_block_number = self.last_block_number.clone();
@@ -121,29 +122,7 @@ impl RpcStreamBuilder {
                 let last_block_number = last_block_number.clone();
 
                 async move {
-                    let new_block_number = head.number;
-                    let prev_block_number = *last_block_number.read().await;
-                    let mut new_blocks = Vec::new();
-
-                    if let Some(prev) = prev_block_number {
-                        if new_block_number <= prev {
-                            tracing::info!(
-                                "Skipping block {new_block_number} as it's not newer than previous block {prev}"
-                            );
-                            return Vec::new();
-                        }
-
-                        if new_block_number != prev + 1 {
-                           let  missing_blocks =  fetch_missing_blocks(&provider, prev, new_block_number, retry_delay)
-                                    .await;
-
-                            new_blocks.extend(missing_blocks);
-                        }
-                    }
-
-                    new_blocks.push(head);
-                    *last_block_number.write().await = Some(new_block_number);
-                    new_blocks
+                    process_block_header(&provider, &last_block_number, head, retry_delay).await
                 }
             })
             .map(stream::iter)
@@ -196,39 +175,16 @@ impl RpcStreamBuilder {
                         }
                     };
 
-                    let new_block_number = block.header.number;
-                    let prev_block_number = *last_block_number.read().await;
-
-                    tracing::info!(
-                        "last_block = {prev_block_number:?}, new_block={new_block_number}"
-                    );
-
-                    let mut new_blocks = Vec::new();
-
-                    if let Some(prev) = prev_block_number {
-                        if new_block_number <= prev {
-                            tracing::info!(
-                                "Skipping block {new_block_number} as it's not newer than previous block {prev}"
-                            );
-                            return Vec::new();
-                        }
-
-                        if new_block_number != prev + 1 {
-                            let  missing_blocks =  fetch_missing_blocks(&provider, prev, new_block_number, retry_delay)
-                                    .await;
-
-                            new_blocks.extend(missing_blocks);
-                        }
-                    }
-
-                    new_blocks.push(block.header);
-                    *last_block_number.write().await = Some(new_block_number);
-                    new_blocks
+                    process_block_header(&provider, &last_block_number, block.header, retry_delay)
+                        .await
                 }
             })
             .map(stream::iter)
             .flatten()
-            .take_until(async move { switch_notify.notified().await })
+            .take_until(async move {
+                switch_notify.notified().await;
+                tracing::warn!("HTTP stream shutting down due to provider switch");
+            })
             .then(move |head| {
                 let provider = provider.clone();
                 async move {
@@ -253,9 +209,15 @@ impl RpcStreamBuilder {
             };
 
             match res {
-                Ok(stream) => return stream,
+                Ok(stream) => {
+                    tracing::info!(attempt = i, "Successfully established L1 block stream");
+                    return stream;
+                }
                 Err(err) => {
-                    tracing::warn!("Failed to establish stream: {err}, retrying...");
+                    tracing::warn!(
+                        attempt = i,
+                        "Failed to establish stream: {err}, retrying..."
+                    );
                     sleep(self.options.l1_retry_delay).await;
                 }
             }
@@ -309,9 +271,16 @@ impl ResettableStream for RpcStream {
                 finalized.number
             )));
         }
+        let old_block_number = *self.builder.last_block_number.read().await;
 
         // Update last_block_number to the reset block
         *self.builder.last_block_number.write().await = Some(block);
+
+        tracing::info!(
+            old_block = ?old_block_number,
+            new_block = block,
+            "Updated last_block_number, recreating stream"
+        );
 
         // Recreate the stream to discard any buffered blocks from the flatten().
         // The missing fetch logic returns a vector which gets flattened into individual blocks.
@@ -350,6 +319,45 @@ async fn fetch_finalized(
         }
         sleep(retry_delay).await;
     }
+}
+
+/// Process a new block header, handling missing blocks
+/// and updating last_block_number.
+/// Returns a vector of headers in order, including any missing blocks that were fetched.
+async fn process_block_header(
+    provider: &Arc<RootProvider<Ethereum>>,
+    last_block_number: &Arc<RwLock<Option<u64>>>,
+    new_header: Header,
+    retry_delay: Duration,
+) -> Vec<Header> {
+    let new_block_number = new_header.number;
+    let prev_block_number = *last_block_number.read().await;
+
+    let mut new_blocks = Vec::new();
+
+    if let Some(prev) = prev_block_number {
+        if new_block_number <= prev {
+            tracing::info!(
+                "Skipping block {new_block_number} as it's not newer than previous block {prev}"
+            );
+            return Vec::new();
+        }
+
+        if new_block_number != prev + 1 {
+            let missing_blocks =
+                fetch_missing_blocks(provider, prev, new_block_number, retry_delay).await;
+
+            tracing::info!(
+                fetched_count = missing_blocks.len(),
+                "Successfully fetched missing blocks"
+            );
+            new_blocks.extend(missing_blocks);
+        }
+    }
+
+    new_blocks.push(new_header);
+    *last_block_number.write().await = Some(new_block_number);
+    new_blocks
 }
 
 /// Fetch missing blocks with retry logic.
