@@ -220,7 +220,7 @@ impl<S: L1Persistence> State<S> {
         if head.block.number != prev.number + 1 || head.block.parent != prev.hash {
             tracing::warn!(?head, ?prev, "new head does not extend previous head");
             let mut state = RwLockUpgradableReadGuard::upgrade(state).await;
-            state.reorg(stream).await?;
+            state.reorg(stream).await;
             return Ok(());
         }
 
@@ -249,7 +249,7 @@ impl<S: L1Persistence> State<S> {
                     %expected_hash,
                     "block finalized with different hash than originally seen"
                 );
-                write_state.reorg(stream).await?;
+                write_state.reorg(stream).await;
                 return Ok(());
             }
 
@@ -278,14 +278,13 @@ impl<S: L1Persistence> State<S> {
     }
 
     /// Reset the state back to the last persisted finalized state.
-    async fn reorg(&mut self, stream: &mut impl ResettableStream) -> Result<()> {
+    async fn reorg(&mut self, stream: &mut impl ResettableStream) {
         tracing::warn!("reorg detected, resetting to finalized state");
         stream.reset(self.blocks[0].block.number).await;
         self.blocks.truncate(1);
         self.blocks_by_hash = [(self.blocks[0].block.hash, self.blocks[0].block.number)]
             .into_iter()
             .collect();
-        Ok(())
     }
 
     /// Handle a new finalized block.
