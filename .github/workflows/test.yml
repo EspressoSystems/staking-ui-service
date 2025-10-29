@@ -30,7 +30,6 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: "staking-ui-service-test"
-          save-if: true
 
       - name: Install nextest
         uses: taiki-e/install-action@nextest
