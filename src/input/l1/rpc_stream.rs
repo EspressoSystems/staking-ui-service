@@ -29,7 +29,6 @@ struct RpcStreamBuilder {
     /// Transport for switching between HTTP providers
     transport: SwitchingTransport,
     options: L1ClientOptions,
-    last_block_number: Arc<RwLock<Option<u64>>>,
 }
 
 /// An L1 event stream based on a standard JSON-RPC server.
@@ -56,44 +55,54 @@ impl RpcStreamBuilder {
         let rpc_client = RpcClient::new(transport.clone(), false);
         let provider = Arc::new(RootProvider::new(rpc_client));
 
-        let last_block_number = Arc::new(RwLock::new(None));
-
         Ok(Self {
             provider,
             transport,
             options,
-            last_block_number,
         })
     }
 
     /// Build the RpcStream
     async fn build(self) -> RpcStream {
         let builder = Arc::new(self);
-        let stream = builder.clone().stream_with_reconnect().await;
+        let stream = builder.clone().stream_with_reconnect(None).await;
         RpcStream { stream, builder }
     }
 
     /// Create the stream wrapper with reconnection
-    async fn stream_with_reconnect(self: Arc<Self>) -> BoxStream<'static, BlockInput> {
-        let stream = self.establish_stream().await;
+    async fn stream_with_reconnect(
+        self: Arc<Self>,
+        last_block: Option<u64>,
+    ) -> BoxStream<'static, BlockInput> {
+        let stream = self.establish_stream(last_block).await;
 
-        stream::unfold((self.clone(), stream), |(builder, mut stream)| async move {
-            loop {
-                match stream.next().await {
-                    Some(item) => return Some((item, (builder, stream))),
-                    None => {
-                        sleep(builder.options.l1_retry_delay).await;
-                        tracing::warn!("L1 block stream ended, reconnecting...");
-                        stream = builder.establish_stream().await;
-                        tracing::info!("Successfully reconnected to L1 block stream");
+        stream::unfold(
+            (self.clone(), stream, last_block),
+            |(builder, mut stream, mut last_block)| async move {
+                loop {
+                    match stream.next().await {
+                        Some(item) => {
+                            last_block = Some(item.block.number);
+                            return Some((item, (builder, stream, last_block)));
+                        }
+                        None => {
+                            sleep(builder.options.l1_retry_delay).await;
+                            tracing::warn!("L1 block stream ended, reconnecting...");
+                            stream = builder.establish_stream(last_block).await;
+                            tracing::info!("Successfully reconnected to L1 block stream");
+                        }
                     }
                 }
-            }
-        })
+            },
+        )
         .boxed()
     }
 
-    async fn create_ws_stream(&self, url: &Url) -> Result<BoxStream<'static, BlockInput>> {
+    async fn create_ws_stream(
+        &self,
+        url: &Url,
+        last_block: Option<u64>,
+    ) -> Result<BoxStream<'static, BlockInput>> {
         let ws = ProviderBuilder::new()
             .connect_ws(WsConnect::new(url.clone()))
             .await
@@ -109,7 +118,7 @@ impl RpcStreamBuilder {
         tracing::info!(%url, "Successfully connected to WebSocket provider and subscribed to blocks");
 
         let provider = self.provider.clone();
-        let last_block_number = self.last_block_number.clone();
+        let last_block_number = Arc::new(RwLock::new(last_block));
         let retry_delay = self.options.l1_retry_delay;
 
         let provider_for_fetch = provider.clone();
@@ -137,7 +146,10 @@ impl RpcStreamBuilder {
             .boxed())
     }
 
-    async fn create_http_stream(&self) -> Result<BoxStream<'static, BlockInput>> {
+    async fn create_http_stream(
+        &self,
+        last_block: Option<u64>,
+    ) -> Result<BoxStream<'static, BlockInput>> {
         let poller = self
             .provider
             .watch_blocks()
@@ -149,7 +161,7 @@ impl RpcStreamBuilder {
             .into_stream();
 
         let provider = self.provider.clone();
-        let last_block_number = self.last_block_number.clone();
+        let last_block_number = Arc::new(RwLock::new(last_block));
         let retry_delay = self.options.l1_retry_delay;
         let switch_notify = self.transport.switch_notify.clone();
 
@@ -196,16 +208,16 @@ impl RpcStreamBuilder {
     }
 
     /// Establish a new block stream connection
-    async fn establish_stream(&self) -> BoxStream<'static, BlockInput> {
+    async fn establish_stream(&self, last_block: Option<u64>) -> BoxStream<'static, BlockInput> {
         // Try to establish connection with retries
         for i in 0.. {
             let res = match &self.options.l1_ws_provider {
                 Some(urls) => {
                     let provider_index = i % urls.len();
                     let url = &urls[provider_index];
-                    self.create_ws_stream(url).await
+                    self.create_ws_stream(url, last_block).await
                 }
-                None => self.create_http_stream().await,
+                None => self.create_http_stream(last_block).await,
             };
 
             match res {
@@ -260,22 +272,15 @@ impl ResettableStream for RpcStream {
     async fn reset(&mut self, block: u64) {
         tracing::info!("Resetting RpcStream to block {block}");
 
-        let old_block_number = *self.builder.last_block_number.read().await;
-
-        // Update last_block_number to the reset block
-        *self.builder.last_block_number.write().await = Some(block);
-
-        tracing::info!(
-            old_block = ?old_block_number,
-            new_block = block,
-            "Updated last_block_number, recreating stream"
-        );
-
         // Recreate the stream to discard any buffered blocks from the flatten().
         // The missing fetch logic returns a vector which gets flattened into individual blocks.
         // Without recreating the stream, next() would continue with buffered blocks
         // instead of triggering the missing fetch from the reset point.
-        self.stream = self.builder.clone().stream_with_reconnect().await;
+        self.stream = self
+            .builder
+            .clone()
+            .stream_with_reconnect(Some(block))
+            .await;
 
         tracing::warn!(
             "Reset RpcStream to block {block} (will resume from block {})",
