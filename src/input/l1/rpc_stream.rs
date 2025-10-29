@@ -593,11 +593,11 @@ mod tests {
         }
 
         println!("Reset to future block");
-        stream.reset(40).await;
+        stream.reset(50).await;
         let block = stream.next().await.expect("Stream ended unexpectedly");
         assert_eq!(
-            block.block.number, 101,
-            "Expected block 101 after reset to block 100"
+            block.block.number, 50,
+            "Expected block 51 after reset to block 50"
         );
     }
 }
