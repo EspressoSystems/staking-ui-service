@@ -596,7 +596,7 @@ mod tests {
         stream.reset(50).await;
         let block = stream.next().await.expect("Stream ended unexpectedly");
         assert_eq!(
-            block.block.number, 50,
+            block.block.number, 51,
             "Expected block 51 after reset to block 50"
         );
     }
