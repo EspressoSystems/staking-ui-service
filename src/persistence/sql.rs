@@ -22,7 +22,11 @@ impl Persistence {
 }
 
 impl L1Persistence for Persistence {
-    async fn finalized_snapshots(&self) -> Result<PersistentSnapshot> {
+    async fn finalized_snapshot(&self) -> Result<Option<PersistentSnapshot>> {
+        todo!()
+    }
+
+    async fn save_genesis(&self, _snapshot: PersistentSnapshot) -> Result<()> {
         todo!()
     }
 

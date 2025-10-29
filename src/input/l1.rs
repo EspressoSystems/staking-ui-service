@@ -47,8 +47,18 @@ pub struct State<S> {
 
 impl<S: L1Persistence> State<S> {
     /// Create a new L1 input data source.
-    pub async fn new(storage: S) -> Result<Self> {
-        let snapshot = storage.finalized_snapshots().await?;
+    ///
+    /// Previously saved state will be loaded from `storage` if possible. If there is no previous
+    /// state in storage, the given genesis state will be used.
+    pub async fn new(storage: S, genesis: PersistentSnapshot) -> Result<Self> {
+        let snapshot = match storage.finalized_snapshot().await? {
+            Some(snapshot) => snapshot,
+            None => {
+                storage.save_genesis(genesis.clone()).await?;
+                genesis
+            }
+        };
+
         let finalized = BlockData {
             block: snapshot.block,
             timestamp: snapshot.timestamp,
@@ -487,7 +497,7 @@ pub trait ResettableStream: Unpin + Stream<Item = BlockInput> {
 }
 
 /// The information which must be stored in persistent storage.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PersistentSnapshot {
     pub block: L1BlockId,
     pub timestamp: Timestamp,
@@ -495,10 +505,30 @@ pub struct PersistentSnapshot {
     pub wallets: WalletsSnapshot,
 }
 
+impl PersistentSnapshot {
+    /// An empty genesis snapshot starting at the given L1 block.
+    pub fn genesis(block: L1BlockId, timestamp: Timestamp) -> Self {
+        Self {
+            block,
+            timestamp,
+            node_set: FullNodeSetSnapshot {
+                nodes: Default::default(),
+                l1_block: L1BlockInfo {
+                    number: block.number,
+                    hash: block.hash,
+                    timestamp,
+                },
+            },
+            wallets: Default::default(),
+        }
+    }
+}
+
 /// Persistent storage for the L1 data.
 pub trait L1Persistence: Send {
-    /// Fetch the latest persisted snapshots.
-    fn finalized_snapshots(&self) -> impl Send + Future<Output = Result<PersistentSnapshot>>;
+    /// Fetch the latest persisted snapshot.
+    fn finalized_snapshot(&self)
+    -> impl Send + Future<Output = Result<Option<PersistentSnapshot>>>;
 
     /// Apply changes to persistent storage up to the specified L1 block.
     fn apply_events(
@@ -508,6 +538,10 @@ pub trait L1Persistence: Send {
         node_set_diff: impl IntoIterator<Item = FullNodeSetDiff> + Send,
         wallets_diff: impl IntoIterator<Item = (Address, WalletDiff)> + Send,
     ) -> impl Send + Future<Output = Result<()>>;
+
+    /// Save an initial snapshot to a previously empty database.
+    fn save_genesis(&self, snapshot: PersistentSnapshot)
+    -> impl Send + Future<Output = Result<()>>;
 }
 
 #[cfg(test)]
@@ -529,35 +563,19 @@ mod test {
     use super::*;
 
     /// Easy-setup storage that just uses memory.
-    #[derive(Clone, Debug)]
+    #[derive(Clone, Debug, Default)]
     struct MemoryStorage {
-        snapshot: Arc<RwLock<PersistentSnapshot>>,
-    }
-
-    impl Default for MemoryStorage {
-        fn default() -> Self {
-            let block = block_id(0);
-            Self {
-                snapshot: Arc::new(RwLock::new(PersistentSnapshot {
-                    block,
-                    timestamp: 0,
-                    node_set: FullNodeSetSnapshot {
-                        nodes: Default::default(),
-                        l1_block: L1BlockInfo {
-                            number: block.number,
-                            hash: block.hash,
-                            timestamp: 0,
-                        },
-                    },
-                    wallets: Default::default(),
-                })),
-            }
-        }
+        snapshot: Arc<RwLock<Option<PersistentSnapshot>>>,
     }
 
     impl L1Persistence for MemoryStorage {
-        async fn finalized_snapshots(&self) -> Result<PersistentSnapshot> {
+        async fn finalized_snapshot(&self) -> Result<Option<PersistentSnapshot>> {
             Ok(self.snapshot.read().await.clone())
+        }
+
+        async fn save_genesis(&self, snapshot: PersistentSnapshot) -> Result<()> {
+            *self.snapshot.write().await = Some(snapshot);
+            Ok(())
         }
 
         async fn apply_events(
@@ -567,7 +585,8 @@ mod test {
             node_set_diff: impl IntoIterator<Item = FullNodeSetDiff> + Send,
             wallets_diff: impl IntoIterator<Item = (Address, WalletDiff)> + Send,
         ) -> Result<()> {
-            let mut snapshot = self.snapshot.write().await;
+            let mut lock = self.snapshot.write().await;
+            let snapshot = lock.get_or_insert(PersistentSnapshot::genesis(block_id(0), 0));
 
             for diff in node_set_diff {
                 apply_node_set_diff(&mut snapshot.node_set, &diff);
@@ -587,7 +606,14 @@ mod test {
     struct FailStorage;
 
     impl L1Persistence for FailStorage {
-        async fn finalized_snapshots(&self) -> Result<PersistentSnapshot> {
+        async fn finalized_snapshot(&self) -> Result<Option<PersistentSnapshot>> {
+            Err(Error::catch_all(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "FailStorage".into(),
+            ))
+        }
+
+        async fn save_genesis(&self, _snapshot: PersistentSnapshot) -> Result<()> {
             Err(Error::catch_all(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "FailStorage".into(),
@@ -664,6 +690,7 @@ mod test {
                 } else {
                     // In some cases, we want to emulate the realistic behavior of an L1 stream,
                     // which is blocking when no more blocks are readily available.
+                    tracing::warn!("reached end of predefined input stream, blocking indefinitely");
                     return Poll::Pending;
                 }
             }
@@ -1026,7 +1053,13 @@ mod test {
 
         // Check that the finalized snapshot has been persisted.
         assert_eq!(
-            state.storage.finalized_snapshots().await.unwrap().block,
+            state
+                .storage
+                .finalized_snapshot()
+                .await
+                .unwrap()
+                .unwrap()
+                .block,
             finalized.finalized
         );
     }
@@ -1176,8 +1209,76 @@ mod test {
 
         // Block 1 should have become finalized.
         assert_eq!(
-            state.storage.finalized_snapshots().await.unwrap().block,
+            state
+                .storage
+                .finalized_snapshot()
+                .await
+                .unwrap()
+                .unwrap()
+                .block,
             inputs[0].block
         );
+    }
+
+    #[test_log::test(tokio::test(flavor = "multi_thread"))]
+    async fn test_restart() {
+        let mut stream = VecStream::infinite();
+        stream.push(random_block_input(1));
+        // Second block finalizes the first block.
+        let mut block_2 = random_block_input(2);
+        block_2.finalized = block_id(1);
+        stream.push(block_2);
+
+        // Start up and run until block 1 is finalized.
+        let genesis = PersistentSnapshot::genesis(block_id(0), 0);
+        let storage = MemoryStorage::default();
+        let state = Arc::new(RwLock::new(
+            State::new(storage.clone(), genesis.clone()).await.unwrap(),
+        ));
+        // Initializing the state should cause a genesis snapshot to be saved.
+        assert_eq!(
+            storage.finalized_snapshot().await.unwrap().unwrap(),
+            genesis
+        );
+        let task = spawn(State::subscribe(state.clone(), stream));
+        let state = loop {
+            sleep(Duration::from_millis(100)).await;
+            let state = state.read().await;
+            if state.blocks[0].block.number == 1 {
+                task.abort();
+                break state;
+            }
+        };
+        assert_eq!(state.blocks.len(), 2);
+        assert_eq!(
+            storage.finalized_snapshot().await.unwrap().unwrap().block,
+            block_id(1)
+        );
+        drop(state);
+
+        // Restart and check that we reload the finalized snapshot (and don't use the genesis, for
+        // which we will pass in some nonsense).
+        let genesis = PersistentSnapshot::genesis(block_id(1000), 12_000);
+        let state = State::new(storage.clone(), genesis).await.unwrap();
+        assert_eq!(state.blocks.len(), 1);
+        assert_eq!(state.blocks[0].block, block_id(1));
+
+        // Subscribe to new blocks starting from where we left off (with block 1 being finalized,
+        // the next block would be block 2).
+        let mut stream = VecStream::infinite();
+        stream.push(random_block_input(2));
+        let state = Arc::new(RwLock::new(state));
+        let task = spawn(State::subscribe(state.clone(), stream));
+        let state = loop {
+            sleep(Duration::from_millis(100)).await;
+            let state = state.read().await;
+            if state.blocks.len() >= 2 {
+                task.abort();
+                break state;
+            }
+        };
+        assert_eq!(state.blocks.len(), 2);
+        assert_eq!(state.blocks[0].block, block_id(1));
+        assert_eq!(state.blocks[1].block, block_id(2));
     }
 }

@@ -1,7 +1,10 @@
 //! An L1 event stream based on a standard JSON-RPC server.
 
 use super::{BlockInput, ResettableStream};
-use crate::Result;
+use crate::{
+    Result,
+    types::common::{Address, L1BlockId, Timestamp},
+};
 use futures::stream::Stream;
 use std::{
     pin::Pin,
@@ -27,6 +30,11 @@ impl RpcStream {
         _http_providers: impl IntoIterator<Item = &Url>,
         _ws_providers: impl IntoIterator<Item = &Url>,
     ) -> Result<Self> {
+        todo!()
+    }
+
+    /// Get the Espresso stake table genesis block.
+    pub async fn genesis(&self, _stake_table: Address) -> Result<(L1BlockId, Timestamp)> {
         todo!()
     }
 }
