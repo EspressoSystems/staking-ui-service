@@ -145,11 +145,11 @@ impl SingleTransportStatus {
 
         // If we've failed recently, switch to the next URL
         let now = Instant::now();
-        if let Some(prev) = self.last_failure {
-            if now.saturating_duration_since(prev) < opt.l1_frequent_failure_tolerance {
-                self.shutting_down = true;
-                return true;
-            }
+        if let Some(prev) = self.last_failure
+            && now.saturating_duration_since(prev) < opt.l1_frequent_failure_tolerance
+        {
+            self.shutting_down = true;
+            return true;
         }
 
         false

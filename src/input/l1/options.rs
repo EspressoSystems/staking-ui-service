@@ -71,17 +71,13 @@ pub struct L1ClientOptions {
     pub l1_rate_limit_delay: Option<Duration>,
 
     /// HTTP providers to use for L1 RPC requests.
-    #[clap(long, env = "ESPRESSO_STAKING_SERVICE_L1_HTTP_PROVIDER", value_delimiter = ',', num_args = 1..)]
+    #[clap(long, env = "ESPRESSO_STAKING_SERVICE_L1_HTTP", value_delimiter = ',', num_args = 1..)]
     pub http_providers: Vec<Url>,
 
     /// Separate provider to use for subscription feeds.
     ///
     /// Typically this would be a WebSockets endpoint while the main provider uses HTTP.
-    #[clap(
-        long,
-        env = "ESPRESSO_STAKING_SERVICE_L1_WS_PROVIDER",
-        value_delimiter = ','
-    )]
+    #[clap(long, env = "ESPRESSO_STAKING_SERVICE_L1_WS", value_delimiter = ',')]
     pub l1_ws_provider: Option<Vec<Url>>,
 }
 
