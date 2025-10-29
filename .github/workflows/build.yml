@@ -64,13 +64,18 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/espressosystems/staking-ui-service
+          flavor: latest=true
 
-      - name: Create manifest list and push
-        run: |
-          docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            ghcr.io/espressosystems/staking-ui-service@${{ needs.build-amd.outputs.digest }} \
-            ghcr.io/espressosystems/staking-ui-service@${{ needs.build-arm.outputs.digest }}
+      - name: Create and push branch tag
+        uses: Noelware/docker-manifest-action@master
+        with:
+            tags: ghcr.io/espressosystems/staking-ui-service:${{ steps.meta.outputs.version }}
+            inputs: ghcr.io/espressosystems/staking-ui-service@${{ needs.build-amd.outputs.digest }},ghcr.io/espressosystems/staking-ui-service@${{needs.build-arm.outputs.digest}}
+            push: ${{ github.event_name != 'pull_request' }}
 
-      - name: Inspect image
-        run: |
-          docker buildx imagetools inspect ghcr.io/espressosystems/staking-ui-service:${{ steps.meta.outputs.version }}
+      - name: Create and push latest tag
+        uses: Noelware/docker-manifest-action@master
+        with:
+            tags: ghcr.io/espressosystems/staking-ui-service:latest
+            inputs: ghcr.io/espressosystems/staking-ui-service@${{ needs.build-amd.outputs.digest }},ghcr.io/espressosystems/staking-ui-service@${{ needs.build-arm.outputs.digest }}
+            push: ${{ github.event_name != 'pull_request' }}

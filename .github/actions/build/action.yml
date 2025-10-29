@@ -40,19 +40,22 @@ runs:
         username: ${{ github.repository_owner }}
         password: ${{ inputs.github_token }}
 
-    - name: Generate ${{ inputs.platform }} docker metadata
-      uses: docker/metadata-action@v5
+    - uses: docker/metadata-action@v5
+      name: Generate Docker Metadata
       id: metadata
       with:
-        images: ghcr.io/espressosystems/staking-ui-service
+        images: ghcr.io/espressosystems/timeboost
+        flavor: |
+          latest=true
+          suffix=-${{ inputs.platform }},onlatest=true
 
-    - name: Build and push docker
+    - name: Build and push Docker image
       uses: docker/build-push-action@v6
       id: build
       with:
         context: .
         file: Dockerfile
-        labels: ${{ steps.metadata.outputs.labels  }}
-        # Note: the final multiarch image will receive the tag
+        labels: ${{ steps.metadata.outputs.labels }}
+        tags: ${{ steps.metadata.outputs.tags }}
         platforms: linux/${{ inputs.platform }}
-        outputs: type=image,name=ghcr.io/espressosystems/staking-ui-service,push-by-digest=true,name-canonical=true,push=true
+        push: ${{ github.event_name != 'pull_request' }}
