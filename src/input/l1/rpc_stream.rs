@@ -3,6 +3,7 @@
 use super::{
     BlockInput, ResettableStream, options::L1ClientOptions, switching_transport::SwitchingTransport,
 };
+use crate::types::common::{Address, Timestamp};
 use crate::{Result, types::common::L1BlockId};
 use alloy::{
     eips::BlockId,
@@ -271,6 +272,11 @@ impl RpcStream {
     pub async fn new(options: L1ClientOptions) -> Result<Self> {
         let builder = RpcStreamBuilder::new(options)?;
         Ok(builder.build().await)
+    }
+
+    /// Get the Espresso stake table genesis block.
+    pub async fn genesis(&self, _stake_table: Address) -> Result<(L1BlockId, Timestamp)> {
+        todo!()
     }
 }
 

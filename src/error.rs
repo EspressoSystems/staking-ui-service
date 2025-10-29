@@ -52,9 +52,13 @@ impl Error {
         }
     }
 
+    /// An error internal to the service.
+    ///
+    /// This can either indicate an internal consistency error, or a transient failure of some inner
+    /// component that is out of the client's control.
     pub fn internal() -> Self {
         Self {
-            message: "internal server error".to_string(),
+            message: "internal error".to_string(),
             status: StatusCode::INTERNAL_SERVER_ERROR,
         }
     }

@@ -22,16 +22,20 @@ impl Persistence {
 }
 
 impl L1Persistence for Persistence {
-    async fn finalized_snapshots(&self) -> Result<PersistentSnapshot> {
+    async fn finalized_snapshot(&self) -> Result<Option<PersistentSnapshot>> {
         todo!()
     }
 
-    async fn apply_events<'a>(
+    async fn save_genesis(&self, _snapshot: PersistentSnapshot) -> Result<()> {
+        todo!()
+    }
+
+    async fn apply_events(
         &self,
         _block: L1BlockId,
         _timestamp: Timestamp,
-        _node_set_diff: impl IntoIterator<Item = &'a FullNodeSetDiff> + Send,
-        _wallets_diff: impl IntoIterator<Item = (Address, &'a WalletDiff)> + Send,
+        _node_set_diff: impl IntoIterator<Item = FullNodeSetDiff> + Send,
+        _wallets_diff: impl IntoIterator<Item = (Address, WalletDiff)> + Send,
     ) -> Result<()> {
         todo!()
     }
