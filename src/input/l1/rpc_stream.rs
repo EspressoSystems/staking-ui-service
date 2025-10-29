@@ -36,6 +36,8 @@ struct RpcStreamBuilder {
 pub struct RpcStream {
     /// block stream
     stream: BoxStream<'static, BlockInput>,
+    /// Builder for recreating the stream
+    builder: Arc<RpcStreamBuilder>,
 }
 
 impl std::fmt::Debug for RpcStream {
@@ -64,29 +66,31 @@ impl RpcStreamBuilder {
         })
     }
 
-    /// Build the RpcStream with automatic reconnection.
+    /// Build the RpcStream
     async fn build(self) -> RpcStream {
         let builder = Arc::new(self);
-        let stream = builder.establish_stream().await;
+        let stream = builder.clone().stream_with_reconnect().await;
+        RpcStream { stream, builder }
+    }
 
-        let stream = stream::unfold(
-            (builder.clone(), stream),
-            |(builder, mut stream)| async move {
-                loop {
-                    match stream.next().await {
-                        Some(item) => return Some((item, (builder, stream))),
-                        None => {
-                            tracing::warn!("L1 block stream ended, reconnecting...");
-                            stream = builder.establish_stream().await;
-                            tracing::info!("Successfully reconnected to L1 block stream");
-                        }
+    /// Create the stream wrapper with reconnection
+    async fn stream_with_reconnect(self: Arc<Self>) -> BoxStream<'static, BlockInput> {
+        let stream = self.establish_stream().await;
+
+        stream::unfold((self.clone(), stream), |(builder, mut stream)| async move {
+            loop {
+                match stream.next().await {
+                    Some(item) => return Some((item, (builder, stream))),
+                    None => {
+                        sleep(builder.options.l1_retry_delay).await;
+                        tracing::warn!("L1 block stream ended, reconnecting...");
+                        stream = builder.establish_stream().await;
+                        tracing::info!("Successfully reconnected to L1 block stream");
                     }
                 }
-            },
-        )
-        .boxed();
-
-        RpcStream { stream }
+            }
+        })
+        .boxed()
     }
 
     async fn create_ws_stream(&self, url: &Url) -> Result<BoxStream<'static, BlockInput>> {
@@ -123,18 +127,17 @@ impl RpcStreamBuilder {
 
                     if let Some(prev) = prev_block_number {
                         if new_block_number <= prev {
+                            tracing::info!(
+                                "Skipping block {new_block_number} as it's not newer than previous block {prev}"
+                            );
                             return Vec::new();
                         }
 
                         if new_block_number != prev + 1 {
-                            if let Some(missing) =
-                                fetch_missing_blocks(&provider, prev, new_block_number, retry_delay)
-                                    .await
-                            {
-                                new_blocks.extend(missing);
-                            } else {
-                                return Vec::new();
-                            }
+                           let  missing_blocks =  fetch_missing_blocks(&provider, prev, new_block_number, retry_delay)
+                                    .await;
+
+                            new_blocks.extend(missing_blocks);
                         }
                     }
 
@@ -196,22 +199,25 @@ impl RpcStreamBuilder {
                     let new_block_number = block.header.number;
                     let prev_block_number = *last_block_number.read();
 
+                    tracing::info!(
+                        "last_block = {prev_block_number:?}, new_block={new_block_number}"
+                    );
+
                     let mut new_blocks = Vec::new();
 
                     if let Some(prev) = prev_block_number {
                         if new_block_number <= prev {
+                            tracing::info!(
+                                "Skipping block {new_block_number} as it's not newer than previous block {prev}"
+                            );
                             return Vec::new();
                         }
 
                         if new_block_number != prev + 1 {
-                            if let Some(missing) =
-                                fetch_missing_blocks(&provider, prev, new_block_number, retry_delay)
-                                    .await
-                            {
-                                new_blocks.extend(missing);
-                            } else {
-                                return Vec::new();
-                            }
+                            let  missing_blocks =  fetch_missing_blocks(&provider, prev, new_block_number, retry_delay)
+                                    .await;
+
+                            new_blocks.extend(missing_blocks);
                         }
                     }
 
@@ -289,8 +295,35 @@ impl Stream for RpcStream {
 }
 
 impl ResettableStream for RpcStream {
-    async fn reset(&mut self, _block: u64) {
-        // todo
+    async fn reset(&mut self, block: u64) -> crate::Result<()> {
+        tracing::info!("Resetting RpcStream to block {block}");
+
+        // Fetch the latest finalized block
+        let finalized =
+            fetch_finalized(&self.builder.provider, self.builder.options.l1_retry_delay).await;
+
+        // Ensure requested block is <= finalized block
+        if block > finalized.number {
+            return Err(crate::Error::internal().context(format!(
+                "Cannot reset to block {block}: latest finalized block is {}",
+                finalized.number
+            )));
+        }
+
+        // Update last_block_number to the reset block
+        *self.builder.last_block_number.write() = Some(block);
+
+        // Recreate the stream to discard any buffered blocks from the flatten().
+        // The missing fetch logic returns a vector which gets flattened into individual blocks.
+        // Without recreating the stream, next() would continue with buffered blocks
+        // instead of triggering the missing fetch from the reset point.
+        self.stream = self.builder.clone().stream_with_reconnect().await;
+
+        tracing::warn!(
+            "Reset RpcStream to block {block} (will resume from block {})",
+            block + 1
+        );
+        Ok(())
     }
 }
 
@@ -325,7 +358,7 @@ async fn fetch_missing_blocks(
     prev_block: u64,
     new_block: u64,
     retry_delay: Duration,
-) -> Option<Vec<Header>> {
+) -> Vec<Header> {
     let mut headers = Vec::new();
 
     if new_block > prev_block + 1 {
@@ -357,7 +390,7 @@ async fn fetch_missing_blocks(
         }
     }
 
-    Some(headers)
+    headers
 }
 
 /// Convert header and finalized block to BlockInput.
@@ -461,5 +494,104 @@ mod tests {
 
             assert!(block_input.block.number > 0);
         }
+    }
+
+    #[tokio::test]
+    #[test_log::test]
+    async fn test_rpc_stream_reset() {
+        let anvil = Anvil::new()
+            .block_time(1)
+            .args(["--slots-in-an-epoch", "0"])
+            .spawn();
+        let url = anvil.endpoint().parse::<Url>().unwrap();
+
+        let options = L1ClientOptions {
+            http_providers: vec![url],
+            ..Default::default()
+        };
+
+        let mut stream = RpcStream::new(options).await.unwrap();
+
+        let mut last_block_number = 0;
+        for i in 1..=10 {
+            println!("Waiting for block {i}");
+            let block_input = stream.next().await.expect("Stream ended unexpectedly");
+            assert_eq!(block_input.block.number, last_block_number + 1);
+            last_block_number = block_input.block.number;
+        }
+
+        println!("Reached block 10, resetting to block 5");
+        stream.reset(5).await.expect("Failed to reset stream");
+
+        let block_input = stream.next().await.expect("Stream ended unexpectedly");
+        println!("After reset, received block: {}", block_input.block.number);
+        assert_eq!(
+            block_input.block.number, 6,
+            "Expected block 6 after reset to block 5"
+        );
+
+        for i in 7..=15 {
+            let block_input = stream.next().await.expect("Stream ended unexpectedly");
+            assert_eq!(block_input.block.number, i, "Expected block {i}");
+        }
+
+        println!(" Reset to genesis");
+        stream.reset(0).await.expect("Failed to reset to genesis");
+        let block = stream.next().await.expect("Stream ended unexpectedly");
+        assert_eq!(
+            block.block.number, 1,
+            "Expected block 1 after reset to genesis"
+        );
+
+        println!(" Reset to block 1");
+        stream.reset(1).await.expect("Failed to reset to block 1");
+        let block = stream.next().await.expect("Stream ended unexpectedly");
+        assert_eq!(
+            block.block.number, 2,
+            "Expected block 2 after reset to block 1"
+        );
+
+        println!(" Reset to current block");
+        for _ in 3..=10 {
+            stream.next().await.expect("Stream ended unexpectedly");
+        }
+        stream
+            .reset(10)
+            .await
+            .expect("Failed to reset to current block");
+        let block = stream.next().await.expect("Stream ended unexpectedly");
+        assert_eq!(
+            block.block.number, 11,
+            "Expected block 11 after reset to current"
+        );
+
+        stream.reset(5).await.expect("Failed to reset to 5");
+        let block = stream.next().await.expect("Stream ended unexpectedly");
+        assert_eq!(block.block.number, 6);
+
+        stream.reset(3).await.expect("Failed to reset to 3");
+        let block = stream.next().await.expect("Stream ended unexpectedly");
+        assert_eq!(block.block.number, 4);
+
+        stream.reset(15).await.expect("Failed to reset to 15");
+        let block = stream.next().await.expect("Stream ended unexpectedly");
+        assert_eq!(block.block.number, 16);
+
+        for _ in 17..=40 {
+            stream.next().await.expect("Stream ended unexpectedly");
+        }
+        stream
+            .reset(10)
+            .await
+            .expect("Failed to reset with large gap");
+
+        for expected in 11..=20 {
+            let block = stream.next().await.expect("Stream ended unexpectedly");
+            assert_eq!(block.block.number, expected,);
+        }
+
+        println!("Reset beyond finalized (should fail)");
+        let result = stream.reset(1000).await;
+        assert!(result.is_err(), "Reset beyond finalized should fail");
     }
 }

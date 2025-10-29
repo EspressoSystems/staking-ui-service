@@ -220,7 +220,7 @@ impl<S: L1Persistence> State<S> {
         if head.block.number != prev.number + 1 || head.block.parent != prev.hash {
             tracing::warn!(?head, ?prev, "new head does not extend previous head");
             let mut state = RwLockUpgradableReadGuard::upgrade(state).await;
-            state.reorg(stream).await;
+            state.reorg(stream).await?;
             return Ok(());
         }
 
@@ -249,7 +249,7 @@ impl<S: L1Persistence> State<S> {
                     %expected_hash,
                     "block finalized with different hash than originally seen"
                 );
-                write_state.reorg(stream).await;
+                write_state.reorg(stream).await?;
                 return Ok(());
             }
 
@@ -278,13 +278,14 @@ impl<S: L1Persistence> State<S> {
     }
 
     /// Reset the state back to the last persisted finalized state.
-    async fn reorg(&mut self, stream: &mut impl ResettableStream) {
+    async fn reorg(&mut self, stream: &mut impl ResettableStream) -> Result<()> {
         tracing::warn!("reorg detected, resetting to finalized state");
-        stream.reset(self.blocks[0].block.number).await;
+        stream.reset(self.blocks[0].block.number).await?;
         self.blocks.truncate(1);
         self.blocks_by_hash = [(self.blocks[0].block.hash, self.blocks[0].block.number)]
             .into_iter()
             .collect();
+        Ok(())
     }
 
     /// Handle a new finalized block.
@@ -496,7 +497,7 @@ pub trait ResettableStream: Unpin + Stream<Item = BlockInput> {
     ///
     /// The first call to `next()` after calling this function should yield the L1 block _after_
     /// `number`, i.e. `number + 1`.
-    fn reset(&mut self, number: u64) -> impl Send + Future<Output = ()>;
+    fn reset(&mut self, number: u64) -> impl Send + Future<Output = Result<()>>;
 }
 
 /// The information which must be stored in persistent storage.
@@ -705,7 +706,7 @@ mod test {
     }
 
     impl ResettableStream for VecStream {
-        async fn reset(&mut self, number: u64) {
+        async fn reset(&mut self, number: u64) -> Result<()> {
             tracing::info!(number, "reset");
             self.pos = self
                 .inputs
@@ -715,6 +716,7 @@ mod test {
             if let Some(reorg) = self.reorg.take() {
                 self.inputs = reorg;
             }
+            Ok(())
         }
     }
 
