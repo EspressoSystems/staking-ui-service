@@ -11,8 +11,8 @@ use alloy::{
     providers::{Provider, ProviderBuilder, RootProvider, WsConnect},
     rpc::{client::RpcClient, types::Header},
 };
+use async_lock::RwLock;
 use futures::stream::{self, BoxStream, Stream, StreamExt};
-use parking_lot::RwLock;
 use std::{
     pin::Pin,
     sync::Arc,
@@ -122,7 +122,7 @@ impl RpcStreamBuilder {
 
                 async move {
                     let new_block_number = head.number;
-                    let prev_block_number = *last_block_number.read();
+                    let prev_block_number = *last_block_number.read().await;
                     let mut new_blocks = Vec::new();
 
                     if let Some(prev) = prev_block_number {
@@ -142,7 +142,7 @@ impl RpcStreamBuilder {
                     }
 
                     new_blocks.push(head);
-                    *last_block_number.write() = Some(new_block_number);
+                    *last_block_number.write().await = Some(new_block_number);
                     new_blocks
                 }
             })
@@ -197,7 +197,7 @@ impl RpcStreamBuilder {
                     };
 
                     let new_block_number = block.header.number;
-                    let prev_block_number = *last_block_number.read();
+                    let prev_block_number = *last_block_number.read().await;
 
                     tracing::info!(
                         "last_block = {prev_block_number:?}, new_block={new_block_number}"
@@ -222,7 +222,7 @@ impl RpcStreamBuilder {
                     }
 
                     new_blocks.push(block.header);
-                    *last_block_number.write() = Some(new_block_number);
+                    *last_block_number.write().await = Some(new_block_number);
                     new_blocks
                 }
             })
@@ -311,7 +311,7 @@ impl ResettableStream for RpcStream {
         }
 
         // Update last_block_number to the reset block
-        *self.builder.last_block_number.write() = Some(block);
+        *self.builder.last_block_number.write().await = Some(block);
 
         // Recreate the stream to discard any buffered blocks from the flatten().
         // The missing fetch logic returns a vector which gets flattened into individual blocks.
