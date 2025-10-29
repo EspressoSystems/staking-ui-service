@@ -7,14 +7,10 @@ use crate::{Result, types::common::L1BlockId};
 use alloy::{
     eips::BlockId,
     network::Ethereum,
-    primitives::BlockHash,
     providers::{Provider, ProviderBuilder, RootProvider, WsConnect},
     rpc::{client::RpcClient, types::Header},
 };
-use futures::{
-    Future,
-    stream::{self, BoxStream, Stream, StreamExt},
-};
+use futures::stream::{self, BoxStream, Stream, StreamExt};
 use parking_lot::RwLock;
 use std::{
     pin::Pin,
@@ -25,34 +21,240 @@ use std::{
 use tide_disco::Url;
 use tokio::time::sleep;
 
-type ReconnectFuture = Pin<Box<dyn Future<Output = Result<BoxStream<'static, BlockInput>>> + Send>>;
-
-/// An L1 event stream based on a standard JSON-RPC server.
-pub struct RpcStream {
-    /// Current block stream
-    stream: BoxStream<'static, BlockInput>,
+/// Builder for creating an RpcStream.
+struct RpcStreamBuilder {
     /// Provider for making RPC calls
     provider: Arc<RootProvider<Ethereum>>,
     /// Transport for switching between HTTP providers
     transport: SwitchingTransport,
-    /// WebSocket URLs for subscription (if any)
-    ws_urls: Option<Vec<Url>>,
-    /// Client options
     options: L1ClientOptions,
-    /// Last finalized block
-    /// todo:
-    last_finalized: Arc<RwLock<L1BlockId>>,
-    /// Pending reconnection future
-    reconnecting: Option<ReconnectFuture>,
+    last_block_number: Arc<RwLock<Option<u64>>>,
+}
+
+/// An L1 event stream based on a standard JSON-RPC server.
+pub struct RpcStream {
+    /// block stream
+    stream: BoxStream<'static, BlockInput>,
 }
 
 impl std::fmt::Debug for RpcStream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RpcStream")
             .field("stream", &"<stream>")
-            .field("ws_urls", &self.ws_urls)
-            .field("reconnecting", &self.reconnecting.is_some())
             .finish()
+    }
+}
+
+impl RpcStreamBuilder {
+    /// Create a new builder from L1 client options.
+    fn new(options: L1ClientOptions) -> Result<Self> {
+        let http_urls = options.http_providers.clone();
+        let transport = SwitchingTransport::new(options.clone(), http_urls)?;
+        let rpc_client = RpcClient::new(transport.clone(), false);
+        let provider = Arc::new(RootProvider::new(rpc_client));
+
+        let last_block_number = Arc::new(RwLock::new(None));
+
+        Ok(Self {
+            provider,
+            transport,
+            options,
+            last_block_number,
+        })
+    }
+
+    /// Build the RpcStream with automatic reconnection.
+    async fn build(self) -> RpcStream {
+        let builder = Arc::new(self);
+        let stream = builder.establish_stream().await;
+
+        let stream = stream::unfold(
+            (builder.clone(), stream),
+            |(builder, mut stream)| async move {
+                loop {
+                    match stream.next().await {
+                        Some(item) => return Some((item, (builder, stream))),
+                        None => {
+                            tracing::warn!("L1 block stream ended, reconnecting...");
+                            stream = builder.establish_stream().await;
+                            tracing::info!("Successfully reconnected to L1 block stream");
+                        }
+                    }
+                }
+            },
+        )
+        .boxed();
+
+        RpcStream { stream }
+    }
+
+    async fn create_ws_stream(&self, url: &Url) -> Result<BoxStream<'static, BlockInput>> {
+        let ws = ProviderBuilder::new()
+            .connect_ws(WsConnect::new(url.clone()))
+            .await
+            .map_err(|err| {
+                tracing::warn!("Failed to connect WebSockets provider: {err:#}");
+                crate::Error::internal().context(format!("Failed to connect: {err}"))
+            })?;
+
+        let block_stream = ws.subscribe_blocks().await.map_err(|err| {
+            tracing::warn!("Failed to subscribe to blocks: {err:#}");
+            crate::Error::internal().context(format!("Failed to subscribe using ws: {err}"))
+        })?;
+
+        let provider = self.provider.clone();
+        let last_block_number = self.last_block_number.clone();
+        let retry_delay = self.options.l1_retry_delay;
+
+        let provider_for_fetch = provider.clone();
+        let provider = provider.clone();
+
+        Ok(block_stream
+            .into_stream()
+            .then(move |head| {
+                let provider = provider_for_fetch.clone();
+                let last_block_number = last_block_number.clone();
+
+                async move {
+                    let new_block_number = head.number;
+                    let prev_block_number = *last_block_number.read();
+                    let mut new_blocks = Vec::new();
+
+                    if let Some(prev) = prev_block_number {
+                        if new_block_number <= prev {
+                            return Vec::new();
+                        }
+
+                        if new_block_number != prev + 1 {
+                            if let Some(missing) =
+                                fetch_missing_blocks(&provider, prev, new_block_number, retry_delay)
+                                    .await
+                            {
+                                new_blocks.extend(missing);
+                            } else {
+                                return Vec::new();
+                            }
+                        }
+                    }
+
+                    new_blocks.push(head);
+                    *last_block_number.write() = Some(new_block_number);
+                    new_blocks
+                }
+            })
+            .map(stream::iter)
+            .flatten()
+            .then(move |head| {
+                let provider = provider.clone();
+                async move {
+                    let finalized = fetch_finalized(&provider, retry_delay).await;
+                    block_to_input(head, finalized)
+                }
+            })
+            .boxed())
+    }
+
+    async fn create_http_stream(&self) -> Result<BoxStream<'static, BlockInput>> {
+        let poller = self
+            .provider
+            .watch_blocks()
+            .await
+            .map_err(|err| {
+                crate::Error::internal().context(format!("Failed to watch blocks: {err}"))
+            })?
+            .with_poll_interval(self.options.l1_polling_interval)
+            .into_stream();
+
+        let provider = self.provider.clone();
+        let last_block_number = self.last_block_number.clone();
+        let retry_delay = self.options.l1_retry_delay;
+        let switch_notify = self.transport.switch_notify.clone();
+
+        let provider_for_fetch = provider.clone();
+
+        Ok(poller
+            .map(stream::iter)
+            .flatten()
+            .then(move |hash| {
+                let provider = provider_for_fetch.clone();
+                let last_block_number = last_block_number.clone();
+
+                async move {
+                    let block = match provider.get_block(BlockId::hash(hash)).await {
+                        Ok(Some(block)) => block,
+                        Ok(None) => {
+                            tracing::warn!(%hash, "HTTP stream: Block not available");
+                            return Vec::new();
+                        }
+                        Err(err) => {
+                            tracing::warn!(%hash, "HTTP stream: Failed to fetch block: {err:#}");
+                            return Vec::new();
+                        }
+                    };
+
+                    let new_block_number = block.header.number;
+                    let prev_block_number = *last_block_number.read();
+
+                    let mut new_blocks = Vec::new();
+
+                    if let Some(prev) = prev_block_number {
+                        if new_block_number <= prev {
+                            return Vec::new();
+                        }
+
+                        if new_block_number != prev + 1 {
+                            if let Some(missing) =
+                                fetch_missing_blocks(&provider, prev, new_block_number, retry_delay)
+                                    .await
+                            {
+                                new_blocks.extend(missing);
+                            } else {
+                                return Vec::new();
+                            }
+                        }
+                    }
+
+                    new_blocks.push(block.header);
+                    *last_block_number.write() = Some(new_block_number);
+                    new_blocks
+                }
+            })
+            .map(stream::iter)
+            .flatten()
+            .take_until(async move { switch_notify.notified().await })
+            .then(move |head| {
+                let provider = provider.clone();
+                async move {
+                    let finalized = fetch_finalized(&provider, retry_delay).await;
+                    block_to_input(head, finalized)
+                }
+            })
+            .boxed())
+    }
+
+    /// Establish a new block stream connection
+    async fn establish_stream(&self) -> BoxStream<'static, BlockInput> {
+        // Try to establish connection with retries
+        for i in 0.. {
+            let res = match &self.options.l1_ws_provider {
+                Some(urls) => {
+                    let provider_index = i % urls.len();
+                    let url = &urls[provider_index];
+                    self.create_ws_stream(url).await
+                }
+                None => self.create_http_stream().await,
+            };
+
+            match res {
+                Ok(stream) => return stream,
+                Err(err) => {
+                    tracing::warn!("Failed to establish stream: {err}, retrying...");
+                    sleep(self.options.l1_retry_delay).await;
+                }
+            }
+        }
+
+        unreachable!("Infinite loop")
     }
 }
 
@@ -67,219 +269,8 @@ impl RpcStream {
     /// If multiple providers are given for either protocol or both, the system will rotate between
     /// them if and when one provider fails.
     pub async fn new(options: L1ClientOptions) -> Result<Self> {
-        let http_urls = options.http_providers.clone();
-
-        let transport = SwitchingTransport::new(options.clone(), http_urls)?;
-
-        let rpc_client = RpcClient::new(transport.clone(), false);
-        let provider = Arc::new(RootProvider::new(rpc_client));
-
-        let ws_urls = options.l1_ws_provider.clone();
-
-        // todo:
-        let last_finalized = Arc::new(RwLock::new(L1BlockId {
-            number: 0,
-            hash: BlockHash::ZERO,
-            parent: BlockHash::ZERO,
-        }));
-
-        let stream = Self::establish_stream(
-            provider.clone(),
-            transport.clone(),
-            ws_urls.clone(),
-            options.clone(),
-            last_finalized.clone(),
-        )
-        .await?;
-
-        Ok(Self {
-            stream,
-            provider,
-            transport,
-            ws_urls,
-            options,
-            last_finalized,
-            reconnecting: None,
-        })
-    }
-
-    async fn fetch_finalized(
-        provider: &Arc<RootProvider<Ethereum>>,
-        last_finalized: &Arc<RwLock<L1BlockId>>,
-        retry_delay: Duration,
-    ) -> L1BlockId {
-        loop {
-            match provider.get_block(BlockId::finalized()).await {
-                Ok(Some(block)) => {
-                    let finalized_id = L1BlockId {
-                        number: block.header.number,
-                        hash: block.header.hash,
-                        parent: block.header.parent_hash,
-                    };
-                    *last_finalized.write() = finalized_id;
-                    return finalized_id;
-                }
-                Ok(None) => {
-                    tracing::warn!("finalized block is None, will retry");
-                }
-                Err(err) => {
-                    tracing::warn!("Failed to fetch finalized block: {err}, will retry");
-                }
-            }
-            sleep(retry_delay).await;
-        }
-    }
-
-    async fn create_ws_stream(
-        url: &Url,
-        provider: Arc<RootProvider<Ethereum>>,
-        last_finalized: Arc<RwLock<L1BlockId>>,
-        retry_delay: Duration,
-    ) -> Result<BoxStream<'static, BlockInput>> {
-        let ws = ProviderBuilder::new()
-            .connect_ws(WsConnect::new(url.clone()))
-            .await
-            .map_err(|err| {
-                tracing::warn!("Failed to connect WebSockets provider: {err:#}");
-                crate::Error::internal().context(format!("Failed to connect: {err}"))
-            })?;
-
-        let stream = ws.subscribe_blocks().await.map_err(|err| {
-            tracing::warn!("Failed to subscribe to blocks: {err:#}");
-            crate::Error::internal().context(format!("Failed to subscribe: {err}"))
-        })?;
-
-        Ok(stream
-            .into_stream()
-            .then(move |head| {
-                let provider = provider.clone();
-                let last_finalized = last_finalized.clone();
-                async move {
-                    let finalized =
-                        Self::fetch_finalized(&provider, &last_finalized, retry_delay).await;
-                    Self::block_to_input(head, finalized)
-                }
-            })
-            .boxed())
-    }
-
-    async fn create_http_stream(
-        provider: Arc<RootProvider<Ethereum>>,
-        transport: &SwitchingTransport,
-        last_finalized: Arc<RwLock<L1BlockId>>,
-        polling_interval: Duration,
-        retry_delay: Duration,
-    ) -> Result<BoxStream<'static, BlockInput>> {
-        let poller_builder = provider.watch_blocks().await.map_err(|err| {
-            crate::Error::internal().context(format!("Failed to watch blocks: {err}"))
-        })?;
-
-        let stream = poller_builder
-            .with_poll_interval(polling_interval)
-            .into_stream();
-        let rpc_clone = provider.clone();
-        let provider_for_finalized = provider.clone();
-        let last_finalized_clone = last_finalized.clone();
-        let switch_notify = transport.switch_notify.clone();
-
-        Ok(stream
-            .map(stream::iter)
-            .flatten()
-            .filter_map(move |hash| {
-                let rpc = rpc_clone.clone();
-                async move {
-                    match rpc.get_block(BlockId::hash(hash)).await {
-                        Ok(Some(block)) => Some(block.header),
-                        Ok(None) => {
-                            tracing::warn!(%hash, "HTTP stream yielded a block hash that was not available");
-                            None
-                        }
-                        Err(err) => {
-                            tracing::warn!(%hash, "Error fetching block from HTTP stream: {err:#}");
-                            None
-                        }
-                    }
-                }
-            })
-            .take_until(async move { switch_notify.notified().await })
-            .then(move |head| {
-                let provider = provider_for_finalized.clone();
-                let last_finalized = last_finalized_clone.clone();
-                async move {
-                    let finalized = Self::fetch_finalized(&provider, &last_finalized, retry_delay).await;
-                    Self::block_to_input(head, finalized)
-                }
-            })
-            .boxed())
-    }
-
-    /// Establish a new block stream connection. Returns the stream on success.
-    pub fn establish_stream(
-        provider: Arc<RootProvider<Ethereum>>,
-        transport: SwitchingTransport,
-        ws_urls: Option<Vec<Url>>,
-        opt: L1ClientOptions,
-        last_finalized: Arc<RwLock<L1BlockId>>,
-    ) -> ReconnectFuture {
-        Box::pin(async move {
-            let retry_delay = opt.l1_retry_delay;
-            let polling_interval = opt.l1_polling_interval;
-
-            // todo:
-            Self::fetch_finalized(&provider, &last_finalized, retry_delay).await;
-
-            // Try to establish connection with retries
-            for i in 0.. {
-                let res = match &ws_urls {
-                    Some(urls) => {
-                        let provider_index = i % urls.len();
-                        let url = &urls[provider_index];
-                        Self::create_ws_stream(
-                            url,
-                            provider.clone(),
-                            last_finalized.clone(),
-                            retry_delay,
-                        )
-                        .await
-                    }
-                    None => {
-                        Self::create_http_stream(
-                            provider.clone(),
-                            &transport,
-                            last_finalized.clone(),
-                            polling_interval,
-                            retry_delay,
-                        )
-                        .await
-                    }
-                };
-
-                match res {
-                    Ok(stream) => return Ok(stream),
-                    Err(err) => {
-                        tracing::warn!("Failed to establish stream: {err}, retrying...");
-                        sleep(retry_delay).await;
-                    }
-                }
-            }
-
-            unreachable!("Infinite loop")
-        })
-    }
-
-    fn block_to_input(head: Header, finalized: L1BlockId) -> BlockInput {
-        let block = L1BlockId {
-            number: head.number,
-            hash: head.hash,
-            parent: head.parent_hash,
-        };
-
-        BlockInput {
-            block,
-            finalized,
-            timestamp: head.timestamp,
-            events: vec![],
-        }
+        let builder = RpcStreamBuilder::new(options)?;
+        Ok(builder.build().await)
     }
 }
 
@@ -287,46 +278,7 @@ impl Stream for RpcStream {
     type Item = BlockInput;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        if let Some(reconnect_future) = self.reconnecting.as_mut() {
-            match reconnect_future.as_mut().poll(cx) {
-                Poll::Ready(Ok(new_stream)) => {
-                    tracing::info!("Successfully reconnected to L1 block stream");
-                    self.stream = new_stream;
-                    self.reconnecting = None;
-                }
-                Poll::Ready(Err(err)) => {
-                    panic!(
-                        "This should not happen because establish_stream retries indefinitely. err={err}"
-                    );
-                }
-                Poll::Pending => {
-                    return Poll::Pending;
-                }
-            }
-        }
-
-        match self.stream.as_mut().poll_next(cx) {
-            Poll::Ready(Some(input)) => {
-                tracing::debug!(block = input.block.number, "Yielding L1 block");
-                Poll::Ready(Some(input))
-            }
-            Poll::Ready(None) => {
-                tracing::warn!("L1 block stream ended, initiating reconnection");
-
-                let reconnect_future = Self::establish_stream(
-                    self.provider.clone(),
-                    self.transport.clone(),
-                    self.ws_urls.clone(),
-                    self.options.clone(),
-                    self.last_finalized.clone(),
-                );
-
-                self.reconnecting = Some(reconnect_future);
-
-                Poll::Pending
-            }
-            Poll::Pending => Poll::Pending,
-        }
+        self.stream.as_mut().poll_next(cx)
     }
 }
 
@@ -336,6 +288,87 @@ impl ResettableStream for RpcStream {
     }
 }
 
+/// Fetch finalized block with retry logic.
+async fn fetch_finalized(
+    provider: &Arc<RootProvider<Ethereum>>,
+    retry_delay: Duration,
+) -> L1BlockId {
+    loop {
+        match provider.get_block(BlockId::finalized()).await {
+            Ok(Some(block)) => {
+                return L1BlockId {
+                    number: block.header.number,
+                    hash: block.header.hash,
+                    parent: block.header.parent_hash,
+                };
+            }
+            Ok(None) => {
+                tracing::warn!("finalized block is None, will retry");
+            }
+            Err(err) => {
+                tracing::warn!("Failed to fetch finalized block: {err}, will retry");
+            }
+        }
+        sleep(retry_delay).await;
+    }
+}
+
+/// Fetch missing blocks with retry logic.
+async fn fetch_missing_blocks(
+    provider: &Arc<RootProvider<Ethereum>>,
+    prev_block: u64,
+    new_block: u64,
+    retry_delay: Duration,
+) -> Option<Vec<Header>> {
+    let mut headers = Vec::new();
+
+    if new_block > prev_block + 1 {
+        tracing::warn!(
+            "Fetching missing blocks from {} to {}",
+            prev_block + 1,
+            new_block - 1
+        );
+
+        for block_num in (prev_block + 1)..new_block {
+            loop {
+                match provider.get_block(BlockId::number(block_num)).await {
+                    Ok(Some(block)) => {
+                        headers.push(block.header);
+                        break;
+                    }
+                    Ok(None) => {
+                        tracing::warn!("Missing block {block_num} not found, retrying...");
+                        sleep(retry_delay).await;
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            "Failed to fetch missing block {block_num}: {err}, retrying..."
+                        );
+                        sleep(retry_delay).await;
+                    }
+                }
+            }
+        }
+    }
+
+    Some(headers)
+}
+
+/// Convert header and finalized block to BlockInput.
+fn block_to_input(head: Header, finalized: L1BlockId) -> BlockInput {
+    let block = L1BlockId {
+        number: head.number,
+        hash: head.hash,
+        parent: head.parent_hash,
+    };
+
+    BlockInput {
+        block,
+        finalized,
+        timestamp: head.timestamp,
+        events: vec![],
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -386,6 +419,7 @@ mod tests {
         for i in 1..=10 {
             println!("Waiting for block {i}");
             let block_input = stream.next().await.expect("Stream ended unexpectedly");
+
             assert!(block_input.block.number == last_block_number + 1);
             last_block_number = block_input.block.number;
             println!("Received block {i}");
