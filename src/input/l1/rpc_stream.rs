@@ -257,20 +257,9 @@ impl Stream for RpcStream {
 }
 
 impl ResettableStream for RpcStream {
-    async fn reset(&mut self, block: u64) -> crate::Result<()> {
+    async fn reset(&mut self, block: u64) {
         tracing::info!("Resetting RpcStream to block {block}");
 
-        // Fetch the latest finalized block
-        let finalized =
-            fetch_finalized(&self.builder.provider, self.builder.options.l1_retry_delay).await;
-
-        // Ensure requested block is <= finalized block
-        if block > finalized.number {
-            return Err(crate::Error::internal().context(format!(
-                "Cannot reset to block {block}: latest finalized block is {}",
-                finalized.number
-            )));
-        }
         let old_block_number = *self.builder.last_block_number.read().await;
 
         // Update last_block_number to the reset block
@@ -292,7 +281,6 @@ impl ResettableStream for RpcStream {
             "Reset RpcStream to block {block} (will resume from block {})",
             block + 1
         );
-        Ok(())
     }
 }
 
@@ -529,7 +517,7 @@ mod tests {
         }
 
         println!("Reached block 10, resetting to block 5");
-        stream.reset(5).await.expect("Failed to reset stream");
+        stream.reset(5).await;
 
         let block_input = stream.next().await.expect("Stream ended unexpectedly");
         println!("After reset, received block: {}", block_input.block.number);
@@ -544,7 +532,7 @@ mod tests {
         }
 
         println!(" Reset to genesis");
-        stream.reset(0).await.expect("Failed to reset to genesis");
+        stream.reset(0).await;
         let block = stream.next().await.expect("Stream ended unexpectedly");
         assert_eq!(
             block.block.number, 1,
@@ -552,7 +540,7 @@ mod tests {
         );
 
         println!(" Reset to block 1");
-        stream.reset(1).await.expect("Failed to reset to block 1");
+        stream.reset(1).await;
         let block = stream.next().await.expect("Stream ended unexpectedly");
         assert_eq!(
             block.block.number, 2,
@@ -563,43 +551,41 @@ mod tests {
         for _ in 3..=10 {
             stream.next().await.expect("Stream ended unexpectedly");
         }
-        stream
-            .reset(10)
-            .await
-            .expect("Failed to reset to current block");
+        stream.reset(10).await;
         let block = stream.next().await.expect("Stream ended unexpectedly");
         assert_eq!(
             block.block.number, 11,
             "Expected block 11 after reset to current"
         );
 
-        stream.reset(5).await.expect("Failed to reset to 5");
+        stream.reset(5).await;
         let block = stream.next().await.expect("Stream ended unexpectedly");
         assert_eq!(block.block.number, 6);
 
-        stream.reset(3).await.expect("Failed to reset to 3");
+        stream.reset(3).await;
         let block = stream.next().await.expect("Stream ended unexpectedly");
         assert_eq!(block.block.number, 4);
 
-        stream.reset(15).await.expect("Failed to reset to 15");
+        stream.reset(15).await;
         let block = stream.next().await.expect("Stream ended unexpectedly");
         assert_eq!(block.block.number, 16);
 
         for _ in 17..=40 {
             stream.next().await.expect("Stream ended unexpectedly");
         }
-        stream
-            .reset(10)
-            .await
-            .expect("Failed to reset with large gap");
+        stream.reset(10).await;
 
         for expected in 11..=20 {
             let block = stream.next().await.expect("Stream ended unexpectedly");
             assert_eq!(block.block.number, expected,);
         }
 
-        println!("Reset beyond finalized (should fail)");
-        let result = stream.reset(1000).await;
-        assert!(result.is_err(), "Reset beyond finalized should fail");
+        println!("Reset to future block");
+        stream.reset(100).await;
+        let block = stream.next().await.expect("Stream ended unexpectedly");
+        assert_eq!(
+            block.block.number, 101,
+            "Expected block 101 after reset to block 100"
+        );
     }
 }
