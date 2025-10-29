@@ -123,8 +123,8 @@ impl RpcStreamBuilder {
         let block_stream = block_stream.into_stream();
 
         Ok(stream::unfold(
-            (block_stream, last_block),
-            move |(mut stream, mut last_block_number)| {
+            (block_stream, last_block, ws),
+            move |(mut stream, mut last_block_number, ws)| {
                 let provider = provider.clone();
 
                 async move {
@@ -132,7 +132,7 @@ impl RpcStreamBuilder {
                     let blocks =
                         process_block_header(&provider, &mut last_block_number, head, retry_delay)
                             .await;
-                    Some((stream::iter(blocks), (stream, last_block_number)))
+                    Some((stream::iter(blocks), (stream, last_block_number, ws)))
                 }
             },
         )
@@ -446,6 +446,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[test_log::test]
     async fn test_rpc_stream_websocket() {
         let anvil = Anvil::new().block_time(1).spawn();
         let http_url = anvil.endpoint().parse::<Url>().unwrap();
@@ -474,6 +475,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[test_log::test]
     async fn test_l1_stream_reconnect() {
         // Start two Anvil instances
         let anvil1 = Anvil::new().block_time(1).spawn();
