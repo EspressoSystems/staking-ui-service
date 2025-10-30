@@ -5,7 +5,7 @@ use clap::Parser;
 use futures::{FutureExt, future::try_join_all};
 use staking_ui_service::{
     Result, app,
-    input::l1::{self, PersistentSnapshot, RpcStream, options::L1ClientOptions},
+    input::l1::{self, RpcStream, Snapshot, options::L1ClientOptions},
     persistence::sql,
     types::common::Address,
 };
@@ -36,8 +36,8 @@ impl Options {
         let storage = sql::Persistence::new(&self.storage).await?;
 
         // Get genesis state.
-        let (id, timestamp) = l1_input.genesis(self.stake_table).await?;
-        let genesis = PersistentSnapshot::genesis(id, timestamp);
+        let genesis_block = l1_input.genesis(self.stake_table).await?;
+        let genesis = Snapshot::empty(genesis_block);
 
         // Create server state.
         let l1 = Arc::new(RwLock::new(l1::State::new(storage, genesis).await?));

@@ -37,28 +37,27 @@ use super::*;
 /// Easy-setup storage that just uses memory.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct MemoryStorage {
-    snapshot: Arc<RwLock<Option<PersistentSnapshot>>>,
+    snapshot: Arc<RwLock<Option<Snapshot>>>,
 }
 
 impl L1Persistence for MemoryStorage {
-    async fn finalized_snapshot(&self) -> Result<Option<PersistentSnapshot>> {
+    async fn finalized_snapshot(&self) -> Result<Option<Snapshot>> {
         Ok(self.snapshot.read().await.clone())
     }
 
-    async fn save_genesis(&self, snapshot: PersistentSnapshot) -> Result<()> {
+    async fn save_genesis(&self, snapshot: Snapshot) -> Result<()> {
         *self.snapshot.write().await = Some(snapshot);
         Ok(())
     }
 
     async fn apply_events(
         &self,
-        block: L1BlockId,
-        timestamp: Timestamp,
+        block: L1BlockSnapshot,
         node_set_diff: impl IntoIterator<Item = FullNodeSetDiff> + Send,
         wallets_diff: impl IntoIterator<Item = (Address, WalletDiff)> + Send,
     ) -> Result<()> {
         let mut lock = self.snapshot.write().await;
-        let snapshot = lock.get_or_insert(PersistentSnapshot::genesis(block_id(0), 0));
+        let snapshot = lock.get_or_insert(Snapshot::empty(block_snapshot(0)));
 
         for diff in node_set_diff {
             snapshot.node_set.apply(&diff);
@@ -67,8 +66,6 @@ impl L1Persistence for MemoryStorage {
             snapshot.wallets.apply(address, &diff);
         }
         snapshot.block = block;
-        snapshot.timestamp = timestamp;
-
         Ok(())
     }
 }
@@ -78,14 +75,14 @@ impl L1Persistence for MemoryStorage {
 pub(crate) struct FailStorage;
 
 impl L1Persistence for FailStorage {
-    async fn finalized_snapshot(&self) -> Result<Option<PersistentSnapshot>> {
+    async fn finalized_snapshot(&self) -> Result<Option<Snapshot>> {
         Err(Error::catch_all(
             StatusCode::INTERNAL_SERVER_ERROR,
             "FailStorage".into(),
         ))
     }
 
-    async fn save_genesis(&self, _snapshot: PersistentSnapshot) -> Result<()> {
+    async fn save_genesis(&self, _snapshot: Snapshot) -> Result<()> {
         Err(Error::catch_all(
             StatusCode::INTERNAL_SERVER_ERROR,
             "FailStorage".into(),
@@ -94,8 +91,7 @@ impl L1Persistence for FailStorage {
 
     async fn apply_events(
         &self,
-        _block: L1BlockId,
-        _timestamp: Timestamp,
+        _block: L1BlockSnapshot,
         _node_set_diff: impl IntoIterator<Item = FullNodeSetDiff> + Send,
         _wallets_diff: impl IntoIterator<Item = (Address, WalletDiff)> + Send,
     ) -> Result<()> {
@@ -195,6 +191,15 @@ pub(crate) fn block_id(number: u64) -> L1BlockId {
         number,
         hash,
         parent,
+    }
+}
+
+/// Generate a block snapshot for testing.
+pub(crate) fn block_snapshot(number: u64) -> L1BlockSnapshot {
+    L1BlockSnapshot {
+        id: block_id(number),
+        timestamp: 12 * number,
+        exit_escrow_period: 3600,
     }
 }
 
@@ -303,7 +308,7 @@ impl Iterator for EventGenerator {
                         // If there are none try again.
                         continue;
                     };
-
+                    self.nodes.remove(&node);
                     StakeTableEvent::Deregister(ValidatorExit { validator: node }).into()
                 }
 
@@ -356,10 +361,11 @@ impl Iterator for InputGenerator {
 impl BlockInput {
     /// Create a [`BlockInput`] with no events, just L1 block information.
     pub(crate) fn empty(number: u64) -> BlockInput {
+        let block = block_snapshot(number);
         Self {
-            block: block_id(number),
+            block: block.id(),
+            timestamp: block.timestamp(),
             finalized: block_id(0),
-            timestamp: 12 * number,
             events: vec![],
         }
     }
@@ -370,7 +376,7 @@ impl<S: Default> super::State<S> {
         let blocks = (start..end).map(BlockData::empty).collect::<Vec<_>>();
         let blocks_by_hash = blocks
             .iter()
-            .map(|block| (block.block.hash, block.block.number))
+            .map(|block| (block.block().hash(), block.block().number()))
             .collect();
         Self {
             blocks,
@@ -383,14 +389,9 @@ impl<S: Default> super::State<S> {
 impl BlockData {
     /// Generate a test L1 block with no staking-related data.
     pub(super) fn empty(number: u64) -> Self {
-        let block = block_id(number);
-        let timestamp = 12 * number;
         Self {
-            block,
-            timestamp,
-            node_set: Default::default(),
+            state: Snapshot::empty(block_snapshot(number)),
             node_set_update: Some(Default::default()),
-            wallets: Default::default(),
             wallets_update: Some(Default::default()),
         }
     }
