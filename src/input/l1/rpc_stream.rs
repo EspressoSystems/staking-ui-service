@@ -1063,22 +1063,23 @@ mod tests {
         let mut stream = RpcStream::new(options.clone()).await.unwrap();
 
         // Fetch genesis using load_genesis
-        let (genesis_block, _timestamp) =
+        let genesis =
             crate::input::l1::provider::load_genesis(&provider, deployment.stake_table_addr)
                 .await
                 .unwrap();
 
         println!(
             "Fetched genesis block: number={}, hash={:?}",
-            genesis_block.number, genesis_block.hash
+            genesis.number(),
+            genesis.hash()
         );
 
-        stream.reset(genesis_block.number).await;
+        stream.reset(genesis.number()).await;
         println!("Reset stream to genesis, now processing all blocks");
 
         // Process all blocks from genesis through the stream
         let mut stake_table_state_from_stream = StakeTableState::new();
-        let start_block = genesis_block.number + 1;
+        let start_block = genesis.number() + 1;
         let mut end_block = start_block;
 
         for _i in 1..=650 {

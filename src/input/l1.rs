@@ -20,7 +20,7 @@ use crate::{
     error::{Error, Result, ensure},
     types::{
         common::{
-            Address, Delegation, ESPTokenAmount, L1BlockId, L1BlockInfo, NodeSetEntry,
+            Address, Delegation, ESPTokenAmount, L1BlockId, L1BlockInfo, NodeExit, NodeSetEntry,
             PendingWithdrawal, Ratio, Timestamp,
         },
         global::{FullNodeSetDiff, FullNodeSetSnapshot, FullNodeSetUpdate},
@@ -62,8 +62,8 @@ impl<S: L1Persistence> State<S> {
     ///
     /// Previously saved state will be loaded from `storage` if possible. If there is no previous
     /// state in storage, the given genesis state will be used.
-    pub async fn new(storage: S, genesis: PersistentSnapshot) -> Result<Self> {
-        let snapshot = match storage.finalized_snapshot().await? {
+    pub async fn new(storage: S, genesis: Snapshot) -> Result<Self> {
+        let state = match storage.finalized_snapshot().await? {
             Some(snapshot) => snapshot,
             None => {
                 storage.save_genesis(genesis.clone()).await?;
@@ -72,17 +72,14 @@ impl<S: L1Persistence> State<S> {
         };
 
         let finalized = BlockData {
-            block: snapshot.block,
-            timestamp: snapshot.timestamp,
-            node_set: snapshot.node_set,
-            wallets: snapshot.wallets,
+            state,
 
             // The updates are the difference between this snapshot and the previous one; for the
             // initial snapshot, there is no such difference.
             node_set_update: None,
             wallets_update: None,
         };
-        let blocks_by_hash = [(finalized.block.hash, finalized.block.number)]
+        let blocks_by_hash = [(finalized.block().hash(), finalized.block().number())]
             .into_iter()
             .collect();
         let blocks = vec![finalized];
@@ -95,19 +92,19 @@ impl<S: L1Persistence> State<S> {
 
     /// Get the latest known L1 block.
     pub fn latest_l1_block(&self) -> L1BlockId {
-        self.blocks[self.blocks.len() - 1].block
+        self.blocks[self.blocks.len() - 1].block().id()
     }
 
     /// Get the hashes identifying a particular L1 block.
     pub fn l1_block(&self, number: u64) -> Result<L1BlockId> {
-        Ok(self.block(number)?.block)
+        Ok(self.block(number)?.block().id())
     }
 
     /// Get a snapshot of the full node set at the given L1 block.
     pub fn full_node_set(&self, hash: BlockHash) -> Result<(NodeSet, L1BlockInfo)> {
         let number = self.block_number(hash)?;
         let block = self.block(number)?;
-        Ok((block.node_set.clone(), block.block_info()))
+        Ok((block.state.node_set.clone(), block.block().info()))
     }
 
     /// Get the update applied to the full node set due to the given L1 block.
@@ -116,7 +113,7 @@ impl<S: L1Persistence> State<S> {
         let block = self.block(number)?;
         let diff = block.node_set_update.clone().ok_or_else(Error::gone)?;
         let update = FullNodeSetUpdate {
-            l1_block: block.block_info(),
+            l1_block: block.block().info(),
             diff,
         };
         Ok(update)
@@ -127,11 +124,12 @@ impl<S: L1Persistence> State<S> {
         let number = self.block_number(hash)?;
         let block = self.block(number)?;
         let wallet = block
+            .state
             .wallets
             .get(&address)
             .ok_or_else(|| Error::not_found().context(format!("unknown account {address}")))?
             .clone();
-        Ok((wallet, block.block_info()))
+        Ok((wallet, block.block().info()))
     }
 
     /// Get the update applied to the requested wallet due to the given L1 block.
@@ -141,7 +139,7 @@ impl<S: L1Persistence> State<S> {
 
         // Check that this account even exists.
         ensure!(
-            block.wallets.contains_key(&address),
+            block.state.wallets.contains_key(&address),
             Error::not_found().context(format!("unknown account {address}"))
         );
 
@@ -154,14 +152,14 @@ impl<S: L1Persistence> State<S> {
             .cloned()
             .unwrap_or_default();
         Ok(WalletUpdate {
-            l1_block: block.block_info(),
+            l1_block: block.block().info(),
             diff,
         })
     }
 
     /// Get the block with the requested block number.
     fn block(&self, number: u64) -> Result<&BlockData> {
-        let finalized = self.blocks[0].block.number;
+        let finalized = self.blocks[0].block().number();
         ensure!(
             number >= finalized,
             Error::gone().context(format!(
@@ -230,8 +228,8 @@ impl<S: L1Persistence> State<S> {
         tracing::debug!("received L1 input");
 
         // Check that the new block extends the last block; if not there's been a reorg.
-        let prev = state.blocks[state.blocks.len() - 1].block;
-        if head.block.number != prev.number + 1 || head.block.parent != prev.hash {
+        let prev = state.blocks[state.blocks.len() - 1].block();
+        if head.block.number != prev.number() + 1 || head.block.parent != prev.hash() {
             tracing::warn!(?head, ?prev, "new head does not extend previous head");
             let mut state = RwLockUpgradableReadGuard::upgrade(state).await;
             state.reorg(stream).await;
@@ -239,7 +237,7 @@ impl<S: L1Persistence> State<S> {
         }
 
         // Handle a new finalized block if there is one.
-        let old_finalized = state.blocks[0].block;
+        let old_finalized = state.blocks[0].block().number();
         let new_finalized = head.finalized;
         ensure!(
             new_finalized.number <= head.block.number,
@@ -249,14 +247,14 @@ impl<S: L1Persistence> State<S> {
                 head.block
             ))
         );
-        if new_finalized.number > old_finalized.number {
+        if new_finalized.number > old_finalized {
             let mut write_state = RwLockUpgradableReadGuard::upgrade(state).await;
 
             // Make sure the hash of this new finalized block matches what we have in our
             // unfinalized state, if not there has somehow been a reorg of this (presumably pretty
             // old) block, and we need to go back and re-process it.
-            let offset = new_finalized.number - old_finalized.number;
-            let expected_hash = write_state.blocks[offset as usize].block.hash;
+            let offset = new_finalized.number - old_finalized;
+            let expected_hash = write_state.blocks[offset as usize].block().hash();
             if new_finalized.hash != expected_hash {
                 tracing::warn!(
                     ?new_finalized,
@@ -285,7 +283,7 @@ impl<S: L1Persistence> State<S> {
         let mut state = RwLockUpgradableReadGuard::upgrade(state).await;
         state
             .blocks_by_hash
-            .insert(new_block.block.hash, new_block.block.number);
+            .insert(new_block.block().hash(), new_block.block().number());
         state.blocks.push(new_block);
 
         Ok(())
@@ -294,11 +292,14 @@ impl<S: L1Persistence> State<S> {
     /// Reset the state back to the last persisted finalized state.
     async fn reorg(&mut self, stream: &mut impl ResettableStream) {
         tracing::warn!("reorg detected, resetting to finalized state");
-        stream.reset(self.blocks[0].block.number).await;
+        stream.reset(self.blocks[0].block().number()).await;
         self.blocks.truncate(1);
-        self.blocks_by_hash = [(self.blocks[0].block.hash, self.blocks[0].block.number)]
-            .into_iter()
-            .collect();
+        self.blocks_by_hash = [(
+            self.blocks[0].block().hash(),
+            self.blocks[0].block().number(),
+        )]
+        .into_iter()
+        .collect();
     }
 
     /// Handle a new finalized block.
@@ -312,7 +313,7 @@ impl<S: L1Persistence> State<S> {
         let mut nodes_set_diff = vec![];
         let mut wallets_diff = vec![];
         for block in &self.blocks[1..] {
-            if block.block.number > finalized {
+            if block.block().number() > finalized {
                 break;
             }
 
@@ -327,12 +328,7 @@ impl<S: L1Persistence> State<S> {
 
         let finalized_info = self.block(finalized)?;
         self.storage
-            .apply_events(
-                finalized_info.block,
-                finalized_info.timestamp,
-                nodes_set_diff,
-                wallets_diff,
-            )
+            .apply_events(finalized_info.block(), nodes_set_diff, wallets_diff)
             .await?;
         self.garbage_collect(finalized);
         Ok(())
@@ -347,12 +343,12 @@ impl<S: L1Persistence> State<S> {
     fn garbage_collect(&mut self, finalized: u64) {
         // Bring the new finalized block to the front of the list, shifting all now-old blocks to
         // the end.
-        let offset = (finalized - self.blocks[0].block.number) as usize;
+        let offset = (finalized - self.blocks[0].block().number()) as usize;
         self.blocks.rotate_left(offset);
         // Remove the old blocks, and also their entries in `blocks_by_hash`.
         for _ in 0..offset {
             let block = self.blocks.pop().unwrap();
-            self.blocks_by_hash.remove(&block.block.hash);
+            self.blocks_by_hash.remove(&block.block().hash());
         }
     }
 }
@@ -360,30 +356,21 @@ impl<S: L1Persistence> State<S> {
 /// Snapshots and updates for each L1 block.
 #[derive(Clone, Debug, PartialEq)]
 struct BlockData {
-    /// The L1 block.
-    block: L1BlockId,
-
-    /// The L1 block timestamp.
-    timestamp: Timestamp,
-
-    /// The full node set as of this L1 block.
-    node_set: NodeSet,
+    state: Snapshot,
 
     /// The change to the full node set between the previous L1 block and this one.
     ///
     /// This may be [`None`] when the previous L1 block has been garbage collected.
     node_set_update: Option<Vec<FullNodeSetDiff>>,
 
-    /// The state of each wallet as of this L1 block.
-    wallets: Wallets,
-
     /// The changes to each wallet between the previous L1 block and this one.
     ///
-    /// Unlike wallet snapshots, we don't benefit from using an immutable map here, as updates are
-    /// always unique to a block, not partially shared with previous blocks. However, the good news
-    /// is that only a few if any wallets will have non-trivial updates in any given block, so the
-    /// size of this set should be small in practice. We use a [`BTreeMap`] to further compress the
-    /// size of this set, as B-Trees should generally have a better memory footprint than hash maps.
+    /// Unlike [`Wallets`] snapshots, we don't benefit from using an immutable map here, as updates
+    /// are always unique to a block, not partially shared with previous blocks. However, the good
+    /// news is that only a few if any wallets will have non-trivial updates in any given block, so
+    /// the size of this set should be small in practice. We use a [`BTreeMap`] to further compress
+    /// the size of this set, as B-Trees should generally have a better memory footprint than hash
+    /// maps.
     ///
     /// If a wallet was not updated in a given block, it will not have an entry here, but a trivial
     /// [`WalletUpdate`] can always be generated for any account by combining the [`L1BlockInfo`]
@@ -391,6 +378,208 @@ struct BlockData {
     ///
     /// This may be [`None`] when the previous L1 block has been garbage collected.
     wallets_update: Option<BTreeMap<Address, Vec<WalletDiff>>>,
+}
+
+impl BlockData {
+    /// Get the [`BlockData`] that follows from this one after applying the next L1 block.
+    fn next(&self, input: &BlockInput) -> Self {
+        // Cloning entire state in order to apply updates and get the new state. This is cheap
+        // thanks to the magic of immutable data structures.
+        let mut state = self.state.clone();
+        let (node_set_update, wallets_update) = state.apply(input);
+        Self {
+            state,
+            node_set_update: Some(node_set_update),
+            wallets_update: Some(wallets_update),
+        }
+    }
+
+    fn block(&self) -> L1BlockSnapshot {
+        self.state.block
+    }
+}
+
+/// Data we capture about each L1 block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct L1BlockSnapshot {
+    /// The L1 block.
+    pub id: L1BlockId,
+
+    /// The L1 block timestamp.
+    pub timestamp: Timestamp,
+
+    /// The exit escrow period in the stake table contract as of this L1 block.
+    pub exit_escrow_period: u64,
+}
+
+impl L1BlockSnapshot {
+    pub fn id(&self) -> L1BlockId {
+        self.id
+    }
+
+    pub fn number(&self) -> u64 {
+        self.id.number
+    }
+
+    pub fn hash(&self) -> BlockHash {
+        self.id.hash
+    }
+
+    pub fn parent(&self) -> BlockHash {
+        self.id.parent
+    }
+
+    pub fn timestamp(&self) -> Timestamp {
+        self.timestamp
+    }
+
+    pub fn info(&self) -> L1BlockInfo {
+        L1BlockInfo {
+            number: self.id.number,
+            hash: self.id.hash,
+            timestamp: self.timestamp,
+        }
+    }
+}
+
+/// A snapshot of the L1-derived state after a certain L1 block.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Snapshot {
+    /// The L1 block.
+    block: L1BlockSnapshot,
+
+    /// The full node set as of this L1 block.
+    node_set: NodeSet,
+
+    /// The state of each wallet as of this L1 block.
+    wallets: Wallets,
+}
+
+impl Snapshot {
+    /// An empty snapshot starting at the given L1 block.
+    pub fn empty(block: L1BlockSnapshot) -> Self {
+        Self::new(block, Default::default(), Default::default())
+    }
+
+    /// A snapshot from an L1 block snapshot and snapshots of the node set and wallet state.
+    pub fn new(block: L1BlockSnapshot, node_set: NodeSet, wallets: Wallets) -> Self {
+        Self {
+            block,
+            node_set,
+            wallets,
+        }
+    }
+
+    /// Transform the state snapshot by applying a new L1 block.
+    ///
+    /// Returns the updates that were made while applying the block.
+    fn apply(
+        &mut self,
+        input: &BlockInput,
+    ) -> (Vec<FullNodeSetDiff>, BTreeMap<Address, Vec<WalletDiff>>) {
+        // Keep track of changes we apply.
+        let mut node_set_update = vec![];
+        let mut wallets_update = BTreeMap::<Address, Vec<WalletDiff>>::default();
+
+        // Update the L1 block information.
+        self.block = L1BlockSnapshot {
+            id: input.block,
+            timestamp: input.timestamp,
+            // The exit escrow period doesn't change unless we get an event saying so.
+            exit_escrow_period: self.block.exit_escrow_period,
+        };
+
+        for event in &input.events {
+            // Convert contract events into either node set or wallet updates, and apply updates
+            // to state snapshots.
+            let (nodes_diff, wallets_diff) = self.handle_event(input, event);
+            for diff in nodes_diff {
+                self.node_set.apply(&diff);
+                node_set_update.push(diff);
+            }
+            for (address, diff) in wallets_diff {
+                self.wallets.apply(address, &diff);
+                wallets_update.entry(address).or_default().push(diff);
+            }
+        }
+
+        (node_set_update, wallets_update)
+    }
+
+    /// Handle a single L1 event from a given L1 block.
+    ///
+    /// Updates the block state accordingly and returns the diffs that should be applied to the rest
+    /// of the state.
+    fn handle_event(
+        &mut self,
+        input: &BlockInput,
+        event: &L1Event,
+    ) -> (Vec<FullNodeSetDiff>, Vec<(Address, WalletDiff)>) {
+        tracing::debug!(?event, "processing L1 event");
+        match event {
+            L1Event::StakeTable(ev) => match ev.as_ref() {
+                StakeTableEvent::RegisterV2(ev) => {
+                    let diff = FullNodeSetDiff::NodeUpdate(NodeSetEntry {
+                        address: ev.account,
+                        staking_key: PubKey::from(ev.blsVK).into(),
+                        commission: Ratio::new(
+                            ev.commission.into(),
+                            COMMISSION_BASIS_POINTS.into(),
+                        ),
+                        // All nodes start with 0 stake, a separate delegation event will be
+                        // generated when someone delegates non-zero stake to a node.
+                        stake: ESPTokenAmount::ZERO,
+                    });
+                    (vec![diff], vec![])
+                }
+                StakeTableEvent::Register(ev) => {
+                    tracing::warn!("received legacy ValidatorRegistered event");
+                    let diff = FullNodeSetDiff::NodeUpdate(NodeSetEntry {
+                        address: ev.account,
+                        staking_key: PubKey::from(ev.blsVk).into(),
+                        commission: Ratio::new(
+                            ev.commission.into(),
+                            COMMISSION_BASIS_POINTS.into(),
+                        ),
+                        // All nodes start with 0 stake, a separate delegation event will be
+                        // generated when someone delegates non-zero stake to a node.
+                        stake: ESPTokenAmount::ZERO,
+                    });
+                    (vec![diff], vec![])
+                }
+                StakeTableEvent::KeyUpdate(_) => {
+                    todo!("implement event handling for StakeTableEvent::KeyUpdate")
+                }
+                StakeTableEvent::KeyUpdateV2(_) => {
+                    todo!("implement event handling for StakeTableEvent::KeyUpdateV2")
+                }
+                StakeTableEvent::CommissionUpdate(_) => {
+                    todo!("implement event handling for StakeTableEvent::CommissionUpdate")
+                }
+                StakeTableEvent::Delegate(_) => {
+                    todo!("implement event handling for StakeTableEvent::Delegate")
+                }
+                StakeTableEvent::Undelegate(_) => {
+                    todo!("implement event handling for StakeTableEvent::Undelegate")
+                }
+                StakeTableEvent::Deregister(ev) => {
+                    let diff = FullNodeSetDiff::NodeExit(NodeExit {
+                        address: ev.validator,
+                        exit_epoch_and_block: Default::default(), // TODO
+                        exit_time: input.timestamp + self.block.exit_escrow_period,
+                    });
+
+                    // TODO we should also emit a `WalletDiff::NodeExited` for each wallet that is
+                    // delegated to the exiting validator.
+                    (vec![diff], vec![])
+                }
+            },
+            L1Event::Reward(_) => {
+                // TODO
+                (vec![], vec![])
+            }
+        }
+    }
 }
 
 /// The state of every wallet.
@@ -484,50 +673,6 @@ impl NodeSet {
     }
 }
 
-impl BlockData {
-    fn block_info(&self) -> L1BlockInfo {
-        L1BlockInfo {
-            number: self.block.number,
-            hash: self.block.hash,
-            timestamp: self.timestamp,
-        }
-    }
-
-    fn next(&self, input: &BlockInput) -> Self {
-        // Cloning entire state in order to apply updates and get the new state. This is cheap
-        // thanks to the magic of immutable data structures.
-        let mut node_set = self.node_set.clone();
-        let mut wallets = self.wallets.clone();
-
-        // Keep track of changes we apply.
-        let mut node_set_update = vec![];
-        let mut wallets_update = BTreeMap::<Address, Vec<WalletDiff>>::default();
-
-        for event in &input.events {
-            // Convert contract events into either node set or wallet updates, and apply updates
-            // to state snapshots.
-            let (nodes_diff, wallets_diff) = event.diffs();
-            for diff in nodes_diff {
-                node_set.apply(&diff);
-                node_set_update.push(diff);
-            }
-            for (address, diff) in wallets_diff {
-                wallets.apply(address, &diff);
-                wallets_update.entry(address).or_default().push(diff);
-            }
-        }
-
-        Self {
-            block: input.block,
-            timestamp: input.timestamp,
-            node_set,
-            node_set_update: Some(node_set_update),
-            wallets,
-            wallets_update: Some(wallets_update),
-        }
-    }
-}
-
 /// The minimal data we need in order to ingest a new L1 block.
 #[derive(Clone, Debug)]
 pub struct BlockInput {
@@ -566,68 +711,6 @@ impl From<StakeTableEvent> for L1Event {
     }
 }
 
-impl L1Event {
-    /// Extract changes to our state snapshot caused by this event.
-    pub fn diffs(&self) -> (Vec<FullNodeSetDiff>, Vec<(Address, WalletDiff)>) {
-        tracing::debug!(?self, "processing L1 event");
-        match self {
-            Self::StakeTable(ev) => match ev.as_ref() {
-                StakeTableEvent::RegisterV2(ev) => {
-                    let diff = FullNodeSetDiff::NodeUpdate(NodeSetEntry {
-                        address: ev.account,
-                        staking_key: PubKey::from(ev.blsVK).into(),
-                        commission: Ratio::new(
-                            ev.commission.into(),
-                            COMMISSION_BASIS_POINTS.into(),
-                        ),
-                        // All nodes start with 0 stake, a separate delegation event will be
-                        // generated when someone delegates non-zero stake to a node.
-                        stake: ESPTokenAmount::ZERO,
-                    });
-                    (vec![diff], vec![])
-                }
-                StakeTableEvent::Register(ev) => {
-                    tracing::warn!("received legacy ValidatorRegistered event");
-                    let diff = FullNodeSetDiff::NodeUpdate(NodeSetEntry {
-                        address: ev.account,
-                        staking_key: PubKey::from(ev.blsVk).into(),
-                        commission: Ratio::new(
-                            ev.commission.into(),
-                            COMMISSION_BASIS_POINTS.into(),
-                        ),
-                        // All nodes start with 0 stake, a separate delegation event will be
-                        // generated when someone delegates non-zero stake to a node.
-                        stake: ESPTokenAmount::ZERO,
-                    });
-                    (vec![diff], vec![])
-                }
-                StakeTableEvent::KeyUpdate(_) => {
-                    todo!("implement event handling for StakeTableEvent::KeyUpdate")
-                }
-                StakeTableEvent::KeyUpdateV2(_) => {
-                    todo!("implement event handling for StakeTableEvent::KeyUpdateV2")
-                }
-                StakeTableEvent::CommissionUpdate(_) => {
-                    todo!("implement event handling for StakeTableEvent::CommissionUpdate")
-                }
-                StakeTableEvent::Delegate(_) => {
-                    todo!("implement event handling for StakeTableEvent::Delegate")
-                }
-                StakeTableEvent::Undelegate(_) => {
-                    todo!("implement event handling for StakeTableEvent::Undelegate")
-                }
-                StakeTableEvent::Deregister(_) => {
-                    todo!("implement event handling for StakeTableEvent::Deregister")
-                }
-            },
-            Self::Reward(_) => {
-                // TODO
-                (vec![], vec![])
-            }
-        }
-    }
-}
-
 /// A stream of information incoming from the L1.
 ///
 /// This stream is special in that it has an interface for resetting back to the finalized block.
@@ -652,45 +735,21 @@ pub trait ResettableStream: Unpin + Stream<Item = BlockInput> {
     fn reset(&mut self, number: u64) -> impl Send + Future<Output = ()>;
 }
 
-/// The information which must be stored in persistent storage.
-#[derive(Clone, Debug, PartialEq)]
-pub struct PersistentSnapshot {
-    pub block: L1BlockId,
-    pub timestamp: Timestamp,
-    pub node_set: NodeSet,
-    pub wallets: Wallets,
-}
-
-impl PersistentSnapshot {
-    /// An empty genesis snapshot starting at the given L1 block.
-    pub fn genesis(block: L1BlockId, timestamp: Timestamp) -> Self {
-        Self {
-            block,
-            timestamp,
-            node_set: Default::default(),
-            wallets: Default::default(),
-        }
-    }
-}
-
 /// Persistent storage for the L1 data.
 pub trait L1Persistence: Send {
     /// Fetch the latest persisted snapshot.
-    fn finalized_snapshot(&self)
-    -> impl Send + Future<Output = Result<Option<PersistentSnapshot>>>;
+    fn finalized_snapshot(&self) -> impl Send + Future<Output = Result<Option<Snapshot>>>;
 
     /// Apply changes to persistent storage up to the specified L1 block.
     fn apply_events(
         &self,
-        block: L1BlockId,
-        timestamp: Timestamp,
+        block: L1BlockSnapshot,
         node_set_diff: impl IntoIterator<Item = FullNodeSetDiff> + Send,
         wallets_diff: impl IntoIterator<Item = (Address, WalletDiff)> + Send,
     ) -> impl Send + Future<Output = Result<()>>;
 
     /// Save an initial snapshot to a previously empty database.
-    fn save_genesis(&self, snapshot: PersistentSnapshot)
-    -> impl Send + Future<Output = Result<()>>;
+    fn save_genesis(&self, snapshot: Snapshot) -> impl Send + Future<Output = Result<()>>;
 }
 
 #[cfg(test)]
@@ -706,7 +765,7 @@ mod test {
     };
 
     use crate::{
-        input::l1::testing::{InputGenerator, subscribe_until},
+        input::l1::testing::{InputGenerator, block_snapshot, subscribe_until},
         types::common::{Delegation, Ratio},
     };
 
@@ -720,7 +779,7 @@ mod test {
         for block in blocks {
             state
                 .blocks_by_hash
-                .insert(block.block.hash, block.block.number);
+                .insert(block.block().hash(), block.block().number());
             state.blocks.push(block);
         }
         state
@@ -738,7 +797,10 @@ mod test {
             assert_eq!(&state.blocks, &blocks[finalized..]);
             assert_eq!(state.blocks.len(), state.blocks_by_hash.len());
             for block in &state.blocks {
-                assert_eq!(state.blocks_by_hash[&block.block.hash], block.block.number);
+                assert_eq!(
+                    state.blocks_by_hash[&block.block().hash()],
+                    block.block().number()
+                );
             }
         }
     }
@@ -757,8 +819,8 @@ mod test {
         assert_eq!(err.status(), StatusCode::NOT_FOUND);
 
         // Query for known block.
-        assert_eq!(state.l1_block(1).unwrap(), block.block);
-        assert_eq!(state.latest_l1_block(), block.block);
+        assert_eq!(state.l1_block(1).unwrap(), block.block().id());
+        assert_eq!(state.latest_l1_block(), block.block().id());
     }
 
     #[test_log::test]
@@ -768,13 +830,13 @@ mod test {
 
         let mut block = BlockData::empty(1);
         let node = make_node(0);
-        block.node_set.push(node.clone());
+        block.state.node_set.push(node.clone());
         block.node_set_update = Some(vec![FullNodeSetDiff::NodeUpdate(node)]);
 
         let state = from_blocks::<MemoryStorage>([finalized.clone(), block.clone()]);
 
         // Query for unknown block.
-        let unknown = BlockData::empty(2).block.hash;
+        let unknown = BlockData::empty(2).block().hash();
         let err = state.full_node_set(unknown).unwrap_err();
         assert_eq!(err.status(), StatusCode::NOT_FOUND);
         let err = state.full_node_set_update(unknown).unwrap_err();
@@ -782,18 +844,18 @@ mod test {
 
         // Query for deleted update.
         let err = state
-            .full_node_set_update(finalized.block.hash)
+            .full_node_set_update(finalized.block().hash())
             .unwrap_err();
         assert_eq!(err.status(), StatusCode::GONE);
 
         // Query for known block.
         assert_eq!(
-            state.full_node_set(block.block.hash).unwrap(),
-            (block.node_set.clone(), block.block_info())
+            state.full_node_set(block.block().hash()).unwrap(),
+            (block.state.node_set.clone(), block.block().info())
         );
-        let update = state.full_node_set_update(block.block.hash).unwrap();
+        let update = state.full_node_set_update(block.block().hash()).unwrap();
         assert_eq!(&update.diff, block.node_set_update.as_ref().unwrap());
-        assert_eq!(update.l1_block, block.block_info());
+        assert_eq!(update.l1_block, block.block().info());
     }
 
     #[test_log::test]
@@ -814,7 +876,7 @@ mod test {
         };
 
         let mut block = BlockData::empty(1);
-        block.wallets.insert(address, wallet.clone());
+        block.state.wallets.insert(address, wallet.clone());
         block
             .wallets_update
             .as_mut()
@@ -822,19 +884,20 @@ mod test {
             .insert(address, vec![WalletDiff::DelegatedToNode(delegation)]);
         // Let `address` be known even in the finalized snapshot, so we can test queries for a known
         // wallet in a block whose update field has been deleted.
-        finalized.wallets = block.wallets.clone();
+        finalized.state.wallets = block.state.wallets.clone();
         // Insert a second wallet that is not updated by this block, so we can test queries for
         // updates for a known wallet with no non-trivial update.
         let not_updated = Address::random();
         let not_updated_wallet = Wallet::default();
         block
+            .state
             .wallets
             .insert(not_updated, not_updated_wallet.clone());
 
         let state = from_blocks::<MemoryStorage>([finalized.clone(), block.clone()]);
 
         // Query for unknown block.
-        let unknown = BlockData::empty(2).block.hash;
+        let unknown = BlockData::empty(2).block().hash();
         let err = state.wallet(address, unknown).unwrap_err();
         assert_eq!(err.status(), StatusCode::NOT_FOUND);
         let err = state.wallet_update(address, unknown).unwrap_err();
@@ -842,41 +905,43 @@ mod test {
 
         // Query for unknown address.
         let err = state
-            .wallet(Address::random(), block.block.hash)
+            .wallet(Address::random(), block.block().hash())
             .unwrap_err();
         assert_eq!(err.status(), StatusCode::NOT_FOUND);
         let err = state
-            .wallet_update(Address::random(), block.block.hash)
+            .wallet_update(Address::random(), block.block().hash())
             .unwrap_err();
         assert_eq!(err.status(), StatusCode::NOT_FOUND);
 
         // Query for known address with no updates.
         assert_eq!(
-            state.wallet(not_updated, block.block.hash).unwrap(),
-            (not_updated_wallet, block.block_info())
+            state.wallet(not_updated, block.block().hash()).unwrap(),
+            (not_updated_wallet, block.block().info())
         );
         assert_eq!(
-            state.wallet_update(not_updated, block.block.hash).unwrap(),
+            state
+                .wallet_update(not_updated, block.block().hash())
+                .unwrap(),
             WalletUpdate {
-                l1_block: block.block_info(),
+                l1_block: block.block().info(),
                 diff: vec![]
             }
         );
 
         // Query for deleted update.
         let err = state
-            .wallet_update(address, finalized.block.hash)
+            .wallet_update(address, finalized.block().hash())
             .unwrap_err();
         assert_eq!(err.status(), StatusCode::GONE);
 
         // Query for known wallet.
         assert_eq!(
-            state.wallet(address, block.block.hash).unwrap(),
-            (wallet, block.block_info())
+            state.wallet(address, block.block().hash()).unwrap(),
+            (wallet, block.block().info())
         );
-        let update = state.wallet_update(address, block.block.hash).unwrap();
+        let update = state.wallet_update(address, block.block().hash()).unwrap();
         assert_eq!(&update.diff, &[WalletDiff::DelegatedToNode(delegation)]);
-        assert_eq!(update.l1_block, block.block_info());
+        assert_eq!(update.l1_block, block.block().info());
     }
 
     #[test_log::test]
@@ -910,8 +975,8 @@ mod test {
 
             tracing::debug!("checking state consistency");
             let validators = state.validators();
-            assert_eq!(validators.len(), block.node_set.len());
-            for node in block.node_set.values() {
+            assert_eq!(validators.len(), block.state.node_set.len());
+            for node in block.state.node_set.values() {
                 let validator = &validators[&node.address];
                 assert_eq!(node.address, validator.account);
                 assert_eq!(
@@ -925,7 +990,7 @@ mod test {
 
         tracing::info!(
             "complete replay, processed {num_events} events and ended with {} nodes",
-            block.node_set.len()
+            block.state.node_set.len()
         );
     }
 
@@ -936,16 +1001,17 @@ mod test {
         // Realistically large state: 500 registered validators, 10000 delegators, each delegating
         // to 10 different nodes.
         for i in 0..500 {
-            block.node_set.push(make_node(i));
+            block.state.node_set.push(make_node(i));
         }
         for i in 0..10_000 {
             let delegator = Address::random();
             let mut wallet = Wallet::default();
             for j in 0..10 {
                 let node = *block
+                    .state
                     .node_set
                     .keys()
-                    .nth((i + j) % block.node_set.len())
+                    .nth((i + j) % block.state.node_set.len())
                     .unwrap();
                 let delegation = Delegation {
                     delegator,
@@ -955,7 +1021,7 @@ mod test {
                 };
                 wallet.nodes.push_back(delegation);
             }
-            block.wallets.insert(delegator, wallet);
+            block.state.wallets.insert(delegator, wallet);
         }
 
         // Apply random events. It should take on average no more than 12 seconds (although in
@@ -996,8 +1062,8 @@ mod test {
         // Check that the new block has been added and state has been garbage collected.
         let state = state.read().await;
         assert_eq!(state.blocks.len(), 2);
-        assert_eq!(state.blocks[0].block, block_id(2));
-        assert_eq!(state.blocks[1].block, block_id(3));
+        assert_eq!(state.blocks[0].block(), block_snapshot(2));
+        assert_eq!(state.blocks[1].block(), block_snapshot(3));
         assert_eq!(state.blocks_by_hash.len(), 2);
         assert_eq!(
             state.blocks_by_hash[&finalized.finalized.hash],
@@ -1016,7 +1082,8 @@ mod test {
                 .await
                 .unwrap()
                 .unwrap()
-                .block,
+                .block
+                .id(),
             finalized.finalized
         );
     }
@@ -1066,7 +1133,7 @@ mod test {
         assert_eq!(state.blocks.len(), 3);
         assert_eq!(state.blocks_by_hash.len(), 3);
         for i in 0..3 {
-            assert_eq!(state.blocks[i as usize].block, block_id(i));
+            assert_eq!(state.blocks[i as usize].block(), block_snapshot(i));
             assert_eq!(state.blocks_by_hash[&block_id(i).hash], i);
         }
     }
@@ -1099,7 +1166,7 @@ mod test {
         assert_eq!(state.blocks.len(), 5);
         assert_eq!(state.blocks_by_hash.len(), 5);
         for i in 0..5 {
-            assert_eq!(state.blocks[i as usize].block, block_id(i));
+            assert_eq!(state.blocks[i as usize].block(), block_snapshot(i));
             assert_eq!(state.blocks_by_hash[&block_id(i).hash], i);
         }
     }
@@ -1136,7 +1203,7 @@ mod test {
         assert_eq!(state.blocks.len(), 4);
         assert_eq!(state.blocks_by_hash.len(), 4);
         for (input, block) in inputs.iter().zip(&state.blocks) {
-            assert_eq!(block.block, input.block);
+            assert_eq!(block.block().id(), input.block);
             assert_eq!(state.blocks_by_hash[&input.block.hash], input.block.number);
         }
 
@@ -1148,7 +1215,8 @@ mod test {
                 .await
                 .unwrap()
                 .unwrap()
-                .block,
+                .block
+                .id(),
             inputs[0].block
         );
     }
@@ -1163,7 +1231,7 @@ mod test {
         stream.push(block_2);
 
         // Start up and run until block 1 is finalized.
-        let genesis = PersistentSnapshot::genesis(block_id(0), 0);
+        let genesis = Snapshot::empty(block_snapshot(0));
         let storage = MemoryStorage::default();
         let state = Arc::new(RwLock::new(
             State::new(storage.clone(), genesis.clone()).await.unwrap(),
@@ -1173,21 +1241,23 @@ mod test {
             storage.finalized_snapshot().await.unwrap().unwrap(),
             genesis
         );
-        let state =
-            subscribe_until(&state, stream, |state| state.blocks[0].block.number == 1).await;
+        let state = subscribe_until(&state, stream, |state| {
+            state.blocks[0].block().number() == 1
+        })
+        .await;
         assert_eq!(state.blocks.len(), 2);
         assert_eq!(
             storage.finalized_snapshot().await.unwrap().unwrap().block,
-            block_id(1)
+            block_snapshot(1)
         );
         drop(state);
 
         // Restart and check that we reload the finalized snapshot (and don't use the genesis, for
         // which we will pass in some nonsense).
-        let genesis = PersistentSnapshot::genesis(block_id(1000), 12_000);
+        let genesis = Snapshot::empty(block_snapshot(1000));
         let state = State::new(storage.clone(), genesis).await.unwrap();
         assert_eq!(state.blocks.len(), 1);
-        assert_eq!(state.blocks[0].block, block_id(1));
+        assert_eq!(state.blocks[0].block(), block_snapshot(1));
 
         // Subscribe to new blocks starting from where we left off (with block 1 being finalized,
         // the next block would be block 2).
@@ -1196,7 +1266,7 @@ mod test {
         let state = Arc::new(RwLock::new(state));
         let state = subscribe_until(&state, stream, |state| state.blocks.len() >= 2).await;
         assert_eq!(state.blocks.len(), 2);
-        assert_eq!(state.blocks[0].block, block_id(1));
-        assert_eq!(state.blocks[1].block, block_id(2));
+        assert_eq!(state.blocks[0].block(), block_snapshot(1));
+        assert_eq!(state.blocks[1].block(), block_snapshot(2));
     }
 }
