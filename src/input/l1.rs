@@ -8,7 +8,10 @@ use std::{
 use alloy::primitives::BlockHash;
 use async_lock::{RwLock, RwLockUpgradableReadGuard, RwLockWriteGuard};
 use derive_more::{Deref, DerefMut};
-use espresso_types::v0_3::StakeTableEvent;
+use espresso_types::{
+    PubKey,
+    v0_3::{COMMISSION_BASIS_POINTS, StakeTableEvent},
+};
 use futures::stream::{Stream, StreamExt};
 use hotshot_contract_adapter::sol_types::RewardClaim::RewardClaimEvents;
 use tracing::instrument;
@@ -18,7 +21,7 @@ use crate::{
     types::{
         common::{
             Address, Delegation, ESPTokenAmount, L1BlockId, L1BlockInfo, NodeSetEntry,
-            PendingWithdrawal, Timestamp,
+            PendingWithdrawal, Ratio, Timestamp,
         },
         global::{FullNodeSetDiff, FullNodeSetSnapshot, FullNodeSetUpdate},
         wallet::{WalletDiff, WalletSnapshot, WalletUpdate},
@@ -464,8 +467,15 @@ impl NodeSet {
     }
 
     /// Mutate this node set by applying a diff.
-    pub fn apply(&mut self, _diff: &FullNodeSetDiff) {
-        // TODO
+    pub fn apply(&mut self, diff: &FullNodeSetDiff) {
+        match diff {
+            FullNodeSetDiff::NodeUpdate(node) => {
+                self.insert(node.address, node.clone());
+            }
+            FullNodeSetDiff::NodeExit(node) => {
+                self.remove(&node.address);
+            }
+        }
     }
 
     /// Add a node to the set.
@@ -544,11 +554,77 @@ pub enum L1Event {
     StakeTable(Arc<StakeTableEvent>),
 }
 
+impl From<RewardClaimEvents> for L1Event {
+    fn from(event: RewardClaimEvents) -> Self {
+        Self::Reward(Arc::new(event))
+    }
+}
+
+impl From<StakeTableEvent> for L1Event {
+    fn from(event: StakeTableEvent) -> Self {
+        Self::StakeTable(Arc::new(event))
+    }
+}
+
 impl L1Event {
     /// Extract changes to our state snapshot caused by this event.
     pub fn diffs(&self) -> (Vec<FullNodeSetDiff>, Vec<(Address, WalletDiff)>) {
-        // TODO
-        (vec![], vec![])
+        tracing::debug!(?self, "processing L1 event");
+        match self {
+            Self::StakeTable(ev) => match ev.as_ref() {
+                StakeTableEvent::RegisterV2(ev) => {
+                    let diff = FullNodeSetDiff::NodeUpdate(NodeSetEntry {
+                        address: ev.account,
+                        staking_key: PubKey::from(ev.blsVK).into(),
+                        commission: Ratio::new(
+                            ev.commission.into(),
+                            COMMISSION_BASIS_POINTS.into(),
+                        ),
+                        // All nodes start with 0 stake, a separate delegation event will be
+                        // generated when someone delegates non-zero stake to a node.
+                        stake: ESPTokenAmount::ZERO,
+                    });
+                    (vec![diff], vec![])
+                }
+                StakeTableEvent::Register(ev) => {
+                    tracing::warn!("received legacy ValidatorRegistered event");
+                    let diff = FullNodeSetDiff::NodeUpdate(NodeSetEntry {
+                        address: ev.account,
+                        staking_key: PubKey::from(ev.blsVk).into(),
+                        commission: Ratio::new(
+                            ev.commission.into(),
+                            COMMISSION_BASIS_POINTS.into(),
+                        ),
+                        // All nodes start with 0 stake, a separate delegation event will be
+                        // generated when someone delegates non-zero stake to a node.
+                        stake: ESPTokenAmount::ZERO,
+                    });
+                    (vec![diff], vec![])
+                }
+                StakeTableEvent::KeyUpdate(_) => {
+                    todo!("implement event handling for StakeTableEvent::KeyUpdate")
+                }
+                StakeTableEvent::KeyUpdateV2(_) => {
+                    todo!("implement event handling for StakeTableEvent::KeyUpdateV2")
+                }
+                StakeTableEvent::CommissionUpdate(_) => {
+                    todo!("implement event handling for StakeTableEvent::CommissionUpdate")
+                }
+                StakeTableEvent::Delegate(_) => {
+                    todo!("implement event handling for StakeTableEvent::Delegate")
+                }
+                StakeTableEvent::Undelegate(_) => {
+                    todo!("implement event handling for StakeTableEvent::Undelegate")
+                }
+                StakeTableEvent::Deregister(_) => {
+                    todo!("implement event handling for StakeTableEvent::Deregister")
+                }
+            },
+            Self::Reward(_) => {
+                // TODO
+                (vec![], vec![])
+            }
+        }
     }
 }
 
@@ -621,16 +697,16 @@ pub trait L1Persistence: Send {
 mod test {
     use std::time::{Duration, Instant};
 
-    use espresso_types::validators_from_l1_events;
+    use espresso_types::StakeTableState;
     use tide_disco::{Error as _, StatusCode};
 
     use super::{
-        testing::{FailStorage, MemoryStorage, VecStream, block_id, make_node, random_block_input},
+        testing::{FailStorage, MemoryStorage, VecStream, block_id, make_node},
         *,
     };
 
     use crate::{
-        input::l1::testing::subscribe_until,
+        input::l1::testing::{InputGenerator, subscribe_until},
         types::common::{Delegation, Ratio},
     };
 
@@ -806,19 +882,34 @@ mod test {
     #[test_log::test]
     fn test_replay_consistency() {
         let mut block = BlockData::empty(0);
-        let mut events = vec![];
+        let mut state = StakeTableState::default();
+        let mut num_events = 0;
 
-        let inputs = (0..100).map(random_block_input);
+        let inputs = InputGenerator::default().take(100);
         for input in inputs {
+            tracing::info!(?input, "apply input");
+            num_events += input.events.len();
+
             // Compute the full node set snapshot as the staking UI service would do it.
+            let start = Instant::now();
             block = block.next(&input);
+            tracing::debug!(elapsed = ?start.elapsed(), "updated BlockData");
 
             // Compute the Espresso validator set as the protocol does it.
-            events.extend(input.events.iter().filter_map(|event| match event {
-                L1Event::StakeTable(ev) => Some(ev.as_ref().clone()),
-                _ => None,
-            }));
-            let validators = validators_from_l1_events(events.iter().cloned()).unwrap().0;
+            let start = Instant::now();
+            for event in &input.events {
+                if let L1Event::StakeTable(e) = event {
+                    state.apply_event(e.as_ref().clone()).unwrap().unwrap();
+                }
+            }
+            tracing::debug!(
+                elapsed = ?start.elapsed(),
+                events = input.events.len(),
+                "updated StakeTableState",
+            );
+
+            tracing::debug!("checking state consistency");
+            let validators = state.validators();
             assert_eq!(validators.len(), block.node_set.len());
             for node in block.node_set.values() {
                 let validator = &validators[&node.address];
@@ -831,6 +922,11 @@ mod test {
                 assert_eq!(node.staking_key, validator.stake_table_key.into());
             }
         }
+
+        tracing::info!(
+            "complete replay, processed {num_events} events and ended with {} nodes",
+            block.node_set.len()
+        );
     }
 
     #[test_log::test]
@@ -865,7 +961,7 @@ mod test {
         // Apply random events. It should take on average no more than 12 seconds (although in
         // practice it should be much less), since that is how long we have to process an L1 block
         // in the real world.
-        let inputs = (0..100).map(random_block_input);
+        let inputs = InputGenerator::default().take(100);
         let start = Instant::now();
         for input in inputs {
             block = block.next(&input);
@@ -877,7 +973,7 @@ mod test {
 
     #[test_log::test(tokio::test(flavor = "multi_thread"))]
     async fn test_finalize_success() {
-        let inputs = (1..3).map(random_block_input).collect::<Vec<_>>();
+        let inputs = (1..3).map(BlockInput::empty).collect::<Vec<_>>();
         let stream = &mut VecStream::default();
 
         // Start with just the finalized state.
@@ -891,7 +987,7 @@ mod test {
         }
 
         // Apply a finalized block.
-        let mut finalized = random_block_input(3);
+        let mut finalized = BlockInput::empty(3);
         finalized.finalized = block_id(2);
         State::handle_new_head(state.upgradable_read().await, stream, &finalized)
             .await
@@ -927,7 +1023,7 @@ mod test {
 
     #[test_log::test(tokio::test(flavor = "multi_thread"))]
     async fn test_finalize_storage_failure() {
-        let inputs = (1..3).map(random_block_input).collect::<Vec<_>>();
+        let inputs = (1..3).map(BlockInput::empty).collect::<Vec<_>>();
         let stream = &mut VecStream::default();
 
         // Start with just the finalized state.
@@ -943,7 +1039,7 @@ mod test {
         // Apply a finalized block. Storing the finalized snapshot will fail, and on failure the
         // state should not be modified.
         let initial_state = { state.read().await.clone() };
-        let mut finalized = random_block_input(3);
+        let mut finalized = BlockInput::empty(3);
         finalized.finalized = block_id(2);
         State::handle_new_head(state.upgradable_read().await, stream, &finalized)
             .await
@@ -957,7 +1053,7 @@ mod test {
     async fn test_subscribe_happy_path() {
         let mut stream = VecStream::infinite();
         for i in 1..3 {
-            stream.push(random_block_input(i));
+            stream.push(BlockInput::empty(i));
         }
 
         // Start with just the finalized state.
@@ -977,7 +1073,7 @@ mod test {
 
     #[test_log::test(tokio::test(flavor = "multi_thread"))]
     async fn test_subscribe_reorg_head() {
-        let inputs = (1..5).map(random_block_input).collect::<Vec<_>>();
+        let inputs = (1..5).map(BlockInput::empty).collect::<Vec<_>>();
 
         let mut stream = VecStream::infinite();
         stream.push(inputs[0].clone());
@@ -1010,7 +1106,7 @@ mod test {
 
     #[test_log::test(tokio::test(flavor = "multi_thread"))]
     async fn test_subscribe_reorg_finalized() {
-        let mut inputs = (1..5).map(random_block_input).collect::<Vec<_>>();
+        let mut inputs = (1..5).map(BlockInput::empty).collect::<Vec<_>>();
 
         let mut stream = VecStream::infinite();
         stream.push(inputs[0].clone());
@@ -1060,9 +1156,9 @@ mod test {
     #[test_log::test(tokio::test(flavor = "multi_thread"))]
     async fn test_restart() {
         let mut stream = VecStream::infinite();
-        stream.push(random_block_input(1));
+        stream.push(BlockInput::empty(1));
         // Second block finalizes the first block.
-        let mut block_2 = random_block_input(2);
+        let mut block_2 = BlockInput::empty(2);
         block_2.finalized = block_id(1);
         stream.push(block_2);
 
@@ -1096,7 +1192,7 @@ mod test {
         // Subscribe to new blocks starting from where we left off (with block 1 being finalized,
         // the next block would be block 2).
         let mut stream = VecStream::infinite();
-        stream.push(random_block_input(2));
+        stream.push(BlockInput::empty(2));
         let state = Arc::new(RwLock::new(state));
         let state = subscribe_until(&state, stream, |state| state.blocks.len() >= 2).await;
         assert_eq!(state.blocks.len(), 2);

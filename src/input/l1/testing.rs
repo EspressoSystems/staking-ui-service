@@ -1,6 +1,7 @@
 #![cfg(any(test, feature = "testing"))]
 
 use std::{
+    collections::HashSet,
     pin::Pin,
     task::{Context, Poll},
     time::Duration,
@@ -8,23 +9,33 @@ use std::{
 
 use alloy::{
     network::EthereumWallet,
-    primitives::{U256, keccak256},
+    primitives::{FixedBytes, U256, keccak256},
     providers::{ProviderBuilder, WalletProvider},
     rpc::types::TransactionReceipt,
     signers::local::PrivateKeySigner,
+    sol_types::SolValue,
 };
 use async_lock::RwLockReadGuard;
 use espresso_contract_deployer::{
     Contract, Contracts, HttpProviderWithWallet, build_signer, builder::DeployerArgsBuilder,
     network_config::light_client_genesis_from_stake_table,
 };
+use espresso_types::v0::v0_3::StakeTableEvent;
 use hotshot_contract_adapter::{
-    sol_types::{G1PointSol, StakeTableV2},
+    sol_types::{
+        G1PointSol,
+        StakeTableV2::{self, ValidatorExit, ValidatorRegistered, ValidatorRegisteredV2},
+    },
     stake_table::{StateSignatureSol, sign_address_bls, sign_address_schnorr},
 };
 use hotshot_state_prover::v1::mock_ledger::STAKE_TABLE_CAPACITY_FOR_TEST;
-use hotshot_types::{light_client::StateKeyPair, signature_key::BLSKeyPair};
-use rand::{Rng, SeedableRng, rngs::StdRng};
+use hotshot_types::{
+    light_client::{StateKeyPair, StateVerKey, hash_bytes_to_field},
+    signature_key::BLSKeyPair,
+    traits::signature_key::{SignatureKey, StateSignatureKey},
+};
+use jf_signature::{SignatureScheme, schnorr::SchnorrSignatureScheme};
+use rand::{Rng, RngCore, SeedableRng, rngs::StdRng, seq::IteratorRandom};
 use staking_cli::demo::{DelegationConfig, StakingTransactions};
 use tagged_base64::TaggedBase64;
 use tide_disco::{Error as _, StatusCode, Url};
@@ -210,10 +221,147 @@ pub fn make_node(i: usize) -> NodeSetEntry {
     }
 }
 
-/// Generate a random L1 input for testing.
-pub fn random_block_input(number: u64) -> BlockInput {
-    // TODO populate random events
-    BlockInput::empty(number)
+/// Generate random L1 events for testing.
+///
+/// The generation process is stateful, which makes it possible to generate random events such that
+/// every generated event is "valid" given the events that came before it (e.g. no duplicate
+/// registrations, no delegations to an unregistered validator, etc.).
+#[derive(Debug)]
+pub struct EventGenerator {
+    nodes: HashSet<Address>,
+    rng: StdRng,
+}
+
+impl Default for EventGenerator {
+    fn default() -> Self {
+        Self {
+            nodes: Default::default(),
+            rng: StdRng::from_seed(Default::default()),
+        }
+    }
+}
+
+impl Iterator for EventGenerator {
+    type Item = L1Event;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // Generate a random event until we get one that is possible given the current state.
+        loop {
+            // Assign each type of event a numeric code.
+            const REGISTER: usize = 0;
+            const REGISTER_V2: usize = 1;
+            const DEREGISTER: usize = 2;
+            const MAX_EVENT_TYPE: usize = 3;
+
+            // Generate the code for a random event type.
+            let event_type = self.rng.gen_range(0..MAX_EVENT_TYPE);
+
+            let event = match event_type {
+                // Register, RegisterV2
+                t @ (REGISTER | REGISTER_V2) => {
+                    let mut address_bytes = FixedBytes::<32>::default();
+                    self.rng.fill_bytes(address_bytes.as_mut_slice());
+                    let account = Address::from_word(address_bytes);
+
+                    // Insert the node so we can reference it in later events (like delegations).
+                    // This insert should always return `true` because with a random address, it is
+                    // vanishingly unlikely we have generated this same address before.
+                    assert!(self.nodes.insert(account));
+
+                    let index = self.rng.next_u64();
+                    let (bls_vk, bls_sk) =
+                        PubKey::generated_from_seed_indexed(Default::default(), index);
+                    let (schnorr_vk, schnorr_sk) =
+                        StateVerKey::generated_from_seed_indexed(Default::default(), index);
+
+                    let commission = self.rng.gen_range(0..COMMISSION_BASIS_POINTS);
+
+                    if t == REGISTER {
+                        StakeTableEvent::Register(ValidatorRegistered {
+                            account,
+                            blsVk: bls_vk.into(),
+                            schnorrVk: schnorr_vk.into(),
+                            commission,
+                        })
+                        .into()
+                    } else {
+                        let auth_msg = account.abi_encode();
+                        let bls_sig = PubKey::sign(&bls_sk, &auth_msg).unwrap();
+                        let schnorr_sig = SchnorrSignatureScheme::sign(
+                            &(),
+                            &schnorr_sk,
+                            [hash_bytes_to_field(&auth_msg).unwrap()],
+                            &mut self.rng,
+                        )
+                        .unwrap();
+
+                        StakeTableEvent::RegisterV2(ValidatorRegisteredV2 {
+                            account,
+                            blsVK: bls_vk.into(),
+                            schnorrVK: schnorr_vk.into(),
+                            commission,
+                            blsSig: G1PointSol::from(bls_sig).into(),
+                            schnorrSig: StateSignatureSol::from(schnorr_sig).into(),
+                        })
+                        .into()
+                    }
+                }
+
+                // Deregister
+                DEREGISTER => {
+                    // Choose a random node to deregister.
+                    let Some(&node) = self.nodes.iter().choose(&mut self.rng) else {
+                        // If there are none try again.
+                        continue;
+                    };
+
+                    StakeTableEvent::Deregister(ValidatorExit { validator: node }).into()
+                }
+
+                _ => unreachable!(),
+            };
+            return Some(event);
+        }
+    }
+}
+
+/// Generate random L1 inputs for testing.
+///
+/// The generation process is stateful, which makes it possible to generate random events in a
+/// sequence of L1 blocks such that every generated event is "valid" given the events that came
+/// before it (e.g. no duplicate registrations, no delegations to an unregistered validator, etc.).
+#[derive(Debug)]
+pub struct InputGenerator {
+    events: EventGenerator,
+    next_block: u64,
+    rng: StdRng,
+}
+
+impl Default for InputGenerator {
+    fn default() -> Self {
+        Self {
+            events: Default::default(),
+            next_block: 0,
+            rng: StdRng::from_seed(Default::default()),
+        }
+    }
+}
+
+impl Iterator for InputGenerator {
+    type Item = BlockInput;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // Select a realistic random number of events to include in this block.
+        let n_events = self.rng.gen_range(0..5);
+
+        // Generate block.
+        let mut input = BlockInput::empty(self.next_block);
+        for _ in 0..n_events {
+            input.events.push(self.events.next()?);
+        }
+        self.next_block += 1;
+        Some(input)
+    }
 }
 
 impl BlockInput {
@@ -245,7 +393,7 @@ impl<S: Default> super::State<S> {
 
 impl BlockData {
     /// Generate a test L1 block with no staking-related data.
-    pub(super) fn empty(number: u64) -> Self {
+    pub fn empty(number: u64) -> Self {
         let block = block_id(number);
         let timestamp = 12 * number;
         Self {
