@@ -7,6 +7,7 @@ use std::{
 
 use alloy::primitives::BlockHash;
 use async_lock::{RwLock, RwLockUpgradableReadGuard, RwLockWriteGuard};
+use derive_more::{Deref, DerefMut};
 use espresso_types::v0_3::StakeTableEvent;
 use futures::stream::{Stream, StreamExt};
 use hotshot_contract_adapter::sol_types::RewardClaim::RewardClaimEvents;
@@ -15,7 +16,10 @@ use tracing::instrument;
 use crate::{
     error::{Error, Result, ensure},
     types::{
-        common::{Address, L1BlockId, L1BlockInfo, Timestamp},
+        common::{
+            Address, Delegation, ESPTokenAmount, L1BlockId, L1BlockInfo, NodeSetEntry,
+            PendingWithdrawal, Timestamp,
+        },
         global::{FullNodeSetDiff, FullNodeSetSnapshot, FullNodeSetUpdate},
         wallet::{WalletDiff, WalletSnapshot, WalletUpdate},
     },
@@ -97,9 +101,10 @@ impl<S: L1Persistence> State<S> {
     }
 
     /// Get a snapshot of the full node set at the given L1 block.
-    pub fn full_node_set(&self, hash: BlockHash) -> Result<FullNodeSetSnapshot> {
+    pub fn full_node_set(&self, hash: BlockHash) -> Result<(NodeSet, L1BlockInfo)> {
         let number = self.block_number(hash)?;
-        Ok(self.block(number)?.node_set.clone())
+        let block = self.block(number)?;
+        Ok((block.node_set.clone(), block.block_info()))
     }
 
     /// Get the update applied to the full node set due to the given L1 block.
@@ -115,14 +120,15 @@ impl<S: L1Persistence> State<S> {
     }
 
     /// Get a snapshot of the requested wallet state at the given L1 block.
-    pub fn wallet(&self, address: Address, hash: BlockHash) -> Result<WalletSnapshot> {
+    pub fn wallet(&self, address: Address, hash: BlockHash) -> Result<(Wallet, L1BlockInfo)> {
         let number = self.block_number(hash)?;
         let block = self.block(number)?;
-        Ok(block
+        let wallet = block
             .wallets
             .get(&address)
             .ok_or_else(|| Error::not_found().context(format!("unknown account {address}")))?
-            .clone())
+            .clone();
+        Ok((wallet, block.block_info()))
     }
 
     /// Get the update applied to the requested wallet due to the given L1 block.
@@ -358,7 +364,7 @@ struct BlockData {
     timestamp: Timestamp,
 
     /// The full node set as of this L1 block.
-    node_set: FullNodeSetSnapshot,
+    node_set: NodeSet,
 
     /// The change to the full node set between the previous L1 block and this one.
     ///
@@ -366,7 +372,7 @@ struct BlockData {
     node_set_update: Option<Vec<FullNodeSetDiff>>,
 
     /// The state of each wallet as of this L1 block.
-    wallets: WalletsSnapshot,
+    wallets: Wallets,
 
     /// The changes to each wallet between the previous L1 block and this one.
     ///
@@ -384,13 +390,89 @@ struct BlockData {
     wallets_update: Option<BTreeMap<Address, Vec<WalletDiff>>>,
 }
 
-/// A snapshot of the latest state of every wallet.
+/// The state of every wallet.
 ///
 /// Note that while this set can, in concept, become very large, the use of immutable data
 /// structures means that the memory for all entries is shared with the previous block's
 /// snapshot, excepting only those wallets whose state has actually changed in this L1 block.
 /// This will be a small number of wallets (often 0!) in practice.
-pub type WalletsSnapshot = im::HashMap<Address, WalletSnapshot>;
+#[derive(Clone, Debug, Default, PartialEq, Deref, DerefMut)]
+pub struct Wallets(im::HashMap<Address, Wallet>);
+
+impl Wallets {
+    /// Mutate the state by applying a diff to the indicated account.
+    pub fn apply(&mut self, _address: Address, _diff: &WalletDiff) {
+        // TODO
+    }
+}
+
+/// State tracked for each wallet.
+///
+/// This is a persistent data structure, meaning the [`Clone`] implementation is very cheap, even
+/// for large wallets (e.g. those with many delegations), and partial changes can be made in a lazy,
+/// copy-on-write fashion. This is important for performance when dealing with many large wallets
+/// and managing different state snapshots for different points in history.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Wallet {
+    /// Nodes that this user is delegating to.
+    nodes: im::Vector<Delegation>,
+
+    /// Stake that has been undelegated but not yet withdrawn.
+    pub pending_undelegations: im::Vector<PendingWithdrawal>,
+
+    /// Stake previously delegated to nodes that have exited.
+    pub pending_exits: im::Vector<PendingWithdrawal>,
+
+    /// Total amount of rewards ever claimed from the contract.
+    pub claimed_rewards: ESPTokenAmount,
+}
+
+impl Wallet {
+    /// Convert this wallet into the public API representation of a wallet snapshot.
+    pub fn into_snapshot(self, l1_block: L1BlockInfo) -> WalletSnapshot {
+        WalletSnapshot {
+            nodes: self.nodes.into_iter().collect(),
+            pending_undelegations: self.pending_undelegations.into_iter().collect(),
+            pending_exits: self.pending_exits.into_iter().collect(),
+            claimed_rewards: self.claimed_rewards,
+            l1_block,
+        }
+    }
+
+    /// Mutate this wallet by applying a diff.
+    pub fn apply(&mut self, _diff: &WalletDiff) {
+        // TODO
+    }
+}
+
+/// State tracked for the full node set.
+///
+/// This is a persistent data structure, meaning the [`Clone`] implementation is very cheap, even
+/// for large sets, and partial changes can be made in a lazy, copy-on-write fashion. This is
+/// important for performance when managing different state snapshots for different points in
+/// history.
+#[derive(Clone, Debug, Default, PartialEq, Deref, DerefMut)]
+pub struct NodeSet(im::OrdMap<Address, NodeSetEntry>);
+
+impl NodeSet {
+    /// Convert this node set into the public API representation of a node set snapshot.
+    pub fn into_snapshot(self, l1_block: L1BlockInfo) -> FullNodeSetSnapshot {
+        FullNodeSetSnapshot {
+            nodes: self.0.values().cloned().collect(),
+            l1_block,
+        }
+    }
+
+    /// Mutate this node set by applying a diff.
+    pub fn apply(&mut self, _diff: &FullNodeSetDiff) {
+        // TODO
+    }
+
+    /// Add a node to the set.
+    pub fn push(&mut self, node: NodeSetEntry) {
+        self.0.insert(node.address, node);
+    }
+}
 
 impl BlockData {
     fn block_info(&self) -> L1BlockInfo {
@@ -416,11 +498,11 @@ impl BlockData {
             // to state snapshots.
             let (nodes_diff, wallets_diff) = event.diffs();
             for diff in nodes_diff {
-                apply_node_set_diff(&mut node_set, &diff);
+                node_set.apply(&diff);
                 node_set_update.push(diff);
             }
             for (address, diff) in wallets_diff {
-                apply_wallet_diff(&mut wallets, address, &diff);
+                wallets.apply(address, &diff);
                 wallets_update.entry(address).or_default().push(diff);
             }
         }
@@ -434,14 +516,6 @@ impl BlockData {
             wallets_update: Some(wallets_update),
         }
     }
-}
-
-fn apply_node_set_diff(_snapshot: &mut FullNodeSetSnapshot, _diff: &FullNodeSetDiff) {
-    // TODO
-}
-
-fn apply_wallet_diff(_snapshot: &mut WalletsSnapshot, _address: Address, _diff: &WalletDiff) {
-    // TODO
 }
 
 /// The minimal data we need in order to ingest a new L1 block.
@@ -507,8 +581,8 @@ pub trait ResettableStream: Unpin + Stream<Item = BlockInput> {
 pub struct PersistentSnapshot {
     pub block: L1BlockId,
     pub timestamp: Timestamp,
-    pub node_set: FullNodeSetSnapshot,
-    pub wallets: WalletsSnapshot,
+    pub node_set: NodeSet,
+    pub wallets: Wallets,
 }
 
 impl PersistentSnapshot {
@@ -517,14 +591,7 @@ impl PersistentSnapshot {
         Self {
             block,
             timestamp,
-            node_set: FullNodeSetSnapshot {
-                nodes: Default::default(),
-                l1_block: L1BlockInfo {
-                    number: block.number,
-                    hash: block.hash,
-                    timestamp,
-                },
-            },
+            node_set: Default::default(),
             wallets: Default::default(),
         }
     }
@@ -558,10 +625,7 @@ mod test {
     use tide_disco::{Error as _, StatusCode};
 
     use super::{
-        testing::{
-            FailStorage, MemoryStorage, VecStream, block_id, empty_wallet, make_node,
-            random_block_input,
-        },
+        testing::{FailStorage, MemoryStorage, VecStream, block_id, make_node, random_block_input},
         *,
     };
 
@@ -628,7 +692,7 @@ mod test {
 
         let mut block = BlockData::empty(1);
         let node = make_node(0);
-        block.node_set.nodes.push_back(node.clone());
+        block.node_set.push(node.clone());
         block.node_set_update = Some(vec![FullNodeSetDiff::NodeUpdate(node)]);
 
         let state = from_blocks::<MemoryStorage>([finalized.clone(), block.clone()]);
@@ -649,7 +713,7 @@ mod test {
         // Query for known block.
         assert_eq!(
             state.full_node_set(block.block.hash).unwrap(),
-            block.node_set
+            (block.node_set.clone(), block.block_info())
         );
         let update = state.full_node_set_update(block.block.hash).unwrap();
         assert_eq!(&update.diff, block.node_set_update.as_ref().unwrap());
@@ -668,9 +732,9 @@ mod test {
             amount: Default::default(),
             effective: Default::default(),
         };
-        let wallet = WalletSnapshot {
+        let wallet = Wallet {
             nodes: vec![delegation].into(),
-            ..empty_wallet(finalized.block_info())
+            ..Default::default()
         };
 
         let mut block = BlockData::empty(1);
@@ -686,7 +750,7 @@ mod test {
         // Insert a second wallet that is not updated by this block, so we can test queries for
         // updates for a known wallet with no non-trivial update.
         let not_updated = Address::random();
-        let not_updated_wallet = empty_wallet(finalized.block_info());
+        let not_updated_wallet = Wallet::default();
         block
             .wallets
             .insert(not_updated, not_updated_wallet.clone());
@@ -713,7 +777,7 @@ mod test {
         // Query for known address with no updates.
         assert_eq!(
             state.wallet(not_updated, block.block.hash).unwrap(),
-            not_updated_wallet
+            (not_updated_wallet, block.block_info())
         );
         assert_eq!(
             state.wallet_update(not_updated, block.block.hash).unwrap(),
@@ -730,7 +794,10 @@ mod test {
         assert_eq!(err.status(), StatusCode::GONE);
 
         // Query for known wallet.
-        assert_eq!(state.wallet(address, block.block.hash).unwrap(), wallet);
+        assert_eq!(
+            state.wallet(address, block.block.hash).unwrap(),
+            (wallet, block.block_info())
+        );
         let update = state.wallet_update(address, block.block.hash).unwrap();
         assert_eq!(&update.diff, &[WalletDiff::DelegatedToNode(delegation)]);
         assert_eq!(update.l1_block, block.block_info());
@@ -752,8 +819,8 @@ mod test {
                 _ => None,
             }));
             let validators = validators_from_l1_events(events.iter().cloned()).unwrap().0;
-            assert_eq!(validators.len(), block.node_set.nodes.len());
-            for node in &block.node_set.nodes {
+            assert_eq!(validators.len(), block.node_set.len());
+            for node in block.node_set.values() {
                 let validator = &validators[&node.address];
                 assert_eq!(node.address, validator.account);
                 assert_eq!(
@@ -773,13 +840,17 @@ mod test {
         // Realistically large state: 500 registered validators, 10000 delegators, each delegating
         // to 10 different nodes.
         for i in 0..500 {
-            block.node_set.nodes.push_back(make_node(i));
+            block.node_set.push(make_node(i));
         }
         for i in 0..10_000 {
             let delegator = Address::random();
-            let mut wallet = empty_wallet(block.block_info());
+            let mut wallet = Wallet::default();
             for j in 0..10 {
-                let node = block.node_set.nodes[(i + j) % block.node_set.nodes.len()].address;
+                let node = *block
+                    .node_set
+                    .keys()
+                    .nth((i + j) % block.node_set.len())
+                    .unwrap();
                 let delegation = Delegation {
                     delegator,
                     node,

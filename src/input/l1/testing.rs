@@ -61,10 +61,10 @@ impl L1Persistence for MemoryStorage {
         let snapshot = lock.get_or_insert(PersistentSnapshot::genesis(block_id(0), 0));
 
         for diff in node_set_diff {
-            apply_node_set_diff(&mut snapshot.node_set, &diff);
+            snapshot.node_set.apply(&diff);
         }
         for (address, diff) in wallets_diff {
-            apply_wallet_diff(&mut snapshot.wallets, address, &diff);
+            snapshot.wallets.apply(address, &diff);
         }
         snapshot.block = block;
         snapshot.timestamp = timestamp;
@@ -210,17 +210,6 @@ pub fn make_node(i: usize) -> NodeSetEntry {
     }
 }
 
-/// Generate an empty wallet snapshot for testing.
-pub fn empty_wallet(l1_block: L1BlockInfo) -> WalletSnapshot {
-    WalletSnapshot {
-        l1_block,
-        nodes: Default::default(),
-        pending_exits: Default::default(),
-        pending_undelegations: Default::default(),
-        claimed_rewards: Default::default(),
-    }
-}
-
 /// Generate a random L1 input for testing.
 pub fn random_block_input(number: u64) -> BlockInput {
     // TODO populate random events
@@ -262,14 +251,7 @@ impl BlockData {
         Self {
             block,
             timestamp,
-            node_set: FullNodeSetSnapshot {
-                nodes: Default::default(),
-                l1_block: L1BlockInfo {
-                    number,
-                    hash: block.hash,
-                    timestamp,
-                },
-            },
+            node_set: Default::default(),
             node_set_update: Some(Default::default()),
             wallets: Default::default(),
             wallets_update: Some(Default::default()),
