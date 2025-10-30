@@ -20,7 +20,6 @@ use espresso_contract_deployer::{
     Contract, Contracts, HttpProviderWithWallet, build_signer, builder::DeployerArgsBuilder,
     network_config::light_client_genesis_from_stake_table,
 };
-use espresso_types::v0::v0_3::StakeTableEvent;
 use hotshot_contract_adapter::{
     sol_types::{
         G1PointSol,
@@ -282,7 +281,7 @@ impl Iterator for EventGenerator {
                     let commission = self.rng.gen_range(0..COMMISSION_BASIS_POINTS);
 
                     if t == REGISTER {
-                        StakeTableEvent::Register(ValidatorRegistered {
+                        StakeTableV2Events::ValidatorRegistered(ValidatorRegistered {
                             account,
                             blsVk: bls_vk.into(),
                             schnorrVk: schnorr_vk.into(),
@@ -300,7 +299,7 @@ impl Iterator for EventGenerator {
                         )
                         .unwrap();
 
-                        StakeTableEvent::RegisterV2(ValidatorRegisteredV2 {
+                        StakeTableV2Events::ValidatorRegisteredV2(ValidatorRegisteredV2 {
                             account,
                             blsVK: bls_vk.into(),
                             schnorrVK: schnorr_vk.into(),
@@ -320,7 +319,7 @@ impl Iterator for EventGenerator {
                         continue;
                     };
                     self.nodes.remove(&node);
-                    StakeTableEvent::Deregister(ValidatorExit { validator: node }).into()
+                    StakeTableV2Events::ValidatorExit(ValidatorExit { validator: node }).into()
                 }
 
                 _ => unreachable!(),

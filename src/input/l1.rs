@@ -8,12 +8,11 @@ use std::{
 use alloy::primitives::BlockHash;
 use async_lock::{RwLock, RwLockUpgradableReadGuard, RwLockWriteGuard};
 use derive_more::{Deref, DerefMut};
-use espresso_types::{
-    PubKey,
-    v0_3::{COMMISSION_BASIS_POINTS, StakeTableEvent},
-};
+use espresso_types::{PubKey, v0_3::COMMISSION_BASIS_POINTS};
 use futures::stream::{Stream, StreamExt};
-use hotshot_contract_adapter::sol_types::RewardClaim::RewardClaimEvents;
+use hotshot_contract_adapter::sol_types::{
+    RewardClaim::RewardClaimEvents, StakeTableV2::StakeTableV2Events,
+};
 use tracing::instrument;
 
 use crate::{
@@ -510,15 +509,16 @@ impl Snapshot {
     ///
     /// Updates the block state accordingly and returns the diffs that should be applied to the rest
     /// of the state.
+    #[tracing::instrument(skip(self))]
     fn handle_event(
         &mut self,
         input: &BlockInput,
         event: &L1Event,
     ) -> (Vec<FullNodeSetDiff>, Vec<(Address, WalletDiff)>) {
-        tracing::debug!(?event, "processing L1 event");
+        tracing::debug!("processing L1 event");
         match event {
             L1Event::StakeTable(ev) => match ev.as_ref() {
-                StakeTableEvent::RegisterV2(ev) => {
+                StakeTableV2Events::ValidatorRegisteredV2(ev) => {
                     let diff = FullNodeSetDiff::NodeUpdate(NodeSetEntry {
                         address: ev.account,
                         staking_key: PubKey::from(ev.blsVK).into(),
@@ -532,7 +532,7 @@ impl Snapshot {
                     });
                     (vec![diff], vec![])
                 }
-                StakeTableEvent::Register(ev) => {
+                StakeTableV2Events::ValidatorRegistered(ev) => {
                     tracing::warn!("received legacy ValidatorRegistered event");
                     let diff = FullNodeSetDiff::NodeUpdate(NodeSetEntry {
                         address: ev.account,
@@ -547,22 +547,20 @@ impl Snapshot {
                     });
                     (vec![diff], vec![])
                 }
-                StakeTableEvent::KeyUpdate(_) => {
-                    todo!("implement event handling for StakeTableEvent::KeyUpdate")
+                StakeTableV2Events::ExitEscrowPeriodUpdated(ev) => {
+                    // This should be quite rare, we can be a little loud about it.
+                    tracing::warn!(
+                        old = self.block.exit_escrow_period,
+                        new = ev.newExitEscrowPeriod,
+                        "updating exit escrow period",
+                    );
+                    self.block.exit_escrow_period = ev.newExitEscrowPeriod;
+
+                    // Apart from changing our per-block state, this event does not have any effect
+                    // on the node set or the wallets.
+                    (vec![], vec![])
                 }
-                StakeTableEvent::KeyUpdateV2(_) => {
-                    todo!("implement event handling for StakeTableEvent::KeyUpdateV2")
-                }
-                StakeTableEvent::CommissionUpdate(_) => {
-                    todo!("implement event handling for StakeTableEvent::CommissionUpdate")
-                }
-                StakeTableEvent::Delegate(_) => {
-                    todo!("implement event handling for StakeTableEvent::Delegate")
-                }
-                StakeTableEvent::Undelegate(_) => {
-                    todo!("implement event handling for StakeTableEvent::Undelegate")
-                }
-                StakeTableEvent::Deregister(ev) => {
+                StakeTableV2Events::ValidatorExit(ev) => {
                     let diff = FullNodeSetDiff::NodeExit(NodeExit {
                         address: ev.validator,
                         exit_epoch_and_block: Default::default(), // TODO
@@ -572,6 +570,41 @@ impl Snapshot {
                     // TODO we should also emit a `WalletDiff::NodeExited` for each wallet that is
                     // delegated to the exiting validator.
                     (vec![diff], vec![])
+                }
+                StakeTableV2Events::ConsensusKeysUpdated(_) => {
+                    todo!("implement event handling for StakeTableV2Events::ConsensusKeysUpdated")
+                }
+                StakeTableV2Events::ConsensusKeysUpdatedV2(_) => {
+                    todo!("implement event handling for StakeTableV2Events::ConsensusKeysUpdatedV2")
+                }
+                StakeTableV2Events::CommissionUpdated(_) => {
+                    todo!("implement event handling for StakeTableV2Events::CommissionUpdated")
+                }
+                StakeTableV2Events::Delegated(_) => {
+                    todo!("implement event handling for StakeTableV2Events::Delegated")
+                }
+                StakeTableV2Events::Undelegated(_) => {
+                    todo!("implement event handling for StakeTableV2Events::Undelegated")
+                }
+                StakeTableV2Events::Withdrawal(_) => {
+                    todo!("implement event handling for StakeTableV2Events::Withdrawal")
+                }
+                // These events are not relevant to this service. We still list them out explicitly
+                // (rather than matching on _) so that it is clear that we are not missing any
+                // important events, and if new event types are added, the compiler will force us to
+                // handle them explicitly.
+                StakeTableV2Events::MaxCommissionIncreaseUpdated(_)
+                | StakeTableV2Events::MinCommissionUpdateIntervalUpdated(_)
+                | StakeTableV2Events::OwnershipTransferred(_)
+                | StakeTableV2Events::Paused(_)
+                | StakeTableV2Events::Unpaused(_)
+                | StakeTableV2Events::Initialized(_)
+                | StakeTableV2Events::RoleAdminChanged(_)
+                | StakeTableV2Events::RoleGranted(_)
+                | StakeTableV2Events::RoleRevoked(_)
+                | StakeTableV2Events::Upgraded(_) => {
+                    tracing::debug!("skipping irrelevant event");
+                    (vec![], vec![])
                 }
             },
             L1Event::Reward(_) => {
@@ -696,7 +729,7 @@ pub enum L1Event {
     Reward(Arc<RewardClaimEvents>),
 
     /// An event emitted by the stake table contract.
-    StakeTable(Arc<StakeTableEvent>),
+    StakeTable(Arc<StakeTableV2Events>),
 }
 
 impl From<RewardClaimEvents> for L1Event {
@@ -705,8 +738,8 @@ impl From<RewardClaimEvents> for L1Event {
     }
 }
 
-impl From<StakeTableEvent> for L1Event {
-    fn from(event: StakeTableEvent) -> Self {
+impl From<StakeTableV2Events> for L1Event {
+    fn from(event: StakeTableV2Events) -> Self {
         Self::StakeTable(Arc::new(event))
     }
 }
@@ -964,7 +997,11 @@ mod test {
             let start = Instant::now();
             for event in &input.events {
                 if let L1Event::StakeTable(e) = event {
-                    state.apply_event(e.as_ref().clone()).unwrap().unwrap();
+                    let Ok(stake_table_event) = e.as_ref().clone().try_into() else {
+                        tracing::info!(?e, "skipping GCL-irrelevant contract event");
+                        continue;
+                    };
+                    state.apply_event(stake_table_event).unwrap().unwrap();
                 }
             }
             tracing::debug!(
