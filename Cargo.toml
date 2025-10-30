@@ -17,6 +17,7 @@ derive_more = "2.0"
 espresso-types = { git = "https://github.com/EspressoSystems/espresso-network.git" }
 futures = "0.3"
 hotshot-contract-adapter = { git = "https://github.com/EspressoSystems/espresso-network.git" }
+hotshot-types = { git = "https://github.com/EspressoSystems/espresso-network.git" }
 im = { version = "15", features = ["serde"] }
 parking_lot = "0.12"
 serde = { version = "1.0", features = ["derive"] }
@@ -30,7 +31,11 @@ tracing = "0.1"
 vbs = "0.1"
 
 [dev-dependencies]
+jf-signature = { git = "https://github.com/EspressoSystems/jellyfish", tag = "jf-signature-v0.4.0", features = [
+    "std",
+] }
 portpicker = "0.1"
+rand = "0.8"
 test-log = { version = "0.2", features = [
     "color",
     "trace",
