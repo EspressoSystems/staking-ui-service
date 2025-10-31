@@ -23,7 +23,10 @@ use espresso_contract_deployer::{
 use hotshot_contract_adapter::{
     sol_types::{
         G1PointSol,
-        StakeTableV2::{self, ValidatorExit, ValidatorRegistered, ValidatorRegisteredV2},
+        StakeTableV2::{
+            self, ExitEscrowPeriodUpdated, ValidatorExit, ValidatorRegistered,
+            ValidatorRegisteredV2,
+        },
     },
     stake_table::{StateSignatureSol, sign_address_bls, sign_address_schnorr},
 };
@@ -34,7 +37,7 @@ use hotshot_types::{
     traits::signature_key::{SignatureKey, StateSignatureKey},
 };
 use jf_signature::{SignatureScheme, schnorr::SchnorrSignatureScheme};
-use rand::{Rng, RngCore, SeedableRng, rngs::StdRng, seq::IteratorRandom};
+use rand::{CryptoRng, Rng, RngCore, SeedableRng, rngs::StdRng, seq::IteratorRandom};
 use staking_cli::demo::{DelegationConfig, StakingTransactions};
 use tagged_base64::TaggedBase64;
 use tide_disco::{Error as _, StatusCode, Url};
@@ -234,6 +237,7 @@ pub fn make_node(i: usize) -> NodeSetEntry {
 pub struct EventGenerator {
     nodes: HashSet<Address>,
     rng: StdRng,
+    stake_table_only: bool,
 }
 
 impl Default for EventGenerator {
@@ -241,6 +245,17 @@ impl Default for EventGenerator {
         Self {
             nodes: Default::default(),
             rng: StdRng::from_seed(Default::default()),
+            stake_table_only: false,
+        }
+    }
+}
+
+impl EventGenerator {
+    /// Generate only events which are relevant to [`StakeTableState`].
+    pub fn stake_table_events() -> Self {
+        Self {
+            stake_table_only: true,
+            ..Default::default()
         }
     }
 }
@@ -251,67 +266,49 @@ impl Iterator for EventGenerator {
     fn next(&mut self) -> Option<Self::Item> {
         // Generate a random event until we get one that is possible given the current state.
         loop {
-            // Assign each type of event a numeric code.
+            // Assign each type of event a numeric code. We put stake table events first so we can
+            // easily choose to generate only stake table events.
             const REGISTER: usize = 0;
             const REGISTER_V2: usize = 1;
             const DEREGISTER: usize = 2;
-            const MAX_EVENT_TYPE: usize = 3;
+
+            const MAX_STAKE_TABLE_EVENT_TYPE: usize = 3;
+
+            // Other contract events that the UI service cares about but consensus does not.
+            const EXIT_ESCROW_PERIOD_UPDATED: usize = 3;
+
+            const MAX_EVENT_TYPE: usize = 4;
 
             // Generate the code for a random event type.
-            let event_type = self.rng.gen_range(0..MAX_EVENT_TYPE);
+            let max = if self.stake_table_only {
+                MAX_STAKE_TABLE_EVENT_TYPE
+            } else {
+                MAX_EVENT_TYPE
+            };
+            let event_type = self.rng.gen_range(0..max);
 
             let event = match event_type {
-                // Register, RegisterV2
                 t @ (REGISTER | REGISTER_V2) => {
-                    let mut address_bytes = FixedBytes::<32>::default();
-                    self.rng.fill_bytes(address_bytes.as_mut_slice());
-                    let account = Address::from_word(address_bytes);
+                    let event = validator_registered_event(&mut self.rng);
 
                     // Insert the node so we can reference it in later events (like delegations).
                     // This insert should always return `true` because with a random address, it is
                     // vanishingly unlikely we have generated this same address before.
-                    assert!(self.nodes.insert(account));
-
-                    let index = self.rng.next_u64();
-                    let (bls_vk, bls_sk) =
-                        PubKey::generated_from_seed_indexed(Default::default(), index);
-                    let (schnorr_vk, schnorr_sk) =
-                        StateVerKey::generated_from_seed_indexed(Default::default(), index);
-
-                    let commission = self.rng.gen_range(0..COMMISSION_BASIS_POINTS);
+                    assert!(self.nodes.insert(event.account));
 
                     if t == REGISTER {
                         StakeTableV2Events::ValidatorRegistered(ValidatorRegistered {
-                            account,
-                            blsVk: bls_vk.into(),
-                            schnorrVk: schnorr_vk.into(),
-                            commission,
+                            account: event.account,
+                            blsVk: event.blsVK,
+                            schnorrVk: event.schnorrVK,
+                            commission: event.commission,
                         })
                         .into()
                     } else {
-                        let auth_msg = account.abi_encode();
-                        let bls_sig = PubKey::sign(&bls_sk, &auth_msg).unwrap();
-                        let schnorr_sig = SchnorrSignatureScheme::sign(
-                            &(),
-                            &schnorr_sk,
-                            [hash_bytes_to_field(&auth_msg).unwrap()],
-                            &mut self.rng,
-                        )
-                        .unwrap();
-
-                        StakeTableV2Events::ValidatorRegisteredV2(ValidatorRegisteredV2 {
-                            account,
-                            blsVK: bls_vk.into(),
-                            schnorrVK: schnorr_vk.into(),
-                            commission,
-                            blsSig: G1PointSol::from(bls_sig).into(),
-                            schnorrSig: StateSignatureSol::from(schnorr_sig).into(),
-                        })
-                        .into()
+                        StakeTableV2Events::ValidatorRegisteredV2(event).into()
                     }
                 }
 
-                // Deregister
                 DEREGISTER => {
                     // Choose a random node to deregister.
                     let Some(&node) = self.nodes.iter().choose(&mut self.rng) else {
@@ -322,10 +319,51 @@ impl Iterator for EventGenerator {
                     StakeTableV2Events::ValidatorExit(ValidatorExit { validator: node }).into()
                 }
 
+                EXIT_ESCROW_PERIOD_UPDATED => {
+                    // Set the exit escrow period to something random.
+                    StakeTableV2Events::ExitEscrowPeriodUpdated(ExitEscrowPeriodUpdated {
+                        newExitEscrowPeriod: self.rng.next_u64(),
+                    })
+                    .into()
+                }
+
                 _ => unreachable!(),
             };
             return Some(event);
         }
+    }
+}
+
+/// Generate a valid [`ValidatorRegisteredV2`] event.
+pub fn validator_registered_event(mut rng: impl RngCore + CryptoRng) -> ValidatorRegisteredV2 {
+    let mut address_bytes = FixedBytes::<32>::default();
+    rng.fill_bytes(address_bytes.as_mut_slice());
+    let account = Address::from_word(address_bytes);
+
+    let index = rng.next_u64();
+    let (bls_vk, bls_sk) = PubKey::generated_from_seed_indexed(Default::default(), index);
+    let (schnorr_vk, schnorr_sk) =
+        StateVerKey::generated_from_seed_indexed(Default::default(), index);
+
+    let auth_msg = account.abi_encode();
+    let bls_sig = PubKey::sign(&bls_sk, &auth_msg).unwrap();
+    let schnorr_sig = SchnorrSignatureScheme::sign(
+        &(),
+        &schnorr_sk,
+        [hash_bytes_to_field(&auth_msg).unwrap()],
+        &mut rng,
+    )
+    .unwrap();
+
+    let commission = rng.gen_range(0..COMMISSION_BASIS_POINTS);
+
+    ValidatorRegisteredV2 {
+        account,
+        blsVK: bls_vk.into(),
+        schnorrVK: schnorr_vk.into(),
+        commission,
+        blsSig: G1PointSol::from(bls_sig).into(),
+        schnorrSig: StateSignatureSol::from(schnorr_sig).into(),
     }
 }
 
@@ -334,17 +372,25 @@ impl Iterator for EventGenerator {
 /// The generation process is stateful, which makes it possible to generate random events in a
 /// sequence of L1 blocks such that every generated event is "valid" given the events that came
 /// before it (e.g. no duplicate registrations, no delegations to an unregistered validator, etc.).
-#[derive(Debug)]
+#[derive(derive_more::Debug)]
 pub struct InputGenerator {
-    events: EventGenerator,
+    #[debug("Iterator")]
+    events: Box<dyn Iterator<Item = L1Event>>,
     next_block: u64,
     rng: StdRng,
 }
 
 impl Default for InputGenerator {
     fn default() -> Self {
+        Self::from_events(EventGenerator::default())
+    }
+}
+
+impl InputGenerator {
+    /// Generate inputs from a given sequence of events.
+    pub fn from_events(events: impl IntoIterator<Item = L1Event> + 'static) -> Self {
         Self {
-            events: Default::default(),
+            events: Box::new(events.into_iter()),
             next_block: 0,
             rng: StdRng::from_seed(Default::default()),
         }
@@ -378,6 +424,12 @@ impl BlockInput {
             finalized: block_id(0),
             events: vec![],
         }
+    }
+
+    /// A [`BlockInput`] like `self` but with `event` added.
+    pub fn with_event(mut self, event: impl Into<L1Event>) -> Self {
+        self.events.push(event.into());
+        self
     }
 }
 

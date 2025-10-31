@@ -519,6 +519,14 @@ impl Snapshot {
         match event {
             L1Event::StakeTable(ev) => match ev.as_ref() {
                 StakeTableV2Events::ValidatorRegisteredV2(ev) => {
+                    if let Err(err) = ev.authenticate() {
+                        // The contract doesn't check all the signatures, so it's possible that an
+                        // invalid event got through. We can safely just ignore it as the consensus
+                        // protocol will do the same.
+                        tracing::warn!("got invalid ValidatorRegisteredV2 event: {err:#}");
+                        return Default::default();
+                    }
+
                     let diff = FullNodeSetDiff::NodeUpdate(NodeSetEntry {
                         address: ev.account,
                         staking_key: PubKey::from(ev.blsVK).into(),
@@ -561,6 +569,16 @@ impl Snapshot {
                     (vec![], vec![])
                 }
                 StakeTableV2Events::ValidatorExit(ev) => {
+                    if !self.node_set.contains_key(&ev.validator) {
+                        // This should not happen, but if we somehow see a validator exit event for
+                        // a non-existent validator:
+                        // * don't generate an invalid diff to pass along to the front end
+                        // * complain loudly because it probably means our node set is out of sync
+                        //   with the contract
+                        tracing::error!(%ev.validator, "got ValidatorExit event for non-existent validator");
+                        return Default::default();
+                    }
+
                     let diff = FullNodeSetDiff::NodeExit(NodeExit {
                         address: ev.validator,
                         exit_epoch_and_block: Default::default(), // TODO
@@ -789,7 +807,10 @@ pub trait L1Persistence: Send {
 mod test {
     use std::time::{Duration, Instant};
 
-    use espresso_types::StakeTableState;
+    use espresso_types::{StakeTableState, v0_3::StakeTableEvent};
+    use hotshot_contract_adapter::sol_types::StakeTableV2::{
+        ExitEscrowPeriodUpdated, ValidatorExit,
+    };
     use tide_disco::{Error as _, StatusCode};
 
     use super::{
@@ -798,7 +819,10 @@ mod test {
     };
 
     use crate::{
-        input::l1::testing::{InputGenerator, block_snapshot, subscribe_until},
+        input::l1::testing::{
+            EventGenerator, InputGenerator, block_snapshot, subscribe_until,
+            validator_registered_event,
+        },
         types::common::{Delegation, Ratio},
     };
 
@@ -816,6 +840,24 @@ mod test {
             state.blocks.push(block);
         }
         state
+    }
+
+    /// Check consistency between the [`NodeSet`] used by this service and the [`StakeTableState`]
+    /// used by consensus.
+    fn check_stake_table_consistency(nodes: &NodeSet, stake_table: &StakeTableState) {
+        tracing::debug!("checking state consistency");
+        let validators = stake_table.validators();
+        assert_eq!(validators.len(), nodes.len());
+        for node in nodes.values() {
+            let validator = &validators[&node.address];
+            assert_eq!(node.address, validator.account);
+            assert_eq!(
+                node.commission,
+                Ratio::new(validator.commission.into(), 10_000),
+            );
+            assert_eq!(node.stake, validator.stake);
+            assert_eq!(node.staking_key, validator.stake_table_key.into());
+        }
     }
 
     #[test_log::test]
@@ -983,7 +1025,7 @@ mod test {
         let mut state = StakeTableState::default();
         let mut num_events = 0;
 
-        let inputs = InputGenerator::default().take(100);
+        let inputs = InputGenerator::from_events(EventGenerator::stake_table_events()).take(100);
         for input in inputs {
             tracing::info!(?input, "apply input");
             num_events += input.events.len();
@@ -1010,19 +1052,7 @@ mod test {
                 "updated StakeTableState",
             );
 
-            tracing::debug!("checking state consistency");
-            let validators = state.validators();
-            assert_eq!(validators.len(), block.state.node_set.len());
-            for node in block.state.node_set.values() {
-                let validator = &validators[&node.address];
-                assert_eq!(node.address, validator.account);
-                assert_eq!(
-                    node.commission,
-                    Ratio::new(validator.commission.into(), 10_000),
-                );
-                assert_eq!(node.stake, validator.stake);
-                assert_eq!(node.staking_key, validator.stake_table_key.into());
-            }
+            check_stake_table_consistency(&block.state.node_set, &state);
         }
 
         tracing::info!(
@@ -1305,5 +1335,165 @@ mod test {
         assert_eq!(state.blocks.len(), 2);
         assert_eq!(state.blocks[0].block(), block_snapshot(1));
         assert_eq!(state.blocks[1].block(), block_snapshot(2));
+    }
+
+    /// Helper for testing event handling.
+    ///
+    /// Pass in a single event or an event sequence. Get back the state after applying those events
+    /// to the empty state. Perform whatever validation you want on the result.
+    ///
+    /// Automatically validates
+    /// * L1 data is snapshotted correctly
+    /// * the result of applying the each event is consistent with applying it to a
+    ///   [`StakeTableState`].
+    /// * if an event is invalid, the state is not modified and no updates are recorded.
+    fn test_events(events: impl IntoIterator<Item = StakeTableV2Events>) -> BlockData {
+        let mut curr = BlockData::empty(0);
+        let mut stake_table = StakeTableState::default();
+
+        for (i, event) in events.into_iter().enumerate() {
+            let number = i as u64 + 1;
+            let next = curr.next(&BlockInput::empty(number).with_event(event.clone()));
+            assert_eq!(next.block(), block_snapshot(number));
+
+            // Calling `next` should always populate the update fields.
+            let node_set_update = next.node_set_update.as_ref().unwrap();
+            let wallets_update = next.wallets_update.as_ref().unwrap();
+
+            if let Ok(stake_table_event) = StakeTableEvent::try_from(event) {
+                // This event affects the stake table. Check consistency between `next` and the
+                // consensus protocol's [`StakeTableState`].
+                if !matches!(stake_table.apply_event(stake_table_event), Ok(Ok(_))) {
+                    // This event was invalid and should not have changed the stake table.
+                    assert_eq!(next.state.node_set, curr.state.node_set);
+                    assert!(node_set_update.is_empty());
+                    assert!(wallets_update.is_empty());
+                }
+                check_stake_table_consistency(&next.state.node_set, &stake_table);
+            }
+
+            curr = next;
+        }
+
+        curr
+    }
+
+    #[test_log::test]
+    fn test_event_validator_registered_v2_valid() {
+        let event = validator_registered_event(rand::thread_rng());
+        let block = test_events([StakeTableV2Events::ValidatorRegisteredV2(event.clone())]);
+        let expected = NodeSetEntry {
+            address: event.account,
+            staking_key: PubKey::from(event.blsVK).into(),
+            commission: Ratio::new(event.commission as usize, COMMISSION_BASIS_POINTS as usize),
+            stake: Default::default(),
+        };
+        assert_eq!(block.state.node_set.len(), 1);
+        assert_eq!(block.state.node_set[&event.account], expected);
+        assert_eq!(
+            block.node_set_update.unwrap(),
+            [FullNodeSetDiff::NodeUpdate(expected)]
+        );
+    }
+
+    #[test_log::test]
+    fn test_event_validator_registered_v2_invalid_bls() {
+        let mut event = validator_registered_event(rand::thread_rng());
+
+        // Change the signature so it doesn't match the public key.
+        event.blsSig = validator_registered_event(rand::thread_rng()).blsSig;
+
+        let block = test_events([StakeTableV2Events::ValidatorRegisteredV2(event)]);
+        assert_eq!(block.state.node_set.len(), 0);
+    }
+
+    #[test_log::test]
+    fn test_event_validator_registered_v2_invalid_schnorr() {
+        let mut event = validator_registered_event(rand::thread_rng());
+
+        // Change the signature so it doesn't match the public key.
+        event.schnorrSig = validator_registered_event(rand::thread_rng()).schnorrSig;
+
+        let block = test_events([StakeTableV2Events::ValidatorRegisteredV2(event)]);
+        assert_eq!(block.state.node_set.len(), 0);
+    }
+
+    #[test_log::test]
+    fn test_event_validator_exit_valid() {
+        let node = validator_registered_event(rand::thread_rng());
+        let next = test_events([
+            StakeTableV2Events::ValidatorRegisteredV2(node.clone()),
+            StakeTableV2Events::ValidatorExit(ValidatorExit {
+                validator: node.account,
+            }),
+        ]);
+        assert_eq!(next.state.node_set.len(), 0);
+        assert_eq!(
+            next.node_set_update.as_ref().unwrap(),
+            &[FullNodeSetDiff::NodeExit(NodeExit {
+                address: node.account,
+                exit_epoch_and_block: Default::default(),
+                exit_time: next.block().timestamp() + next.block().exit_escrow_period
+            })]
+        );
+    }
+
+    #[test_log::test]
+    fn test_event_validator_exit_invalid_not_found() {
+        test_events([StakeTableV2Events::ValidatorExit(ValidatorExit {
+            validator: Address::random(),
+        })]);
+    }
+
+    #[test_log::test]
+    fn test_exit_escrow_period_updated() {
+        let block = test_events([StakeTableV2Events::ExitEscrowPeriodUpdated(
+            ExitEscrowPeriodUpdated {
+                newExitEscrowPeriod: 12345,
+            },
+        )]);
+        assert_eq!(block.block().exit_escrow_period, 12345);
+    }
+
+    #[test_log::test]
+    fn test_exit_escrow_period_updated_and_validator_exit_in_same_block() {
+        let genesis = BlockData::empty(0);
+        let node = validator_registered_event(rand::thread_rng());
+
+        let input = BlockInput::empty(1)
+            .with_event(StakeTableV2Events::ValidatorRegisteredV2(node.clone()))
+            .with_event(StakeTableV2Events::ExitEscrowPeriodUpdated(
+                ExitEscrowPeriodUpdated {
+                    newExitEscrowPeriod: genesis.block().exit_escrow_period + 100,
+                },
+            ))
+            .with_event(StakeTableV2Events::ValidatorExit(ValidatorExit {
+                validator: node.account,
+            }));
+        let block = genesis.next(&input);
+        assert!(block.state.node_set.is_empty());
+        assert_eq!(
+            block.block().exit_escrow_period,
+            genesis.block().exit_escrow_period + 100
+        );
+        assert_eq!(
+            block.node_set_update.as_ref().unwrap(),
+            &[
+                FullNodeSetDiff::NodeUpdate(NodeSetEntry {
+                    address: node.account,
+                    staking_key: PubKey::from(node.blsVK).into(),
+                    stake: Default::default(),
+                    commission: Ratio::new(
+                        node.commission as usize,
+                        COMMISSION_BASIS_POINTS as usize
+                    ),
+                }),
+                FullNodeSetDiff::NodeExit(NodeExit {
+                    address: node.account,
+                    exit_epoch_and_block: Default::default(),
+                    exit_time: block.block().timestamp() + block.block().exit_escrow_period
+                })
+            ]
+        );
     }
 }
