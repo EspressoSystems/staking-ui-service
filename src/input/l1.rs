@@ -581,7 +581,6 @@ impl Snapshot {
 
                     let diff = FullNodeSetDiff::NodeExit(NodeExit {
                         address: ev.validator,
-                        exit_epoch_and_block: Default::default(), // TODO
                         exit_time: input.timestamp + self.block.exit_escrow_period,
                     });
 
@@ -943,7 +942,6 @@ mod test {
             delegator: address,
             node: Address::random(),
             amount: Default::default(),
-            effective: Default::default(),
         };
         let wallet = Wallet {
             nodes: vec![delegation].into(),
@@ -1084,7 +1082,6 @@ mod test {
                     delegator,
                     node,
                     amount: 1.try_into().unwrap(),
-                    effective: Default::default(),
                 };
                 wallet.nodes.push_back(delegation);
             }
@@ -1432,7 +1429,6 @@ mod test {
             next.node_set_update.as_ref().unwrap(),
             &[FullNodeSetDiff::NodeExit(NodeExit {
                 address: node.account,
-                exit_epoch_and_block: Default::default(),
                 exit_time: next.block().timestamp() + next.block().exit_escrow_period
             })]
         );
@@ -1490,7 +1486,6 @@ mod test {
                 }),
                 FullNodeSetDiff::NodeExit(NodeExit {
                     address: node.account,
-                    exit_epoch_and_block: Default::default(),
                     exit_time: block.block().timestamp() + block.block().exit_escrow_period
                 })
             ]
