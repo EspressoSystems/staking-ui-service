@@ -1,5 +1,7 @@
 //! Configuration options for Rpc Stream client.
 
+use crate::{Result, input::l1::switching_transport::SwitchingTransport};
+use alloy::{providers::RootProvider, rpc::client::RpcClient};
 use clap::Parser;
 use std::{str::FromStr, time::Duration};
 use tide_disco::Url;
@@ -88,6 +90,12 @@ impl Default for L1ClientOptions {
 }
 
 impl L1ClientOptions {
+    pub fn provider(&self) -> Result<(RootProvider, SwitchingTransport)> {
+        let transport = SwitchingTransport::new(self.clone())?;
+        let rpc_client = RpcClient::new(transport.clone(), false);
+        Ok((RootProvider::new(rpc_client), transport))
+    }
+
     pub(super) fn rate_limit_delay(&self) -> Duration {
         self.l1_rate_limit_delay.unwrap_or(self.l1_retry_delay)
     }
