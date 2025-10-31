@@ -29,6 +29,7 @@ use crate::{
 };
 
 pub mod options;
+pub mod provider;
 mod rpc_stream;
 pub mod switching_transport;
 

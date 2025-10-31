@@ -3,14 +3,12 @@
 use super::{
     BlockInput, ResettableStream, options::L1ClientOptions, switching_transport::SwitchingTransport,
 };
-use crate::input::l1::L1BlockSnapshot;
-use crate::types::common::Address;
 use crate::{Result, types::common::L1BlockId};
 use alloy::{
     eips::BlockId,
     network::Ethereum,
     providers::{Provider, ProviderBuilder, RootProvider, WsConnect},
-    rpc::{client::RpcClient, types::Header},
+    rpc::types::Header,
 };
 use futures::stream::{self, BoxStream, Stream, StreamExt};
 use std::{
@@ -50,13 +48,9 @@ impl std::fmt::Debug for RpcStream {
 impl RpcStreamBuilder {
     /// Create a new builder from L1 client options.
     fn new(options: L1ClientOptions) -> Result<Self> {
-        let http_urls = options.http_providers.clone();
-        let transport = SwitchingTransport::new(options.clone(), http_urls)?;
-        let rpc_client = RpcClient::new(transport.clone(), false);
-        let provider = Arc::new(RootProvider::new(rpc_client));
-
+        let (provider, transport) = options.provider()?;
         Ok(Self {
-            provider,
+            provider: Arc::new(provider),
             transport,
             options,
         })
@@ -260,11 +254,6 @@ impl RpcStream {
     pub async fn new(options: L1ClientOptions) -> Result<Self> {
         let builder = RpcStreamBuilder::new(options)?;
         Ok(builder.build().await)
-    }
-
-    /// Get the Espresso stake table genesis block.
-    pub async fn genesis(&self, _stake_table: Address) -> Result<L1BlockSnapshot> {
-        todo!()
     }
 }
 
