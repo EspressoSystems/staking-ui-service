@@ -40,3 +40,8 @@ test-log = { version = "0.2", features = [
     "color",
     "trace",
 ], default-features = false }
+
+[patch."https://github.com/EspressoSystems/espresso-network.git"]
+espresso-types = { git = "https://github.com/EspressoSystems//espresso-network.git", branch = "jb/stake-table-v2-events" }
+hotshot-types = { git = "https://github.com/EspressoSystems//espresso-network.git", branch = "jb/stake-table-v2-events" }
+hotshot-contract-adapter = { git = "https://github.com/EspressoSystems//espresso-network.git", branch = "jb/stake-table-v2-events" }
