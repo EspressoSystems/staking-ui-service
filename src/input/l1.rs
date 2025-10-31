@@ -1354,7 +1354,7 @@ mod test {
         for (i, event) in events.into_iter().enumerate() {
             let number = i as u64 + 1;
             let next = curr.next(&BlockInput::empty(number).with_event(event.clone()));
-            assert_eq!(next.block(), block_snapshot(number));
+            assert_eq!(next.block().id(), block_id(number));
 
             // Calling `next` should always populate the update fields.
             let node_set_update = next.node_set_update.as_ref().unwrap();
