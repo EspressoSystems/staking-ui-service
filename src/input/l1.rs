@@ -34,7 +34,7 @@ mod rpc_stream;
 pub mod switching_transport;
 
 pub use rpc_stream::RpcStream;
-pub(crate) mod testing;
+pub mod testing;
 
 /// In-memory state populated by the L1 input source.
 #[derive(Clone, Debug)]

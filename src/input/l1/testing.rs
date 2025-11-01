@@ -1,4 +1,4 @@
-#![cfg(test)]
+#![cfg(any(test, feature = "testing"))]
 
 use std::{
     collections::HashSet,
@@ -8,10 +8,20 @@ use std::{
 };
 
 use alloy::{
-    primitives::{FixedBytes, keccak256},
+    node_bindings::AnvilInstance,
+    primitives::{FixedBytes, U256, keccak256},
+    providers::{Provider, WalletProvider},
+    signers::{
+        k256::ecdsa::SigningKey,
+        local::{LocalSigner, MnemonicBuilder},
+    },
     sol_types::SolValue,
 };
 use async_lock::RwLockReadGuard;
+use espresso_contract_deployer::{
+    Contracts, network_config::light_client_genesis_from_stake_table,
+};
+use espresso_types::{L1Client, SeqTypes};
 use hotshot_contract_adapter::{
     sol_types::{
         G1PointSol,
@@ -22,7 +32,9 @@ use hotshot_contract_adapter::{
     stake_table::StateSignatureSol,
 };
 use hotshot_types::{
+    PeerConfig,
     light_client::{StateVerKey, hash_bytes_to_field},
+    stake_table::StakeTableEntry,
     traits::signature_key::{SignatureKey, StateSignatureKey},
 };
 use jf_signature::{SignatureScheme, schnorr::SchnorrSignatureScheme};
@@ -36,7 +48,7 @@ use super::*;
 
 /// Easy-setup storage that just uses memory.
 #[derive(Clone, Debug, Default)]
-pub(crate) struct MemoryStorage {
+pub struct MemoryStorage {
     snapshot: Arc<RwLock<Option<Snapshot>>>,
 }
 
@@ -72,7 +84,7 @@ impl L1Persistence for MemoryStorage {
 
 /// Storage that always fails.
 #[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct FailStorage;
+pub struct FailStorage;
 
 impl L1Persistence for FailStorage {
     async fn finalized_snapshot(&self) -> Result<Option<Snapshot>> {
@@ -104,7 +116,7 @@ impl L1Persistence for FailStorage {
 
 /// Resettable stream that yields a predefined list of inputs.
 #[derive(Clone, Debug)]
-pub(crate) struct VecStream {
+pub struct VecStream {
     inputs: Vec<BlockInput>,
     reorg: Option<Vec<BlockInput>>,
     pos: usize,
@@ -127,7 +139,7 @@ impl VecStream {
     ///
     /// The resulting stream will block indefinitely when it reaches the end of its predefined
     /// input sequence.
-    pub(crate) fn infinite() -> Self {
+    pub fn infinite() -> Self {
         Self {
             panic_at_end: false,
             ..Default::default()
@@ -135,12 +147,12 @@ impl VecStream {
     }
 
     /// Append a new L1 block input to be yielded by the stream.
-    pub(crate) fn push(&mut self, input: BlockInput) {
+    pub fn push(&mut self, input: BlockInput) {
         self.inputs.push(input);
     }
 
     /// Provide an alternative sequence of inputs to yield after the stream is reset.
-    pub(crate) fn with_reorg(mut self, inputs: Vec<BlockInput>) -> Self {
+    pub fn with_reorg(mut self, inputs: Vec<BlockInput>) -> Self {
         self.reorg = Some(inputs);
         self
     }
@@ -184,7 +196,7 @@ impl ResettableStream for VecStream {
 }
 
 /// Generate a block ID for testing.
-pub(crate) fn block_id(number: u64) -> L1BlockId {
+pub fn block_id(number: u64) -> L1BlockId {
     let parent = keccak256(number.saturating_sub(1).to_le_bytes());
     let hash = keccak256(number.to_le_bytes());
     L1BlockId {
@@ -195,7 +207,7 @@ pub(crate) fn block_id(number: u64) -> L1BlockId {
 }
 
 /// Generate a block snapshot for testing.
-pub(crate) fn block_snapshot(number: u64) -> L1BlockSnapshot {
+pub fn block_snapshot(number: u64) -> L1BlockSnapshot {
     L1BlockSnapshot {
         id: block_id(number),
         timestamp: 12 * number,
@@ -204,7 +216,7 @@ pub(crate) fn block_snapshot(number: u64) -> L1BlockSnapshot {
 }
 
 /// Generate an arbitrary node for testing.
-pub(crate) fn make_node(i: usize) -> NodeSetEntry {
+pub fn make_node(i: usize) -> NodeSetEntry {
     (&validator_registered_event(StdRng::seed_from_u64(i as u64))).into()
 }
 
@@ -214,7 +226,7 @@ pub(crate) fn make_node(i: usize) -> NodeSetEntry {
 /// every generated event is "valid" given the events that came before it (e.g. no duplicate
 /// registrations, no delegations to an unregistered validator, etc.).
 #[derive(Debug)]
-pub(crate) struct EventGenerator {
+pub struct EventGenerator {
     nodes: HashSet<Address>,
     rng: StdRng,
     stake_table_only: bool,
@@ -232,7 +244,7 @@ impl Default for EventGenerator {
 
 impl EventGenerator {
     /// Generate only events which are relevant to [`StakeTableState`].
-    pub(crate) fn stake_table_events() -> Self {
+    pub fn stake_table_events() -> Self {
         Self {
             stake_table_only: true,
             ..Default::default()
@@ -315,9 +327,7 @@ impl Iterator for EventGenerator {
 }
 
 /// Generate a valid [`ValidatorRegisteredV2`] event.
-pub(crate) fn validator_registered_event(
-    mut rng: impl RngCore + CryptoRng,
-) -> ValidatorRegisteredV2 {
+pub fn validator_registered_event(mut rng: impl RngCore + CryptoRng) -> ValidatorRegisteredV2 {
     let mut address_bytes = FixedBytes::<32>::default();
     rng.fill_bytes(address_bytes.as_mut_slice());
     let account = Address::from_word(address_bytes);
@@ -355,7 +365,7 @@ pub(crate) fn validator_registered_event(
 /// sequence of L1 blocks such that every generated event is "valid" given the events that came
 /// before it (e.g. no duplicate registrations, no delegations to an unregistered validator, etc.).
 #[derive(derive_more::Debug)]
-pub(crate) struct InputGenerator {
+pub struct InputGenerator {
     #[debug("Iterator")]
     events: Box<dyn Iterator<Item = L1Event>>,
     next_block: u64,
@@ -370,7 +380,7 @@ impl Default for InputGenerator {
 
 impl InputGenerator {
     /// Generate inputs from a given sequence of events.
-    pub(crate) fn from_events(events: impl IntoIterator<Item = L1Event> + 'static) -> Self {
+    pub fn from_events(events: impl IntoIterator<Item = L1Event> + 'static) -> Self {
         Self {
             events: Box::new(events.into_iter()),
             next_block: 0,
@@ -398,7 +408,7 @@ impl Iterator for InputGenerator {
 
 impl BlockInput {
     /// Create a [`BlockInput`] with no events, just L1 block information.
-    pub(crate) fn empty(number: u64) -> BlockInput {
+    pub fn empty(number: u64) -> BlockInput {
         let block = block_snapshot(number);
         Self {
             block: block.id(),
@@ -409,14 +419,14 @@ impl BlockInput {
     }
 
     /// A [`BlockInput`] like `self` but with `event` added.
-    pub(crate) fn with_event(mut self, event: impl Into<L1Event>) -> Self {
+    pub fn with_event(mut self, event: impl Into<L1Event>) -> Self {
         self.events.push(event.into());
         self
     }
 }
 
 impl<S: Default> super::State<S> {
-    pub(crate) fn with_l1_block_range(start: u64, end: u64) -> Self {
+    pub fn with_l1_block_range(start: u64, end: u64) -> Self {
         let blocks = (start..end).map(BlockData::empty).collect::<Vec<_>>();
         let blocks_by_hash = blocks
             .iter()
@@ -432,7 +442,7 @@ impl<S: Default> super::State<S> {
 
 impl BlockData {
     /// Generate a test L1 block with no staking-related data.
-    pub(super) fn empty(number: u64) -> Self {
+    pub fn empty(number: u64) -> Self {
         Self {
             state: Snapshot::empty(block_snapshot(number)),
             node_set_update: Some(Default::default()),
@@ -445,7 +455,7 @@ impl BlockData {
 ///
 /// Returns a lock on the state, frozen after the first observation where the predicate was
 /// satisfied.
-pub(crate) async fn subscribe_until<S>(
+pub async fn subscribe_until<S>(
     state: &'_ Arc<RwLock<State<S>>>,
     stream: impl ResettableStream + Send + 'static,
     p: impl Fn(&State<S>) -> bool,
@@ -465,4 +475,85 @@ where
             break state;
         }
     }
+}
+
+pub async fn deploy_contracts(
+    provider: &(impl Provider + WalletProvider),
+    anvil: &AnvilInstance,
+    contracts: &mut Contracts,
+) {
+    let admin = provider.default_signer_address();
+    let initial_token_supply = U256::from(1_000_000_000);
+    let genesis_exit_escrow_period = U256::from(256);
+    let blocks_per_epoch = 100;
+    let epoch_start_block = 1000;
+
+    let peers = vec![PeerConfig::<SeqTypes> {
+        stake_table_entry: StakeTableEntry {
+            stake_key: PubKey::generated_from_seed_indexed([0; 32], 0).0,
+            stake_amount: U256::from(1),
+        },
+        state_ver_key: Default::default(),
+    }];
+    let (genesis_state, genesis_stake) =
+        light_client_genesis_from_stake_table(&peers.into(), 10).unwrap();
+    let lc_proxy_addr = espresso_contract_deployer::deploy_light_client_proxy(
+        provider,
+        contracts,
+        true, // use mock
+        genesis_state,
+        genesis_stake,
+        admin,
+        None, // no permissioned prover
+    )
+    .await
+    .unwrap();
+    espresso_contract_deployer::upgrade_light_client_v2(
+        provider,
+        contracts,
+        true, // use mock
+        blocks_per_epoch,
+        epoch_start_block,
+    )
+    .await
+    .unwrap();
+
+    let token_proxy_addr = espresso_contract_deployer::deploy_token_proxy(
+        provider,
+        contracts,
+        admin,
+        admin,
+        initial_token_supply,
+        "Espresso",
+        "ESP",
+    )
+    .await
+    .unwrap();
+
+    espresso_contract_deployer::deploy_stake_table_proxy(
+        provider,
+        contracts,
+        token_proxy_addr,
+        lc_proxy_addr,
+        genesis_exit_escrow_period,
+        admin,
+    )
+    .await
+    .unwrap();
+    espresso_contract_deployer::upgrade_stake_table_v2(
+        provider,
+        L1Client::anvil(anvil).unwrap(),
+        contracts,
+        admin,
+        admin,
+    )
+    .await
+    .unwrap();
+}
+
+pub fn funded_wallet() -> LocalSigner<SigningKey> {
+    MnemonicBuilder::english()
+        .phrase("test test test test test test test test test test test junk")
+        .build()
+        .unwrap()
 }

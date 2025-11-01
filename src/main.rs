@@ -134,9 +134,12 @@ mod test {
     use std::time::Duration;
 
     use alloy::node_bindings::Anvil;
+    use alloy::providers::ProviderBuilder;
+    use espresso_contract_deployer::{Contract, Contracts};
     use portpicker::pick_unused_port;
-    use staking_ui_service::Error;
+    use staking_ui_service::input::l1::testing::funded_wallet;
     use staking_ui_service::types::common::L1BlockId;
+    use staking_ui_service::{Error, input::l1::testing::deploy_contracts};
     use surf_disco::Client;
     use tempfile::tempdir;
     use tokio::{task::spawn, time::sleep};
@@ -149,13 +152,20 @@ mod test {
         let port = pick_unused_port().unwrap();
         let tmp = tempdir().unwrap();
         let anvil = Anvil::new().block_time(1).spawn();
+        let provider = ProviderBuilder::new()
+            .wallet(funded_wallet())
+            .connect_http(anvil.endpoint_url());
+
+        let mut contracts = Contracts::default();
+        deploy_contracts(&provider, &anvil, &mut contracts).await;
+
         let opt = Options {
             l1_options: L1ClientOptions {
                 http_providers: vec![anvil.endpoint_url()],
                 l1_ws_provider: Some(vec![anvil.ws_endpoint_url()]),
                 ..Default::default()
             },
-            stake_table: Default::default(),
+            stake_table: contracts[&Contract::StakeTableProxy],
             port,
             storage: tmp.path().join("staking-ui-storage"),
             log_format: Some(LogFormat::Json),
