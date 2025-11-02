@@ -129,6 +129,7 @@ dependencies = [
  "alloy-rpc-types",
  "alloy-serde",
  "alloy-signer",
+ "alloy-signer-ledger",
  "alloy-signer-local",
  "alloy-transport",
  "alloy-transport-http",
@@ -150,7 +151,7 @@ dependencies = [
 [[package]]
 name = "alloy-compat"
 version = "0.1.0"
-source = "git+https://github.com/EspressoSystems/espresso-network.git#772bfb00b379d673ea90af52edd53cf76f0b6c56"
+source = "git+https://github.com/EspressoSystems/espresso-network.git#2a7e7cbb49eb2704f9d6f0dadec5015de9e5a91c"
 dependencies = [
  "alloy",
  "ethers-core",
@@ -642,6 +643,24 @@ dependencies = [
  "elliptic-curve",
  "k256",
  "thiserror 2.0.17",
+]
+
+[[package]]
+name = "alloy-signer-ledger"
+version = "1.0.41"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4599a95670313c028b1f69c425deee72c26f2c4911713eb49a4d5faf9eb67c29"
+dependencies = [
+ "alloy-consensus",
+ "alloy-network",
+ "alloy-primitives",
+ "alloy-signer",
+ "async-trait",
+ "coins-ledger",
+ "futures-util",
+ "semver 1.0.27",
+ "thiserror 2.0.17",
+ "tracing",
 ]
 
 [[package]]
@@ -1308,7 +1327,7 @@ dependencies = [
  "ark-poly-commit",
  "ark-serialize 0.5.0",
  "ark-std 0.5.0",
- "directories",
+ "directories 5.0.1",
  "hex-literal",
  "rand 0.8.5",
  "sha2 0.10.9",
@@ -2164,6 +2183,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "borsh"
+version = "1.5.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ad8646f98db542e39fc66e68a20b2144f6a732636df7c2354e74645faaa433ce"
+dependencies = [
+ "borsh-derive",
+ "cfg_aliases",
+]
+
+[[package]]
+name = "borsh-derive"
+version = "1.5.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fdd1d3c0c2f5833f22386f252fe8ed005c7f59fdcddeef025c01b4c3b9fd9ac3"
+dependencies = [
+ "once_cell",
+ "proc-macro-crate",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.108",
+]
+
+[[package]]
 name = "bs58"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2292,10 +2334,10 @@ version = "0.6.1"
 source = "git+https://github.com/EspressoSystems/Push-CDN?tag=0.6.1#54ee47049c2c90cd418d1fa2fddfbd3533737c35"
 dependencies = [
  "cdn-proto",
- "clap",
+ "clap 4.5.50",
  "console-subscriber",
  "derivative",
- "jf-signature",
+ "jf-signature 0.4.0 (git+https://github.com/EspressoSystems/jellyfish?tag=jf-signature-v0.4.0)",
  "lazy_static",
  "local-ip-address",
  "parking_lot",
@@ -2314,9 +2356,9 @@ version = "0.6.1"
 source = "git+https://github.com/EspressoSystems/Push-CDN?tag=0.6.1#54ee47049c2c90cd418d1fa2fddfbd3533737c35"
 dependencies = [
  "cdn-proto",
- "clap",
+ "clap 4.5.50",
  "derive_more 1.0.0",
- "jf-signature",
+ "jf-signature 0.4.0 (git+https://github.com/EspressoSystems/jellyfish?tag=jf-signature-v0.4.0)",
  "parking_lot",
  "rand 0.8.5",
  "tokio",
@@ -2330,8 +2372,8 @@ version = "0.6.1"
 source = "git+https://github.com/EspressoSystems/Push-CDN?tag=0.6.1#54ee47049c2c90cd418d1fa2fddfbd3533737c35"
 dependencies = [
  "cdn-proto",
- "clap",
- "jf-signature",
+ "clap 4.5.50",
+ "jf-signature 0.4.0 (git+https://github.com/EspressoSystems/jellyfish?tag=jf-signature-v0.4.0)",
  "tokio",
  "tracing",
  "tracing-subscriber 0.3.20",
@@ -2349,7 +2391,7 @@ dependencies = [
  "capnp",
  "derivative",
  "derive_more 1.0.0",
- "jf-signature",
+ "jf-signature 0.4.0 (git+https://github.com/EspressoSystems/jellyfish?tag=jf-signature-v0.4.0)",
  "lazy_static",
  "mnemonic",
  "num_enum",
@@ -2408,12 +2450,56 @@ dependencies = [
 
 [[package]]
 name = "clap"
+version = "3.2.25"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4ea181bf566f71cb9a5d17a59e1871af638180a18fb0035c92ae62b705207123"
+dependencies = [
+ "bitflags 1.3.2",
+ "clap_lex 0.2.4",
+ "indexmap 1.9.3",
+ "textwrap",
+]
+
+[[package]]
+name = "clap"
 version = "4.5.50"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c2cfd7bf8a6017ddaa4e32ffe7403d547790db06bd171c1c53926faab501623"
 dependencies = [
  "clap_builder",
  "clap_derive",
+]
+
+[[package]]
+name = "clap-serde"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f1d9609b451fd69eec0ecd379932d605a64bba1746397b31455962c8ba2fdfb7"
+dependencies = [
+ "clap 3.2.25",
+ "serde",
+]
+
+[[package]]
+name = "clap-serde-derive"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c4b7d643cbdc3a4eb0b5db8b9844ab2002bc4be44c1244db5cd27df8e594c125"
+dependencies = [
+ "clap 4.5.50",
+ "clap-serde-proc",
+ "serde",
+]
+
+[[package]]
+name = "clap-serde-proc"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f6725cfcf906f158cdad4ca9a2a426133b36a3f91b5da2b971f8b956823ef55e"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 1.0.109",
 ]
 
 [[package]]
@@ -2424,7 +2510,7 @@ checksum = "0a4c05b9e80c5ccd3a7ef080ad7b6ba7d6fc00a985b8b157197075677c82c7a0"
 dependencies = [
  "anstream",
  "anstyle",
- "clap_lex",
+ "clap_lex 0.7.6",
  "strsim",
 ]
 
@@ -2438,6 +2524,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.108",
+]
+
+[[package]]
+name = "clap_lex"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2850f2f5a82cbf437dd5af4d49848fbdfc27c157c3d010345776f952765261c5"
+dependencies = [
+ "os_str_bytes",
 ]
 
 [[package]]
@@ -2501,6 +2596,29 @@ dependencies = [
  "sha2 0.10.9",
  "sha3",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "coins-ledger"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ab9bc0994d0aa0f4ade5f3a9baf4a8d936f250278c85a1124b401860454246ab"
+dependencies = [
+ "async-trait",
+ "byteorder",
+ "cfg-if",
+ "const-hex",
+ "getrandom 0.2.16",
+ "hidapi-rusb",
+ "js-sys",
+ "log",
+ "nix",
+ "once_cell",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
 ]
 
 [[package]]
@@ -3320,6 +3438,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "directories"
+version = "6.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "16f5094c54661b38d03bd7e50df373292118db60b585c08a411c6d840017fe7d"
+dependencies = [
+ "dirs-sys 0.5.0",
+]
+
+[[package]]
 name = "dirs"
 version = "5.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3611,6 +3738,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "espresso-contract-deployer"
+version = "0.1.0"
+source = "git+https://github.com/EspressoSystems/espresso-network.git#2a7e7cbb49eb2704f9d6f0dadec5015de9e5a91c"
+dependencies = [
+ "alloy",
+ "anyhow",
+ "clap 4.5.50",
+ "derive_builder",
+ "derive_more 2.0.1",
+ "dotenvy",
+ "espresso-types",
+ "hotshot-contract-adapter",
+ "hotshot-types",
+ "serde_json",
+ "surf-disco",
+ "tide-disco",
+ "tokio",
+ "tracing",
+ "url",
+ "vbs",
+]
+
+[[package]]
 name = "espresso-systems-common"
 version = "0.4.0"
 source = "git+https://github.com/espressosystems/espresso-systems-common?tag=0.4.0#5abd890f79014a86db31286e1f3a529f161e69de"
@@ -3618,7 +3768,7 @@ source = "git+https://github.com/espressosystems/espresso-systems-common?tag=0.4
 [[package]]
 name = "espresso-types"
 version = "0.1.0"
-source = "git+https://github.com/EspressoSystems/espresso-network.git#772bfb00b379d673ea90af52edd53cf76f0b6c56"
+source = "git+https://github.com/EspressoSystems/espresso-network.git#2a7e7cbb49eb2704f9d6f0dadec5015de9e5a91c"
 dependencies = [
  "alloy",
  "alloy-compat",
@@ -3634,7 +3784,7 @@ dependencies = [
  "bincode",
  "blake3",
  "bytesize",
- "clap",
+ "clap 4.5.50",
  "cld",
  "committable",
  "derive_more 2.0.1",
@@ -3870,6 +4020,12 @@ dependencies = [
  "rustc-hex",
  "static_assertions",
 ]
+
+[[package]]
+name = "fixedbitset"
+version = "0.5.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d674e81391d1e1ab681a28d99df07927c6d4aa5b027d7da16ba32d1d21ecd99"
 
 [[package]]
 name = "flate2"
@@ -4190,6 +4346,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e629b9b98ef3dd8afe6ca2bd0f89306cec16d43d907889945bc5d6687f2f13c7"
 
 [[package]]
+name = "git-version"
+version = "0.3.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1ad568aa3db0fcbc81f2f116137f263d7304f512a1209b35b85150d3ef88ad19"
+dependencies = [
+ "git-version-macro",
+]
+
+[[package]]
+name = "git-version-macro"
+version = "0.3.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "53010ccb100b96a67bc32c0175f0ed1426b31b655d562898e57325f81c023ac0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.108",
+]
+
+[[package]]
 name = "glob"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4461,6 +4637,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "hidapi-rusb"
+version = "1.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "efdc2ec354929a6e8f3c6b6923a4d97427ec2f764cfee8cd4bfe890946cdf08b"
+dependencies = [
+ "cc",
+ "libc",
+ "pkg-config",
+ "rusb",
+]
+
+[[package]]
 name = "hkdf"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4500,17 +4688,17 @@ dependencies = [
 
 [[package]]
 name = "home"
-version = "0.5.12"
+version = "0.5.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cc627f471c528ff0c4a49e1d5e60450c8f6461dd6d10ba9dcd3a61d3dff7728d"
+checksum = "589533453244b0995c858700322199b2becb13b627df2851f64a2775d024abcf"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
 name = "hotshot"
 version = "0.1.0"
-source = "git+https://github.com/EspressoSystems/espresso-network.git#772bfb00b379d673ea90af52edd53cf76f0b6c56"
+source = "git+https://github.com/EspressoSystems/espresso-network.git#2a7e7cbb49eb2704f9d6f0dadec5015de9e5a91c"
 dependencies = [
  "alloy",
  "anyhow",
@@ -4553,10 +4741,10 @@ dependencies = [
 [[package]]
 name = "hotshot-builder-api"
 version = "0.1.7"
-source = "git+https://github.com/EspressoSystems/espresso-network.git#772bfb00b379d673ea90af52edd53cf76f0b6c56"
+source = "git+https://github.com/EspressoSystems/espresso-network.git#2a7e7cbb49eb2704f9d6f0dadec5015de9e5a91c"
 dependencies = [
  "async-trait",
- "clap",
+ "clap 4.5.50",
  "committable",
  "derive_more 2.0.1",
  "futures",
@@ -4572,7 +4760,7 @@ dependencies = [
 [[package]]
 name = "hotshot-contract-adapter"
 version = "0.1.0"
-source = "git+https://github.com/EspressoSystems/espresso-network.git#772bfb00b379d673ea90af52edd53cf76f0b6c56"
+source = "git+https://github.com/EspressoSystems/espresso-network.git#2a7e7cbb49eb2704f9d6f0dadec5015de9e5a91c"
 dependencies = [
  "alloy",
  "anyhow",
@@ -4588,7 +4776,7 @@ dependencies = [
  "jf-pcs",
  "jf-plonk 0.7.0 (git+https://github.com/EspressoSystems/jellyfish?tag=jf-plonk-v0.7.0)",
  "jf-plonk 0.7.0 (git+https://github.com/EspressoSystems/jellyfish?branch=jf-relation-v0.5.0-compat)",
- "jf-signature",
+ "jf-signature 0.4.0 (git+https://github.com/EspressoSystems/jellyfish?tag=jf-signature-v0.4.0)",
  "jf-utils",
  "num-bigint",
  "num-traits",
@@ -4601,13 +4789,13 @@ dependencies = [
 [[package]]
 name = "hotshot-events-service"
 version = "0.1.57"
-source = "git+https://github.com/EspressoSystems/espresso-network.git#772bfb00b379d673ea90af52edd53cf76f0b6c56"
+source = "git+https://github.com/EspressoSystems/espresso-network.git#2a7e7cbb49eb2704f9d6f0dadec5015de9e5a91c"
 dependencies = [
  "alloy",
  "async-broadcast",
  "async-lock 3.4.1",
  "async-trait",
- "clap",
+ "clap 4.5.50",
  "derive_more 2.0.1",
  "futures",
  "hotshot-types",
@@ -4626,7 +4814,7 @@ dependencies = [
 [[package]]
 name = "hotshot-example-types"
 version = "0.1.0"
-source = "git+https://github.com/EspressoSystems/espresso-network.git#772bfb00b379d673ea90af52edd53cf76f0b6c56"
+source = "git+https://github.com/EspressoSystems/espresso-network.git#2a7e7cbb49eb2704f9d6f0dadec5015de9e5a91c"
 dependencies = [
  "alloy",
  "anyhow",
@@ -4656,7 +4844,7 @@ dependencies = [
 [[package]]
 name = "hotshot-libp2p-networking"
 version = "0.1.0"
-source = "git+https://github.com/EspressoSystems/espresso-network.git#772bfb00b379d673ea90af52edd53cf76f0b6c56"
+source = "git+https://github.com/EspressoSystems/espresso-network.git#2a7e7cbb49eb2704f9d6f0dadec5015de9e5a91c"
 dependencies = [
  "alloy",
  "anyhow",
@@ -4687,7 +4875,7 @@ dependencies = [
 [[package]]
 name = "hotshot-macros"
 version = "0.1.0"
-source = "git+https://github.com/EspressoSystems/espresso-network.git#772bfb00b379d673ea90af52edd53cf76f0b6c56"
+source = "git+https://github.com/EspressoSystems/espresso-network.git#2a7e7cbb49eb2704f9d6f0dadec5015de9e5a91c"
 dependencies = [
  "derive_builder",
  "proc-macro2",
@@ -4698,7 +4886,7 @@ dependencies = [
 [[package]]
 name = "hotshot-query-service"
 version = "0.1.76"
-source = "git+https://github.com/EspressoSystems/espresso-network.git#772bfb00b379d673ea90af52edd53cf76f0b6c56"
+source = "git+https://github.com/EspressoSystems/espresso-network.git#2a7e7cbb49eb2704f9d6f0dadec5015de9e5a91c"
 dependencies = [
  "alloy",
  "anyhow",
@@ -4749,9 +4937,57 @@ dependencies = [
 ]
 
 [[package]]
+name = "hotshot-state-prover"
+version = "0.1.0"
+source = "git+https://github.com/EspressoSystems/espresso-network.git#2a7e7cbb49eb2704f9d6f0dadec5015de9e5a91c"
+dependencies = [
+ "alloy",
+ "anyhow",
+ "ark-bn254",
+ "ark-ec",
+ "ark-ed-on-bn254",
+ "ark-ff 0.5.0",
+ "ark-serialize 0.5.0",
+ "ark-srs",
+ "ark-std 0.5.0",
+ "clap 4.5.50",
+ "displaydoc",
+ "espresso-contract-deployer",
+ "espresso-types",
+ "futures",
+ "hotshot-contract-adapter",
+ "hotshot-query-service",
+ "hotshot-task-impls",
+ "hotshot-types",
+ "itertools 0.12.1",
+ "jf-crhf",
+ "jf-pcs",
+ "jf-plonk 0.7.0 (git+https://github.com/EspressoSystems/jellyfish?tag=jf-plonk-v0.7.0)",
+ "jf-plonk 0.7.0 (git+https://github.com/EspressoSystems/jellyfish?branch=jf-relation-v0.5.0-compat)",
+ "jf-relation 0.5.0 (git+https://github.com/EspressoSystems/jellyfish?tag=jf-relation-v0.5.0)",
+ "jf-relation 0.5.0 (git+https://github.com/EspressoSystems/jellyfish?branch=jf-relation-v0.5.0-compat)",
+ "jf-rescue 0.3.0 (git+https://github.com/EspressoSystems/jellyfish?tag=jf-rescue-v0.3.0)",
+ "jf-rescue 0.3.0 (git+https://github.com/EspressoSystems/jellyfish?branch=jf-relation-v0.5.0-compat)",
+ "jf-signature 0.4.0 (git+https://github.com/EspressoSystems/jellyfish?tag=jf-signature-v0.4.0)",
+ "jf-signature 0.4.0 (git+https://github.com/EspressoSystems/jellyfish?branch=jf-relation-v0.5.0-compat)",
+ "jf-utils",
+ "reqwest",
+ "sequencer-utils",
+ "serde",
+ "surf-disco",
+ "tide-disco",
+ "time 0.3.44",
+ "tokio",
+ "toml",
+ "tracing",
+ "url",
+ "vbs",
+]
+
+[[package]]
 name = "hotshot-task"
 version = "0.1.0"
-source = "git+https://github.com/EspressoSystems/espresso-network.git#772bfb00b379d673ea90af52edd53cf76f0b6c56"
+source = "git+https://github.com/EspressoSystems/espresso-network.git#2a7e7cbb49eb2704f9d6f0dadec5015de9e5a91c"
 dependencies = [
  "async-broadcast",
  "async-trait",
@@ -4764,7 +5000,7 @@ dependencies = [
 [[package]]
 name = "hotshot-task-impls"
 version = "0.1.0"
-source = "git+https://github.com/EspressoSystems/espresso-network.git#772bfb00b379d673ea90af52edd53cf76f0b6c56"
+source = "git+https://github.com/EspressoSystems/espresso-network.git#2a7e7cbb49eb2704f9d6f0dadec5015de9e5a91c"
 dependencies = [
  "alloy",
  "anyhow",
@@ -4802,7 +5038,7 @@ dependencies = [
 [[package]]
 name = "hotshot-testing"
 version = "0.1.0"
-source = "git+https://github.com/EspressoSystems/espresso-network.git#772bfb00b379d673ea90af52edd53cf76f0b6c56"
+source = "git+https://github.com/EspressoSystems/espresso-network.git#2a7e7cbb49eb2704f9d6f0dadec5015de9e5a91c"
 dependencies = [
  "alloy",
  "anyhow",
@@ -4844,7 +5080,7 @@ dependencies = [
 [[package]]
 name = "hotshot-types"
 version = "0.1.11"
-source = "git+https://github.com/EspressoSystems/espresso-network.git#772bfb00b379d673ea90af52edd53cf76f0b6c56"
+source = "git+https://github.com/EspressoSystems/espresso-network.git#2a7e7cbb49eb2704f9d6f0dadec5015de9e5a91c"
 dependencies = [
  "alloy",
  "anyhow",
@@ -4860,7 +5096,7 @@ dependencies = [
  "bincode",
  "bitvec",
  "blake3",
- "clap",
+ "clap 4.5.50",
  "committable",
  "derive_more 2.0.1",
  "digest 0.10.7",
@@ -4873,7 +5109,7 @@ dependencies = [
  "jf-crhf",
  "jf-pcs",
  "jf-rescue 0.3.0 (git+https://github.com/EspressoSystems/jellyfish?tag=jf-rescue-v0.3.0)",
- "jf-signature",
+ "jf-signature 0.4.0 (git+https://github.com/EspressoSystems/jellyfish?tag=jf-signature-v0.4.0)",
  "jf-utils",
  "lazy_static",
  "libp2p-identity",
@@ -4903,7 +5139,7 @@ dependencies = [
 [[package]]
 name = "hotshot-utils"
 version = "0.1.0"
-source = "git+https://github.com/EspressoSystems/espresso-network.git#772bfb00b379d673ea90af52edd53cf76f0b6c56"
+source = "git+https://github.com/EspressoSystems/espresso-network.git#2a7e7cbb49eb2704f9d6f0dadec5015de9e5a91c"
 dependencies = [
  "tracing",
 ]
@@ -5304,7 +5540,7 @@ dependencies = [
  "rtnetlink",
  "system-configuration",
  "tokio",
- "windows",
+ "windows 0.53.0",
 ]
 
 [[package]]
@@ -5920,6 +6156,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "jf-signature"
+version = "0.4.0"
+source = "git+https://github.com/EspressoSystems/jellyfish?branch=jf-relation-v0.5.0-compat#11e54d4e97858610d5f423bac2603a331c0046f6"
+dependencies = [
+ "ark-bls12-381",
+ "ark-bn254",
+ "ark-ec",
+ "ark-ff 0.5.0",
+ "ark-serialize 0.5.0",
+ "ark-std 0.5.0",
+ "blst",
+ "derivative",
+ "digest 0.10.7",
+ "displaydoc",
+ "getrandom 0.2.16",
+ "hashbrown 0.14.5",
+ "itertools 0.12.1",
+ "jf-crhf",
+ "jf-relation 0.5.0 (git+https://github.com/EspressoSystems/jellyfish?branch=jf-relation-v0.5.0-compat)",
+ "jf-rescue 0.3.0 (git+https://github.com/EspressoSystems/jellyfish?branch=jf-relation-v0.5.0-compat)",
+ "jf-utils",
+ "num-bigint",
+ "num-traits",
+ "serde",
+ "sha3",
+ "tagged-base64",
+ "zeroize",
+]
+
+[[package]]
 name = "jf-utils"
 version = "0.5.0"
 source = "git+https://github.com/EspressoSystems/jellyfish?tag=jf-utils-v0.5.0#f1538793f7f0e391495cb17bbb0c8703ec5f689d"
@@ -6441,6 +6707,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "libusb1-sys"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "da050ade7ac4ff1ba5379af847a10a10a8e284181e060105bf8d86960ce9ce0f"
+dependencies = [
+ "cc",
+ "libc",
+ "pkg-config",
+ "vcpkg",
+]
+
+[[package]]
 name = "libz-sys"
 version = "1.1.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6629,6 +6907,15 @@ name = "memchr"
 version = "2.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f52b00d39961fc5b2736ea853c9cc86238e165017a493d1d5c8eac6bdc4cc273"
+
+[[package]]
+name = "memoffset"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5de893c32cde5f383baa4c04c5d6dbdd735cfd4a794b0debdb2bb1b421da5ff4"
+dependencies = [
+ "autocfg",
+]
 
 [[package]]
 name = "memoize"
@@ -6903,6 +7190,8 @@ dependencies = [
  "bitflags 1.3.2",
  "cfg-if",
  "libc",
+ "memoffset",
+ "pin-utils",
 ]
 
 [[package]]
@@ -6913,6 +7202,15 @@ checksum = "d273983c5a657a70a3e8f2a01329822f3b8c8172b73826411a55751e404a0a4a"
 dependencies = [
  "memchr",
  "minimal-lexical",
+]
+
+[[package]]
+name = "ntapi"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e8a3895c6391c39d7fe7ebc444a87eb2991b2a0bc718fdabd071eec617fc68e4"
+dependencies = [
+ "winapi",
 ]
 
 [[package]]
@@ -7200,6 +7498,12 @@ dependencies = [
  "dlv-list",
  "hashbrown 0.14.5",
 ]
+
+[[package]]
+name = "os_str_bytes"
+version = "6.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e2355d85b9a3786f481747ced0e0ff2ba35213a1f9bd406ed906554d7af805a1"
 
 [[package]]
 name = "p3-maybe-rayon"
@@ -8039,6 +8343,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "readme-rustdocifier"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "08ad765b21a08b1a8e5cdce052719188a23772bcbefb3c439f0baaf62c56ceac"
+
+[[package]]
 name = "redis"
 version = "0.27.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8091,6 +8401,18 @@ dependencies = [
  "getrandom 0.2.16",
  "libredox",
  "thiserror 2.0.17",
+]
+
+[[package]]
+name = "reed-solomon-simd"
+version = "3.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cffef0520d30fbd4151fb20e262947ae47fb0ab276a744a19b6398438105a072"
+dependencies = [
+ "cpufeatures",
+ "fixedbitset",
+ "once_cell",
+ "readme-rustdocifier",
 ]
 
 [[package]]
@@ -8186,6 +8508,12 @@ name = "regex-syntax"
 version = "0.8.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7a2d987857b319362043e95f5353c0535c1f58eec5336fdfcf626430af7def58"
+
+[[package]]
+name = "relative-path"
+version = "1.9.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ba39f3699c378cd8970968dcbff9c43159ea4cfbd88d43c00b22f2ef10a435d2"
 
 [[package]]
 name = "rend"
@@ -8394,6 +8722,47 @@ dependencies = [
 ]
 
 [[package]]
+name = "rstest"
+version = "0.25.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6fc39292f8613e913f7df8fa892b8944ceb47c247b78e1b1ae2f09e019be789d"
+dependencies = [
+ "futures-timer",
+ "futures-util",
+ "rstest_macros",
+ "rustc_version 0.4.1",
+]
+
+[[package]]
+name = "rstest_macros"
+version = "0.25.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1f168d99749d307be9de54d23fd226628d99768225ef08f6ffb52e0182a27746"
+dependencies = [
+ "cfg-if",
+ "glob",
+ "proc-macro-crate",
+ "proc-macro2",
+ "quote",
+ "regex",
+ "relative-path",
+ "rustc_version 0.4.1",
+ "syn 2.0.108",
+ "unicode-ident",
+]
+
+[[package]]
+name = "rstest_reuse"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b3a8fb4672e840a587a66fc577a5491375df51ddb88f2a2c2a792598c326fe14"
+dependencies = [
+ "quote",
+ "rand 0.8.5",
+ "syn 2.0.108",
+]
+
+[[package]]
 name = "rtnetlink"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8446,6 +8815,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "48fd7bd8a6377e15ad9d42a8ec25371b94ddc67abe7c8b9127bec79bebaaae18"
 
 [[package]]
+name = "rusb"
+version = "0.9.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ab9f9ff05b63a786553a4c02943b74b34a988448671001e9a27e2f0565cc05a4"
+dependencies = [
+ "libc",
+ "libusb1-sys",
+]
+
+[[package]]
 name = "rust-ini"
 version = "0.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8453,6 +8832,22 @@ checksum = "3e0698206bcb8882bf2a9ecb4c1e7785db57ff052297085a6efd4fe42302068a"
 dependencies = [
  "cfg-if",
  "ordered-multimap",
+]
+
+[[package]]
+name = "rust_decimal"
+version = "1.39.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "35affe401787a9bd846712274d97654355d21b2a2c092a3139aabe31e9022282"
+dependencies = [
+ "arrayvec",
+ "borsh",
+ "bytes 1.10.1",
+ "num-traits",
+ "rand 0.8.5",
+ "rkyv",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -8821,13 +9216,13 @@ checksum = "cd0b0ec5f1c1ca621c432a25813d8d60c88abe6d3e08a3eb9cf37d97a0fe3d73"
 [[package]]
 name = "sequencer-utils"
 version = "0.1.0"
-source = "git+https://github.com/EspressoSystems/espresso-network.git#772bfb00b379d673ea90af52edd53cf76f0b6c56"
+source = "git+https://github.com/EspressoSystems/espresso-network.git#2a7e7cbb49eb2704f9d6f0dadec5015de9e5a91c"
 dependencies = [
  "alloy",
  "anyhow",
  "ark-serialize 0.5.0",
  "async-trait",
- "clap",
+ "clap 4.5.50",
  "committable",
  "hotshot",
  "hotshot-example-types",
@@ -9553,20 +9948,67 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
+name = "staking-cli"
+version = "0.1.0"
+source = "git+https://github.com/EspressoSystems/espresso-network.git#2a7e7cbb49eb2704f9d6f0dadec5015de9e5a91c"
+dependencies = [
+ "alloy",
+ "anyhow",
+ "ark-serialize 0.5.0",
+ "clap 4.5.50",
+ "clap-serde",
+ "clap-serde-derive",
+ "derive_more 2.0.1",
+ "directories 6.0.0",
+ "dotenvy",
+ "espresso-contract-deployer",
+ "espresso-types",
+ "futures-util",
+ "git-version",
+ "hotshot-contract-adapter",
+ "hotshot-state-prover",
+ "hotshot-types",
+ "jf-signature 0.4.0 (git+https://github.com/EspressoSystems/jellyfish?tag=jf-signature-v0.4.0)",
+ "portpicker",
+ "rand 0.8.5",
+ "rand_chacha 0.3.1",
+ "rstest",
+ "rstest_reuse",
+ "rust_decimal",
+ "sequencer-utils",
+ "serde",
+ "serde_json",
+ "sysinfo",
+ "tagged-base64",
+ "thiserror 2.0.17",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber 0.3.20",
+ "url",
+]
+
+[[package]]
 name = "staking-ui-service"
 version = "0.1.0"
 dependencies = [
  "alloy",
  "async-lock 3.4.1",
- "clap",
+ "clap 4.5.50",
  "cld",
+ "committable",
  "derive_more 2.0.1",
+ "espresso-contract-deployer",
  "espresso-types",
  "futures",
  "hotshot-contract-adapter",
+ "hotshot-state-prover",
+ "hotshot-types",
  "im",
  "parking_lot",
+ "rand 0.8.5",
  "serde",
+ "staking-cli",
  "tagged-base64",
  "test-log",
  "tide-disco",
@@ -9880,6 +10322,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "sysinfo"
+version = "0.33.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4fc858248ea01b66f19d8e8a6d55f41deaf91e9d495246fd01368d99935c6c01"
+dependencies = [
+ "core-foundation-sys",
+ "libc",
+ "memchr",
+ "ntapi",
+ "rayon",
+ "windows 0.57.0",
+]
+
+[[package]]
 name = "system-configuration"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9974,6 +10430,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "textwrap"
+version = "0.16.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c13547615a44dc9c452a8a534638acdf07120d4b6847c8178705da06306a3057"
+
+[[package]]
 name = "thiserror"
 version = "1.0.69"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10063,7 +10525,7 @@ dependencies = [
  "async-lock 3.4.1",
  "async-std",
  "async-trait",
- "clap",
+ "clap 4.5.50",
  "config",
  "derivative",
  "derive_more 0.99.20",
@@ -10955,7 +11417,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "vid"
 version = "0.1.0"
-source = "git+https://github.com/EspressoSystems/espresso-network.git#772bfb00b379d673ea90af52edd53cf76f0b6c56"
+source = "git+https://github.com/EspressoSystems/espresso-network.git#2a7e7cbb49eb2704f9d6f0dadec5015de9e5a91c"
 dependencies = [
  "anyhow",
  "ark-bn254",
@@ -10970,6 +11432,7 @@ dependencies = [
  "jf-poseidon2",
  "jf-utils",
  "p3-maybe-rayon",
+ "reed-solomon-simd",
  "serde",
  "sha2 0.10.9",
  "sha3",
@@ -11254,6 +11717,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "windows"
+version = "0.57.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "12342cb4d8e3b046f3d80effd474a7a02447231330ef77d71daa6fbc40681143"
+dependencies = [
+ "windows-core 0.57.0",
+ "windows-targets 0.52.6",
+]
+
+[[package]]
 name = "windows-core"
 version = "0.53.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11265,12 +11738,24 @@ dependencies = [
 
 [[package]]
 name = "windows-core"
+version = "0.57.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d2ed2439a290666cd67ecce2b0ffaad89c2a56b976b736e6ece670297897832d"
+dependencies = [
+ "windows-implement 0.57.0",
+ "windows-interface 0.57.0",
+ "windows-result 0.1.2",
+ "windows-targets 0.52.6",
+]
+
+[[package]]
+name = "windows-core"
 version = "0.62.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b8e83a14d34d0623b51dce9581199302a221863196a1dde71a7663a4c2be9deb"
 dependencies = [
- "windows-implement",
- "windows-interface",
+ "windows-implement 0.60.2",
+ "windows-interface 0.59.3",
  "windows-link 0.2.1",
  "windows-result 0.4.1",
  "windows-strings 0.5.1",
@@ -11278,9 +11763,31 @@ dependencies = [
 
 [[package]]
 name = "windows-implement"
+version = "0.57.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9107ddc059d5b6fbfbffdfa7a7fe3e22a226def0b2608f72e9d552763d3e1ad7"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.108",
+]
+
+[[package]]
+name = "windows-implement"
 version = "0.60.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "053e2e040ab57b9dc951b72c264860db7eb3b0200ba345b4e4c3b14f67855ddf"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.108",
+]
+
+[[package]]
+name = "windows-interface"
+version = "0.57.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "29bee4b38ea3cde66011baa44dba677c432a78593e202392d1e9070cf2a7fca7"
 dependencies = [
  "proc-macro2",
  "quote",

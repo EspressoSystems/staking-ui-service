@@ -8,6 +8,9 @@ alloy = { version = "1.0", features = ["provider-ws", "json-rpc", "node-bindings
 async-lock = "3.0"
 clap = { version = "4.4", features = ["derive", "env"] }
 cld = "0.5"
+committable = { git = "https://github.com/EspressoSystems/commit.git", features = [
+    "ark-serialize",
+] }
 derive_more = "2.0"
 espresso-types = { git = "https://github.com/EspressoSystems/espresso-network.git" }
 futures = "0.3"
@@ -22,6 +25,11 @@ tower-service = "0.3"
 tracing = "0.1"
 
 [dev-dependencies]
+espresso-contract-deployer = { git = "https://github.com/EspressoSystems/espresso-network.git" }
+hotshot-state-prover = { git = "https://github.com/EspressoSystems/espresso-network.git" }
+hotshot-types = { git = "https://github.com/EspressoSystems/espresso-network.git" }
+rand = "0.8"
+staking-cli = { git = "https://github.com/EspressoSystems/espresso-network.git" }
 test-log = { version = "0.2", features = [
     "color",
     "trace",

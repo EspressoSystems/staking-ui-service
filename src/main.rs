@@ -20,6 +20,10 @@ struct Options {
     #[clap(long, env = "ESPRESSO_STAKING_SERVICE_STAKE_TABLE")]
     stake_table: Address,
 
+    /// Address of deployed reward contract.
+    #[clap(long, env = "ESPRESSO_STAKING_SERVICE_REWARD_CONTRACT")]
+    reward_contract: Address,
+
     /// Location for persistent storage.
     #[clap(long, env = "ESPRESSO_STAKING_SERVICE_STORAGE")]
     storage: PathBuf,
@@ -27,7 +31,8 @@ struct Options {
 
 impl Options {
     async fn run(self) -> Result<()> {
-        let l1_input = RpcStream::new(self.l1_options).await?;
+        let l1_input =
+            RpcStream::new(self.l1_options, self.stake_table, self.reward_contract).await?;
         let storage = sql::Persistence::new(&self.storage).await?;
 
         // Get genesis state.
