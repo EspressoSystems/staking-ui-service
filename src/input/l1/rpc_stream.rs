@@ -528,8 +528,8 @@ async fn fetch_block_events(
                     // Try to decode stake table event
                     if log.address() == stake_table_address {
                         match StakeTableV2Events::decode_raw_log(log.topics(), &log.data().data) {
-                            Ok(contract_event) => {
-                                let event = contract_event.try_into().unwrap();
+                            Ok(st_event) => {
+                                let event = st_event.try_into().unwrap();
                                 events.push(L1Event::StakeTable(Arc::new(event)));
                             }
                             Err(e) => {
@@ -1497,9 +1497,9 @@ mod tests {
         let mut stake_table_state_from_provider = StakeTableState::new();
 
         for log in logs {
-            let contract_event =
+            let st_event =
                 StakeTableV2Events::decode_raw_log(log.topics(), &log.data().data).unwrap();
-            let event = contract_event.try_into().unwrap();
+            let event = st_event.try_into().unwrap();
             let result = stake_table_state_from_provider.apply_event(event);
             match result {
                 Ok(Ok(())) => {}
