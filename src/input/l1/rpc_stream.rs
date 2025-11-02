@@ -1360,11 +1360,6 @@ mod tests {
 
         let validators = ContractDeployment::create_test_validators(2);
 
-        let _receipts = deployment
-            .register_validators(validators, DelegationConfig::VariableAmounts)
-            .await
-            .expect("Failed to register validators");
-
         let options = L1ClientOptions {
             http_providers: vec![deployment.rpc_url.clone()],
             ..Default::default()
@@ -1377,6 +1372,11 @@ mod tests {
         )
         .await
         .unwrap();
+
+        let _receipts = deployment
+            .register_validators(validators, DelegationConfig::VariableAmounts)
+            .await
+            .expect("Failed to register validators");
 
         let mut found_stake_event = false;
         'outer: for _ in 0..20 {
