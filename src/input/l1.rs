@@ -64,8 +64,12 @@ impl<S: L1Persistence> State<S> {
     /// state in storage, the given genesis state will be used.
     pub async fn new(storage: S, genesis: Snapshot) -> Result<Self> {
         let state = match storage.finalized_snapshot().await? {
-            Some(snapshot) => snapshot,
+            Some(snapshot) => {
+                tracing::info!(?snapshot.block, "starting from saved snapshot");
+                snapshot
+            }
             None => {
+                tracing::info!(?genesis.block, "starting from genesis");
                 storage.save_genesis(genesis.clone()).await?;
                 genesis
             }
