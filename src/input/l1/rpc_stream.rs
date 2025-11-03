@@ -9,7 +9,6 @@ use crate::{Error, Result, types::common::L1BlockId};
 use alloy::{
     eips::BlockId,
     network::Ethereum,
-    primitives::Bloom,
     providers::{Provider, ProviderBuilder, RootProvider, WsConnect},
     rpc::{
         client::RpcClient,
@@ -500,14 +499,15 @@ async fn fetch_missing_blocks(
 /// Fetch events from L1 for a specific block with retry logic.
 async fn fetch_block_events(
     provider: &RootProvider<Ethereum>,
-    logs_bloom: &Bloom,
-    block_number: u64,
+    header: &Header,
     stake_table_address: Address,
     reward_contract_address: Address,
     retry_delay: Duration,
 ) -> Vec<L1Event> {
-    let stake_table_may_have_logs = logs_bloom.contains_raw_log(stake_table_address, &[]);
-    let reward_contract_may_have_logs = logs_bloom.contains_raw_log(reward_contract_address, &[]);
+    let stake_table_may_have_logs = header.logs_bloom.contains_raw_log(stake_table_address, &[]);
+    let reward_contract_may_have_logs = header
+        .logs_bloom
+        .contains_raw_log(reward_contract_address, &[]);
 
     if !stake_table_may_have_logs && !reward_contract_may_have_logs {
         // Bloom filter indicates no logs for our addresses in this block
@@ -515,8 +515,7 @@ async fn fetch_block_events(
     }
 
     let filter = Filter::new()
-        .from_block(block_number)
-        .to_block(block_number)
+        .at_block_hash(header.hash)
         .address(vec![stake_table_address, reward_contract_address]);
 
     loop {
@@ -534,7 +533,7 @@ async fn fetch_block_events(
                             }
                             Err(e) => {
                                 tracing::warn!(
-                                    block = block_number,
+                                    block = header.number,
                                     tx_hash = ?log.transaction_hash,
                                     "Failed to decode stake table log: {e:?}"
                                 );
@@ -551,7 +550,7 @@ async fn fetch_block_events(
                             }
                             Err(e) => {
                                 tracing::warn!(
-                                    block = block_number,
+                                    block = header.number,
                                     tx_hash = ?log.transaction_hash,
                                     "Failed to decode reward claim log: {e:?}"
                                 );
@@ -565,7 +564,7 @@ async fn fetch_block_events(
             }
             Err(err) => {
                 tracing::warn!(
-                    block = block_number,
+                    block = header.number,
                     "Failed to fetch logs from provider: {err}, retrying..."
                 );
                 sleep(retry_delay).await;
@@ -585,8 +584,7 @@ async fn create_block_input(
     let finalized = fetch_finalized(provider, retry_delay).await;
     let events = fetch_block_events(
         provider,
-        &head.logs_bloom,
-        head.number,
+        &head,
         stake_table_address,
         reward_contract_address,
         retry_delay,
@@ -617,6 +615,7 @@ mod tests {
         providers::{ProviderBuilder, WalletProvider, ext::AnvilApi},
     };
     use committable::Committable;
+    use espresso_contract_deployer::HttpProviderWithWallet;
     use espresso_contract_deployer::{
         Contract, Contracts, build_signer, builder::DeployerArgsBuilder,
         network_config::light_client_genesis_from_stake_table,
@@ -640,35 +639,6 @@ mod tests {
     use std::time::Duration;
 
     const DEV_MNEMONIC: &str = "test test test test test test test test test test test junk";
-
-    pub async fn register_validators_with_delegators(
-        rpc_url: Url,
-        stake_table_addr: Address,
-        validators: Vec<(PrivateKeySigner, BLSKeyPair, StateKeyPair)>,
-        delegation_config: DelegationConfig,
-    ) -> Result<Vec<TransactionReceipt>> {
-        let provider = ProviderBuilder::new()
-            .wallet(EthereumWallet::from(build_signer(DEV_MNEMONIC, 0)))
-            .connect_http(rpc_url.clone());
-
-        let mut staking_txns = StakingTransactions::create(
-            rpc_url,
-            &provider,
-            stake_table_addr,
-            validators,
-            delegation_config,
-        )
-        .await
-        .map_err(|err| {
-            Error::internal().context(format!("Failed to create staking transactions: {err}"))
-        })?;
-
-        let receipts = staking_txns.apply_all().await.map_err(|err| {
-            Error::internal().context(format!("Failed to apply staking transactions: {err}"))
-        })?;
-
-        Ok(receipts)
-    }
 
     #[derive(Debug, Clone)]
     pub struct DeploymentConfig {
@@ -833,15 +803,23 @@ mod tests {
         }
     }
 
+    /// Spawns a background task that continuously performs random stake table operations.
+    /// Operations include: registering validators, updating consensus keys, undelegating, and deregistering.
+    /// Used in tests to have some activity on L1 and validate events fetching
     pub struct BackgroundStakeTableOps {
         task_handle: Option<tokio::task::JoinHandle<()>>,
+    }
+
+    struct DelegatorInfo {
+        address: Address,
+        provider: HttpProviderWithWallet,
     }
 
     struct ValidatorInfo {
         index: u64,
         address: Address,
-        signer: PrivateKeySigner,
-        delegators: Vec<Address>,
+        provider: HttpProviderWithWallet,
+        delegators: Vec<DelegatorInfo>,
     }
 
     impl BackgroundStakeTableOps {
@@ -862,38 +840,56 @@ mod tests {
                             let schnorr_key =
                                 StateKeyPair::generate_from_seed_indexed(seed, validator_index);
 
-                            // todo:
-                            // copied from the inner functions directly to know the addresses
-                            let num_delegators = rng.gen_range(2..=5);
-                            let mut delegator_addresses = vec![signer.address()];
+                            let provider = ProviderBuilder::new()
+                                .wallet(EthereumWallet::from(build_signer(DEV_MNEMONIC, 0)))
+                                .connect_http(rpc_url.clone());
 
-                            let delegator_base_index = 1000 + (validator_index * 10);
-                            for i in 0..num_delegators {
-                                let delegator_signer =
-                                    build_signer(DEV_MNEMONIC, (delegator_base_index + i) as u32);
-                                delegator_addresses.push(delegator_signer.address());
-                            }
-
-                            if register_validators_with_delegators(
+                            match StakingTransactions::create(
                                 rpc_url.clone(),
+                                &provider,
                                 stake_table_addr,
                                 vec![(signer.clone(), bls_key.clone(), schnorr_key.clone())],
                                 DelegationConfig::MultipleDelegators,
                             )
                             .await
-                            .is_ok()
                             {
-                                println!(
-                                    "Background: Registered validator #{validator_index} with {} delegators",
-                                    delegator_addresses.len(),
-                                );
+                                Ok(mut staking_txns) => {
+                                    let validator_provider =
+                                        staking_txns.provider(signer.address()).unwrap().clone();
 
-                                registered_validators.push(ValidatorInfo {
-                                    index: validator_index,
-                                    address: signer.address(),
-                                    signer,
-                                    delegators: delegator_addresses,
-                                });
+                                    let delegator_infos: Vec<DelegatorInfo> = staking_txns
+                                        .delegations()
+                                        .iter()
+                                        .filter(|d| d.validator == signer.address())
+                                        .filter_map(|d| {
+                                            let provider = staking_txns.provider(d.from)?.clone();
+
+                                            Some(DelegatorInfo {
+                                                address: d.from,
+                                                provider,
+                                            })
+                                        })
+                                        .collect();
+
+                                    if staking_txns.apply_all().await.is_ok() {
+                                        println!(
+                                            "Background: Registered validator #{validator_index} with {} delegators",
+                                            delegator_infos.len(),
+                                        );
+
+                                        registered_validators.push(ValidatorInfo {
+                                            index: validator_index,
+                                            address: signer.address(),
+                                            provider: validator_provider,
+                                            delegators: delegator_infos,
+                                        });
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "Background: Failed to create staking transactions for validator #{validator_index}: {e:?}"
+                                    );
+                                }
                             }
                             validator_index += 1;
                         }
@@ -915,16 +911,12 @@ mod tests {
                             let new_schnorr_key =
                                 StateKeyPair::generate_from_seed_indexed(new_seed, validator.index);
 
-                            let provider = ProviderBuilder::new()
-                                .wallet(EthereumWallet::from(validator.signer.clone()))
-                                .connect_http(rpc_url.clone());
-
                             let bls_sig: G1PointSol =
                                 sign_address_bls(&new_bls_key, validator.address).into();
                             let schnorr_sig: StateSignatureSol =
                                 sign_address_schnorr(&new_schnorr_key, validator.address).into();
 
-                            match StakeTableV2::new(stake_table_addr, &provider)
+                            match StakeTableV2::new(stake_table_addr, &validator.provider)
                                 .updateConsensusKeysV2(
                                     new_bls_key.ver_key().into(),
                                     new_schnorr_key.ver_key().into(),
@@ -961,34 +953,20 @@ mod tests {
 
                             if !validator.delegators.is_empty() {
                                 let del_idx = rng.gen_range(0..validator.delegators.len());
-                                let delegator_address = validator.delegators[del_idx];
-
-                                let delegator_signer = if delegator_address == validator.address {
-                                    validator.signer.clone()
-                                } else {
-                                    // todo
-                                    let delegator_base_index = 1000 + (validator.index * 10);
-                                    build_signer(
-                                        DEV_MNEMONIC,
-                                        (delegator_base_index + (del_idx as u64) - 1) as u32,
-                                    )
-                                };
+                                let delegator = &validator.delegators[del_idx];
 
                                 let provider = ProviderBuilder::new().connect_http(rpc_url.clone());
                                 let stake_table = StakeTableV2::new(stake_table_addr, &provider);
 
                                 if let Ok(delegated_amount) = stake_table
-                                    .delegations(validator.address, delegator_address)
+                                    .delegations(validator.address, delegator.address)
                                     .call()
                                     .await
                                     && delegated_amount > U256::ZERO
                                 {
                                     let undelegate_amount = delegated_amount / U256::from(2);
-                                    let delegator_provider = ProviderBuilder::new()
-                                        .wallet(EthereumWallet::from(delegator_signer))
-                                        .connect_http(rpc_url.clone());
 
-                                    match StakeTableV2::new(stake_table_addr, &delegator_provider)
+                                    match StakeTableV2::new(stake_table_addr, &delegator.provider)
                                         .undelegate(validator.address, undelegate_amount)
                                         .send()
                                         .await
@@ -999,7 +977,7 @@ mod tests {
                                                 undelegate_amount
                                                     / U256::from(10).pow(U256::from(18)),
                                                 validator.index,
-                                                delegator_address,
+                                                delegator.address,
                                                 receipt.transaction_hash
                                             ),
                                             Err(e) => println!(
@@ -1024,11 +1002,7 @@ mod tests {
                             let idx = rng.gen_range(0..registered_validators.len());
                             let validator = &registered_validators[idx];
 
-                            let provider = ProviderBuilder::new()
-                                .wallet(EthereumWallet::from(validator.signer.clone()))
-                                .connect_http(rpc_url.clone());
-
-                            match StakeTableV2::new(stake_table_addr, &provider)
+                            match StakeTableV2::new(stake_table_addr, &validator.provider)
                                 .deregisterValidator()
                                 .send()
                                 .await
@@ -1056,7 +1030,7 @@ mod tests {
                             }
                         }
 
-                        _ => panic!("operation should be 0..4"),
+                        _ => unreachable!(),
                     }
 
                     sleep(Duration::from_millis(500)).await;
