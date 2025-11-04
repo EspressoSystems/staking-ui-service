@@ -94,7 +94,19 @@ pub struct L1ClientOptions {
 
 impl Default for L1ClientOptions {
     fn default() -> Self {
-        Self::parse_from(std::iter::empty::<String>())
+        Self {
+            l1_retry_delay: Duration::from_secs(1),
+            l1_polling_interval: Duration::from_secs(7),
+            subscription_timeout: Duration::from_secs(120),
+            l1_frequent_failure_tolerance: Duration::from_secs(60),
+            l1_consecutive_failure_tolerance: 10,
+            l1_failover_revert: Duration::from_secs(1800),
+            l1_rate_limit_delay: None,
+            http_providers: Vec::new(),
+            l1_ws_provider: None,
+            stake_table_address: Address::ZERO,
+            reward_contract_address: Address::ZERO,
+        }
     }
 }
 
