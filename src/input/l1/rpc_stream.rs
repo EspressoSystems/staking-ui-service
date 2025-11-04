@@ -565,8 +565,11 @@ fn decode_events(
                         log.transaction_hash
                     );
                 });
-            let event = st_event.try_into().unwrap();
-            events.push(L1Event::StakeTable(Arc::new(event)));
+            // Try to convert to StakeTableEvent. Some events like `Upgraded`` are not relevant
+            // to the staking state and can be skipped.
+            if let Ok(event) = st_event.try_into() {
+                events.push(L1Event::StakeTable(Arc::new(event)));
+            }
             continue;
         }
 
@@ -625,6 +628,7 @@ mod tests {
     use crate::input::l1::testing::ContractDeployment;
 
     use super::*;
+    use alloy::providers::ext::AnvilApi;
     use alloy::sol_types::SolEvent;
     use alloy::{node_bindings::Anvil, providers::ProviderBuilder};
     use committable::Committable;
@@ -1041,5 +1045,128 @@ mod tests {
         let provider_commit = stake_table_state_from_provider.commit();
 
         assert_eq!(stream_commit, provider_commit, "commit mismatch",);
+    }
+
+    #[tokio::test]
+    #[test_log::test]
+    async fn test_stake_table_events_with_reset_from_genesis() {
+        let anvil = Anvil::new()
+            .block_time(1)
+            .args(["--slots-in-an-epoch", "0"])
+            .spawn();
+        let rpc_url: Url = anvil.endpoint().parse().unwrap();
+
+        let deployment = ContractDeployment::deploy(rpc_url.clone()).await.unwrap();
+        let background_task = deployment.spawn_task();
+
+        println!("Waiting for stake table events");
+        sleep(Duration::from_secs(150)).await;
+        drop(background_task);
+
+        let provider = ProviderBuilder::new().connect_http(rpc_url.clone());
+        provider.anvil_mine(Some(500), None).await.unwrap();
+
+        let options = L1ClientOptions {
+            http_providers: vec![rpc_url.clone()],
+            stake_table_address: deployment.stake_table_addr,
+            reward_contract_address: deployment.reward_claim_addr,
+            ..Default::default()
+        };
+        let mut stream = RpcStream::new(options.clone()).await.unwrap();
+
+        // Fetch genesis using load_genesis
+        let (genesis_block, _timestamp) =
+            crate::input::l1::provider::load_genesis(&provider, deployment.stake_table_addr)
+                .await
+                .unwrap();
+
+        println!(
+            "Fetched genesis block: number={}, hash={:?}",
+            genesis_block.number, genesis_block.hash
+        );
+
+        stream.reset(genesis_block.number).await;
+        println!("Reset stream to genesis, now processing all blocks");
+
+        // Process all blocks from genesis through the stream
+        let mut stake_table_state_from_stream = StakeTableState::new();
+        let start_block = genesis_block.number + 1;
+        let mut end_block = start_block;
+
+        for _i in 1..=650 {
+            let block_input = stream.next().await.expect("Stream ended unexpectedly");
+            end_block = block_input.block.number;
+
+            for event in &block_input.events {
+                match event {
+                    L1Event::StakeTable(stake_event) => {
+                        let result =
+                            stake_table_state_from_stream.apply_event((**stake_event).clone());
+                        match result {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => {
+                                println!("Expected error: {e:?}");
+                            }
+                            Err(err) => {
+                                panic!("Critical stake table error: {err:?}");
+                            }
+                        }
+                    }
+                    L1Event::Reward(_) => {}
+                }
+            }
+        }
+
+        println!(
+            "Fetching events from blocks {start_block} to {end_block} directly from rpc provider"
+        );
+
+        let filter = Filter::new()
+            .events([
+                ValidatorRegistered::SIGNATURE,
+                ValidatorRegisteredV2::SIGNATURE,
+                ValidatorExit::SIGNATURE,
+                Delegated::SIGNATURE,
+                Undelegated::SIGNATURE,
+                ConsensusKeysUpdated::SIGNATURE,
+                ConsensusKeysUpdatedV2::SIGNATURE,
+                CommissionUpdated::SIGNATURE,
+            ])
+            .address(deployment.stake_table_addr)
+            .from_block(start_block)
+            .to_block(end_block);
+
+        let logs = provider
+            .get_logs(&filter)
+            .await
+            .expect("Failed to fetch logs");
+
+        // Apply events from range query to a fresh state
+        let mut stake_table_state_from_provider = StakeTableState::new();
+
+        for log in logs {
+            let st_event =
+                StakeTableV2Events::decode_raw_log(log.topics(), &log.data().data).unwrap();
+            let event = st_event.try_into().unwrap();
+            let result = stake_table_state_from_provider.apply_event(event);
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    println!("Expected error: {err:?}");
+                }
+                Err(err) => {
+                    panic!("Critical err: {err:?}");
+                }
+            }
+        }
+
+        // Compare the commits
+        let stream_commit = stake_table_state_from_stream.commit();
+        let provider_commit = stake_table_state_from_provider.commit();
+
+        assert_eq!(
+            stream_commit, provider_commit,
+            "Commit mismatch after reset from genesis"
+        );
     }
 }
