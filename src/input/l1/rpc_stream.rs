@@ -6,6 +6,7 @@ use super::{
 };
 use crate::types::common::Address;
 use crate::{Error, Result, types::common::L1BlockId};
+use alloy::transports::{RpcError, TransportErrorKind};
 use alloy::{
     eips::BlockId,
     network::Ethereum,
@@ -437,25 +438,22 @@ async fn fetch_missing_blocks(
     headers
 }
 
-/// Fetch events from L1 for a specific block with retry logic.
-/// Returns the events and the header which may differ from input header due to reorg.
-async fn fetch_block_events(
+/// Try to fetch and decode events for a given header.
+/// Returns Ok(events, header) on success, Err on failure.
+async fn try_get_events_from_header(
     provider: &RootProvider<Ethereum>,
     header: &Header,
     stake_table_address: Address,
     reward_contract_address: Address,
-    retry_delay: Duration,
-) -> (Vec<L1Event>, Header) {
-    const MAX_HASH_RETRIES: u32 = 3;
-
-    // Check bloom filter for potential logs
-    let has_potential_logs = header.logs_bloom.contains_raw_log(stake_table_address, &[])
+) -> Result<(Vec<L1Event>, Header), RpcError<TransportErrorKind>> {
+    // Check bloom filter with header
+    let has_logs = header.logs_bloom.contains_raw_log(stake_table_address, &[])
         || header
             .logs_bloom
             .contains_raw_log(reward_contract_address, &[]);
 
-    if !has_potential_logs {
-        return (Vec::new(), header.clone());
+    if !has_logs {
+        return Ok((Vec::new(), header.clone()));
     }
 
     // try fetching the events with the block hash
@@ -463,97 +461,11 @@ async fn fetch_block_events(
         .at_block_hash(header.hash)
         .address(vec![stake_table_address, reward_contract_address]);
 
-    for attempt in 1..=MAX_HASH_RETRIES {
-        match provider.get_logs(&filter).await {
-            Ok(logs) => {
-                let events = decode_events(
-                    logs,
-                    header.number,
-                    stake_table_address,
-                    reward_contract_address,
-                );
-                return (events, header.clone());
-            }
-            Err(err) => {
-                if attempt == MAX_HASH_RETRIES {
-                    tracing::warn!(
-                        block = header.number,
-                        hash = ?header.hash,
-                        "Failed to fetch logs by hash after {MAX_HASH_RETRIES} attempts: {err}, falling back to fetch by block number"
-                    );
-                } else {
-                    sleep(retry_delay).await;
-                }
-            }
-        }
-    }
+    let logs = provider.get_logs(&filter).await?;
 
-    // Fall back to fetching by block number
-    let block_number = header.number;
-    loop {
-        // Refetch the header on each retry, even if get_logs() call failed,
-        // in case the RPC is still returning the old block
-        let new_header = match provider.get_block(BlockId::number(block_number)).await {
-            Ok(Some(block)) => block.header,
-            Ok(None) => {
-                tracing::warn!("Block {block_number} not found, retrying...");
-                sleep(retry_delay).await;
-                continue;
-            }
-            Err(err) => {
-                tracing::warn!("Failed to fetch block {block_number}: {err}, retrying...");
-                sleep(retry_delay).await;
-                continue;
-            }
-        };
-
-        // check bloom filter with new header
-        let has_logs = new_header
-            .logs_bloom
-            .contains_raw_log(stake_table_address, &[])
-            || new_header
-                .logs_bloom
-                .contains_raw_log(reward_contract_address, &[]);
-
-        if !has_logs {
-            return (Vec::new(), new_header);
-        }
-
-        // Fetch logs using the current block hash
-        let filter = Filter::new()
-            .at_block_hash(new_header.hash)
-            .address(vec![stake_table_address, reward_contract_address]);
-
-        match provider.get_logs(&filter).await {
-            Ok(logs) => {
-                let events = decode_events(
-                    logs,
-                    block_number,
-                    stake_table_address,
-                    reward_contract_address,
-                );
-                return (events, new_header);
-            }
-            Err(err) => {
-                tracing::warn!(
-                    block = block_number,
-                    hash = ?new_header.hash,
-                    "Failed to fetch logs: {err}, retrying..."
-                );
-                sleep(retry_delay).await;
-            }
-        }
-    }
-}
-
-/// Helper function to decode events from logs
-fn decode_events(
-    logs: Vec<alloy::rpc::types::Log>,
-    block_number: u64,
-    stake_table_address: Address,
-    reward_contract_address: Address,
-) -> Vec<L1Event> {
+    // Decode events from logs
     let mut events = Vec::new();
+    let block_number = header.number;
 
     for log in logs {
         // Try to decode stake table event
@@ -587,7 +499,83 @@ fn decode_events(
         }
     }
 
-    events
+    Ok((events, header.clone()))
+}
+
+/// Fetch events from L1 for a specific block with retry logic.
+/// Returns the events and the header which may differ from input header due to reorg.
+async fn fetch_block_events(
+    provider: &RootProvider<Ethereum>,
+    header: &Header,
+    stake_table_address: Address,
+    reward_contract_address: Address,
+    retry_delay: Duration,
+) -> (Vec<L1Event>, Header) {
+    const MAX_HASH_RETRIES: u32 = 3;
+
+    // Try fetching the events with the block hash
+    for attempt in 1..=MAX_HASH_RETRIES {
+        match try_get_events_from_header(
+            provider,
+            header,
+            stake_table_address,
+            reward_contract_address,
+        )
+        .await
+        {
+            Ok((events, header)) => return (events, header),
+            Err(err) => {
+                if attempt == MAX_HASH_RETRIES {
+                    tracing::warn!(
+                        block = header.number,
+                        hash = ?header.hash,
+                        "Failed to fetch logs by hash after {MAX_HASH_RETRIES} attempts: {err}, falling back to fetch by block number"
+                    );
+                } else {
+                    sleep(retry_delay).await;
+                }
+            }
+        }
+    }
+
+    // Fall back to fetching by block number
+    let block_number = header.number;
+    loop {
+        // Refetch the header on each retry, even if get_logs() call failed,
+        // in case the RPC is still returning the old block
+        let new_header = match provider.get_block(BlockId::number(block_number)).await {
+            Ok(Some(block)) => block.header,
+            Ok(None) => {
+                tracing::warn!("Block {block_number} not found, retrying...");
+                sleep(retry_delay).await;
+                continue;
+            }
+            Err(err) => {
+                tracing::warn!("Failed to fetch block {block_number}: {err}, retrying...");
+                sleep(retry_delay).await;
+                continue;
+            }
+        };
+
+        match try_get_events_from_header(
+            provider,
+            &new_header,
+            stake_table_address,
+            reward_contract_address,
+        )
+        .await
+        {
+            Ok((events, header)) => return (events, header),
+            Err(err) => {
+                tracing::warn!(
+                    block = block_number,
+                    hash = ?new_header.hash,
+                    "Failed to fetch logs: {err}, retrying..."
+                );
+                sleep(retry_delay).await;
+            }
+        }
+    }
 }
 
 /// Fetch all necessary data and construct a BlockInput.
