@@ -32,8 +32,6 @@ struct RpcStreamBuilder {
     /// Transport for switching between HTTP providers
     transport: SwitchingTransport,
     options: L1ClientOptions,
-    stake_table_address: Address,
-    reward_contract_address: Address,
 }
 
 /// An L1 event stream based on a standard JSON-RPC server.
@@ -54,18 +52,12 @@ impl std::fmt::Debug for RpcStream {
 
 impl RpcStreamBuilder {
     /// Create a new builder from L1 client options and contract addresses.
-    fn new(
-        options: L1ClientOptions,
-        stake_table_address: Address,
-        reward_contract_address: Address,
-    ) -> Result<Self> {
+    fn new(options: L1ClientOptions) -> Result<Self> {
         let (provider, transport) = options.provider()?;
         Ok(Self {
             provider: Arc::new(provider),
             transport,
             options,
-            stake_table_address,
-            reward_contract_address,
         })
     }
 
@@ -126,8 +118,8 @@ impl RpcStreamBuilder {
 
         let retry_delay = self.options.l1_retry_delay;
         let provider = self.provider.clone();
-        let stake_table_address = self.stake_table_address;
-        let reward_contract_address = self.reward_contract_address;
+        let stake_table_address = self.options.stake_table_address;
+        let reward_contract_address = self.options.reward_contract_address;
 
         let provider_for_fetch = provider.clone();
         let block_stream = block_stream.into_stream();
@@ -178,8 +170,8 @@ impl RpcStreamBuilder {
         let provider = self.provider.clone();
         let retry_delay = self.options.l1_retry_delay;
         let switch_notify = self.transport.switch_notify.clone();
-        let stake_table_address = self.stake_table_address;
-        let reward_contract_address = self.reward_contract_address;
+        let stake_table_address = self.options.stake_table_address;
+        let reward_contract_address = self.options.reward_contract_address;
 
         let provider_for_fetch = provider.clone();
         let poller_stream = poller.map(stream::iter).flatten();
@@ -278,12 +270,8 @@ impl RpcStream {
     ///
     /// If multiple providers are given for either protocol or both, the system will rotate between
     /// them if and when one provider fails.
-    pub async fn new(
-        options: L1ClientOptions,
-        stake_table: Address,
-        reward_contract: Address,
-    ) -> Result<Self> {
-        let builder = RpcStreamBuilder::new(options, stake_table, reward_contract)?;
+    pub async fn new(options: L1ClientOptions) -> Result<Self> {
+        let builder = RpcStreamBuilder::new(options)?;
         Ok(builder.build().await)
     }
 }
@@ -450,80 +438,153 @@ async fn fetch_missing_blocks(
 }
 
 /// Fetch events from L1 for a specific block with retry logic.
+/// Returns the events and the header which may differ from input header due to reorg.
 async fn fetch_block_events(
     provider: &RootProvider<Ethereum>,
     header: &Header,
     stake_table_address: Address,
     reward_contract_address: Address,
     retry_delay: Duration,
-) -> Vec<L1Event> {
-    let stake_table_may_have_logs = header.logs_bloom.contains_raw_log(stake_table_address, &[]);
-    let reward_contract_may_have_logs = header
-        .logs_bloom
-        .contains_raw_log(reward_contract_address, &[]);
+) -> (Vec<L1Event>, Header) {
+    const MAX_HASH_RETRIES: u32 = 3;
 
-    if !stake_table_may_have_logs && !reward_contract_may_have_logs {
-        // Bloom filter indicates no logs for our addresses in this block
-        return Vec::new();
+    // Check bloom filter for potential logs
+    let has_potential_logs = header.logs_bloom.contains_raw_log(stake_table_address, &[])
+        || header
+            .logs_bloom
+            .contains_raw_log(reward_contract_address, &[]);
+
+    if !has_potential_logs {
+        return (Vec::new(), header.clone());
     }
 
+    // try fetching the events with the block hash
     let filter = Filter::new()
         .at_block_hash(header.hash)
         .address(vec![stake_table_address, reward_contract_address]);
 
-    loop {
+    for attempt in 1..=MAX_HASH_RETRIES {
         match provider.get_logs(&filter).await {
             Ok(logs) => {
-                let mut events = Vec::new();
-
-                for log in logs {
-                    // Try to decode stake table event
-                    if log.address() == stake_table_address {
-                        match StakeTableV2Events::decode_raw_log(log.topics(), &log.data().data) {
-                            Ok(st_event) => {
-                                let event = st_event.try_into().unwrap();
-                                events.push(L1Event::StakeTable(Arc::new(event)));
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    block = header.number,
-                                    tx_hash = ?log.transaction_hash,
-                                    "Failed to decode stake table log: {e:?}"
-                                );
-                            }
-                        }
-                        continue;
-                    }
-
-                    // Try to decode reward claim event
-                    if log.address() == reward_contract_address {
-                        match RewardClaimEvents::decode_raw_log(log.topics(), &log.data().data) {
-                            Ok(event) => {
-                                events.push(L1Event::Reward(Arc::new(event)));
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    block = header.number,
-                                    tx_hash = ?log.transaction_hash,
-                                    "Failed to decode reward claim log: {e:?}"
-                                );
-                            }
-                        }
-                        continue;
-                    }
+                let events = decode_events(
+                    logs,
+                    header.number,
+                    stake_table_address,
+                    reward_contract_address,
+                );
+                return (events, header.clone());
+            }
+            Err(err) => {
+                if attempt == MAX_HASH_RETRIES {
+                    tracing::warn!(
+                        block = header.number,
+                        hash = ?header.hash,
+                        "Failed to fetch logs by hash after {MAX_HASH_RETRIES} attempts: {err}, falling back to fetch by block number"
+                    );
+                } else {
+                    sleep(retry_delay).await;
                 }
+            }
+        }
+    }
 
-                return events;
+    // Fall back to fetching by block number
+    let block_number = header.number;
+    loop {
+        // Refetch the header on each retry, even if get_logs() call failed,
+        // in case the RPC is still returning the old block
+        let new_header = match provider.get_block(BlockId::number(block_number)).await {
+            Ok(Some(block)) => block.header,
+            Ok(None) => {
+                tracing::warn!("Block {block_number} not found, retrying...");
+                sleep(retry_delay).await;
+                continue;
+            }
+            Err(err) => {
+                tracing::warn!("Failed to fetch block {block_number}: {err}, retrying...");
+                sleep(retry_delay).await;
+                continue;
+            }
+        };
+
+        // check bloom filter with new header
+        let has_logs = new_header
+            .logs_bloom
+            .contains_raw_log(stake_table_address, &[])
+            || new_header
+                .logs_bloom
+                .contains_raw_log(reward_contract_address, &[]);
+
+        if !has_logs {
+            return (Vec::new(), new_header);
+        }
+
+        // Fetch logs using the current block hash
+        let filter = Filter::new()
+            .at_block_hash(new_header.hash)
+            .address(vec![stake_table_address, reward_contract_address]);
+
+        match provider.get_logs(&filter).await {
+            Ok(logs) => {
+                let events = decode_events(
+                    logs,
+                    block_number,
+                    stake_table_address,
+                    reward_contract_address,
+                );
+                return (events, new_header);
             }
             Err(err) => {
                 tracing::warn!(
-                    block = header.number,
-                    "Failed to fetch logs from provider: {err}, retrying..."
+                    block = block_number,
+                    hash = ?new_header.hash,
+                    "Failed to fetch logs: {err}, retrying..."
                 );
                 sleep(retry_delay).await;
             }
         }
     }
+}
+
+/// Helper function to decode events from logs
+fn decode_events(
+    logs: Vec<alloy::rpc::types::Log>,
+    block_number: u64,
+    stake_table_address: Address,
+    reward_contract_address: Address,
+) -> Vec<L1Event> {
+    let mut events = Vec::new();
+
+    for log in logs {
+        // Try to decode stake table event
+        if log.address() == stake_table_address {
+            let st_event = StakeTableV2Events::decode_raw_log(log.topics(), &log.data().data)
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "failed to decode stake table event at block {block_number}, tx {:?}: {e:?}",
+                        log.transaction_hash
+                    );
+                });
+            let event = st_event.try_into().unwrap();
+            events.push(L1Event::StakeTable(Arc::new(event)));
+            continue;
+        }
+
+        // Try to decode reward claim event
+        if log.address() == reward_contract_address {
+            let event = RewardClaimEvents::decode_raw_log(log.topics(), &log.data().data)
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "failed to decode reward claim event at block {block_number}, tx {:?}: {e:?}",
+                     log.transaction_hash
+                    );
+                });
+            events.push(L1Event::Reward(Arc::new(event)));
+            continue;
+        }
+    }
+
+    events
 }
 
 /// Fetch all necessary data and construct a BlockInput.
@@ -534,8 +595,10 @@ async fn create_block_input(
     stake_table_address: Address,
     reward_contract_address: Address,
 ) -> BlockInput {
-    let finalized = fetch_finalized(provider, &head, retry_delay).await;
-    let events = fetch_block_events(
+    // Fetch events for the block. The returned header may differ from the input header
+    // if a reorg occurred, we get the new header for the same block number
+    // with potentially different hash
+    let (events, header) = fetch_block_events(
         provider,
         &head,
         stake_table_address,
@@ -544,14 +607,16 @@ async fn create_block_input(
     )
     .await;
 
+    let finalized = fetch_finalized(provider, &header, retry_delay).await;
+
     BlockInput {
         block: L1BlockId {
-            number: head.number,
-            hash: head.hash,
-            parent: head.parent_hash,
+            number: header.number,
+            hash: header.hash,
+            parent: header.parent_hash,
         },
         finalized,
-        timestamp: head.timestamp,
+        timestamp: header.timestamp,
         events,
     }
 }
@@ -579,12 +644,12 @@ mod tests {
 
         let options = L1ClientOptions {
             http_providers: vec![url],
+            stake_table_address: Address::ZERO,
+            reward_contract_address: Address::ZERO,
             ..Default::default()
         };
 
-        let mut stream = RpcStream::new(options, Address::ZERO, Address::ZERO)
-            .await
-            .unwrap();
+        let mut stream = RpcStream::new(options).await.unwrap();
 
         let mut last_block_number = 0;
 
@@ -607,12 +672,12 @@ mod tests {
         let options = L1ClientOptions {
             http_providers: vec![http_url],
             l1_ws_provider: Some(vec![ws_url]),
+            stake_table_address: Address::ZERO,
+            reward_contract_address: Address::ZERO,
             ..Default::default()
         };
 
-        let mut stream = RpcStream::new(options, Address::ZERO, Address::ZERO)
-            .await
-            .unwrap();
+        let mut stream = RpcStream::new(options).await.unwrap();
 
         println!("Stream created successfully");
 
@@ -641,12 +706,12 @@ mod tests {
         let options = L1ClientOptions {
             http_providers: vec![http_url1.clone(), http_url2.clone()],
             l1_retry_delay: Duration::from_millis(100),
+            stake_table_address: Address::ZERO,
+            reward_contract_address: Address::ZERO,
             ..Default::default()
         };
 
-        let mut stream = RpcStream::new(options, Address::ZERO, Address::ZERO)
-            .await
-            .unwrap();
+        let mut stream = RpcStream::new(options).await.unwrap();
 
         for _i in 1..=3 {
             let block_input = stream.next().await.unwrap();
@@ -756,12 +821,12 @@ mod tests {
 
         let options = L1ClientOptions {
             http_providers: vec![url],
+            stake_table_address: Address::ZERO,
+            reward_contract_address: Address::ZERO,
             ..Default::default()
         };
 
-        let mut stream = RpcStream::new(options, Address::ZERO, Address::ZERO)
-            .await
-            .unwrap();
+        let mut stream = RpcStream::new(options).await.unwrap();
         println!("Testing HTTP stream reset");
 
         test_reset_logic(&mut stream).await;
@@ -780,12 +845,12 @@ mod tests {
         let options = L1ClientOptions {
             http_providers: vec![http_url],
             l1_ws_provider: Some(vec![ws_url]),
+            stake_table_address: Address::ZERO,
+            reward_contract_address: Address::ZERO,
             ..Default::default()
         };
 
-        let mut stream = RpcStream::new(options, Address::ZERO, Address::ZERO)
-            .await
-            .unwrap();
+        let mut stream = RpcStream::new(options).await.unwrap();
         println!("Testing WebSocket stream reset");
 
         test_reset_logic(&mut stream).await;
@@ -830,16 +895,12 @@ mod tests {
 
         let options = L1ClientOptions {
             http_providers: vec![deployment.rpc_url.clone()],
+            stake_table_address: deployment.stake_table_addr,
+            reward_contract_address: deployment.reward_claim_addr,
             ..Default::default()
         };
 
-        let mut stream = RpcStream::new(
-            options,
-            deployment.stake_table_addr,
-            deployment.reward_claim_addr,
-        )
-        .await
-        .unwrap();
+        let mut stream = RpcStream::new(options).await.unwrap();
 
         let _receipts = deployment
             .register_validators(validators, DelegationConfig::VariableAmounts)
@@ -886,19 +947,15 @@ mod tests {
 
         let options = L1ClientOptions {
             http_providers: vec![rpc_url.clone()],
+            stake_table_address: deployment.stake_table_addr,
+            reward_contract_address: deployment.reward_claim_addr,
             ..Default::default()
         };
 
         // Create the rpc stream BEFORE starting the background task.
         // because we are not handling the snapshots here so  the stream starts processing blocks
         // and then events begin appearing in those blocks.
-        let mut stream = RpcStream::new(
-            options.clone(),
-            deployment.stake_table_addr,
-            deployment.reward_claim_addr,
-        )
-        .await
-        .unwrap();
+        let mut stream = RpcStream::new(options.clone()).await.unwrap();
 
         let background_task = deployment.spawn_task();
 

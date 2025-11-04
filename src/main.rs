@@ -8,7 +8,6 @@ use staking_ui_service::{
     Result, app,
     input::l1::{self, PersistentSnapshot, RpcStream, options::L1ClientOptions},
     persistence::sql,
-    types::common::Address,
 };
 use tracing_subscriber::{EnvFilter, fmt::format::FmtSpan};
 
@@ -37,14 +36,6 @@ struct Options {
     #[clap(flatten)]
     l1_options: L1ClientOptions,
 
-    /// Address of deployed stake table contract.
-    #[clap(long, env = "ESPRESSO_STAKING_SERVICE_STAKE_TABLE")]
-    stake_table: Address,
-
-    /// Address of deployed reward contract.
-    #[clap(long, env = "ESPRESSO_STAKING_SERVICE_REWARD_CONTRACT")]
-    reward_contract: Address,
-
     /// Location for persistent storage.
     #[clap(long, env = "ESPRESSO_STAKING_SERVICE_STORAGE")]
     storage: PathBuf,
@@ -69,11 +60,11 @@ impl Options {
 
         // Get genesis state.
         let l1_provider = self.l1_options.provider()?.0;
-        let (id, timestamp) = l1::provider::load_genesis(&l1_provider, self.stake_table).await?;
+        let (id, timestamp) =
+            l1::provider::load_genesis(&l1_provider, self.l1_options.stake_table_address).await?;
         let genesis = PersistentSnapshot::genesis(id, timestamp);
 
-        let l1_input =
-            RpcStream::new(self.l1_options, self.stake_table, self.reward_contract).await?;
+        let l1_input = RpcStream::new(self.l1_options).await?;
         let storage = sql::Persistence::new(&self.storage).await?;
 
         // Create server state.
@@ -165,10 +156,10 @@ mod test {
             l1_options: L1ClientOptions {
                 http_providers: vec![anvil.endpoint_url()],
                 l1_ws_provider: Some(vec![anvil.ws_endpoint_url()]),
+                stake_table_address: deployment.stake_table_addr,
+                reward_contract_address: deployment.reward_claim_addr,
                 ..Default::default()
             },
-            stake_table: deployment.stake_table_addr,
-            reward_contract: deployment.reward_claim_addr,
             port,
             storage: tmp.path().join("staking-ui-storage"),
             log_format: Some(LogFormat::Json),

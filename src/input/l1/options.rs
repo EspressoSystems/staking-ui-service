@@ -1,5 +1,6 @@
 //! Configuration options for Rpc Stream client.
 
+use crate::types::common::Address;
 use crate::{Result, input::l1::switching_transport::SwitchingTransport};
 use alloy::{providers::RootProvider, rpc::client::RpcClient};
 use clap::Parser;
@@ -81,6 +82,14 @@ pub struct L1ClientOptions {
     /// Typically this would be a WebSockets endpoint while the main provider uses HTTP.
     #[clap(long, env = "ESPRESSO_STAKING_SERVICE_L1_WS", value_delimiter = ',')]
     pub l1_ws_provider: Option<Vec<Url>>,
+
+    /// Address of the stake table contract.
+    #[clap(long, env = "ESPRESSO_STAKING_SERVICE_STAKE_TABLE_ADDRESS")]
+    pub stake_table_address: Address,
+
+    /// Address of the reward contract.
+    #[clap(long, env = "ESPRESSO_STAKING_SERVICE_REWARD_CONTRACT_ADDRESS")]
+    pub reward_contract_address: Address,
 }
 
 impl Default for L1ClientOptions {

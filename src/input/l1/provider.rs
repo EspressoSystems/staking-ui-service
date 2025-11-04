@@ -14,6 +14,16 @@ pub async fn load_genesis(
 ) -> Result<(L1BlockId, Timestamp)> {
     let stake_table_contract = StakeTableV2::new(stake_table, provider);
 
+    // Fetch the finalized block first.
+    // This avoids a race condition where the initialized block could change
+    // due to a reorg between fetching it and fetching the finalized block.
+    let finalized_block = provider
+        .get_block(BlockId::finalized())
+        .await
+        .map_err(|err| {
+            Error::internal().context(format!("Failed to fetch finalized block: {err}"))
+        })?
+        .ok_or_else(|| Error::internal().context("Finalized block not found"))?;
     // Get the block number when the contract was initialized
     let initialized_at_block = stake_table_contract
         .initializedAtBlock()
@@ -24,18 +34,9 @@ pub async fn load_genesis(
         })?
         .to::<u64>();
 
-    // Fetch the finalized block to verify the initialized block is less than finalized
-    let finalized_block = provider
-        .get_block(BlockId::finalized())
-        .await
-        .map_err(|err| {
-            Error::internal().context(format!("Failed to fetch finalized block: {err}"))
-        })?
-        .ok_or_else(|| Error::internal().context("Finalized block not found"))?;
-
     let finalized_block_number = finalized_block.header.number;
 
-    if initialized_at_block >= finalized_block_number {
+    if initialized_at_block > finalized_block_number {
         panic!(
             "Initialized block {initialized_at_block} must be less than finalized block {finalized_block_number}",
         );
