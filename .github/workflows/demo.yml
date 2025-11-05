@@ -26,6 +26,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main'  }}
           shared-key: test-demo
       - uses: extractions/setup-just@v3
+      - uses: docker/setup-compose-action@v1
 
       - name: Build
         run: just build
