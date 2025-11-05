@@ -41,7 +41,7 @@ natively, use `just run`. You can optionally pass in a build profile as well as 
 service itself, e.g. `just run release --port 3000`.
 
 To run via Docker, first [build or obtain a Docker image](#docker), then run
-`docker run ghcr.io/espressosystems/staking-ui-service:main`.
+`docker run ghcr.io/espressosystems/staking-ui-service:latest`.
 
 No matter how you run the service, you will need to configure it properly to connect to an Espresso
 and Ethereum blockchain. Service configuration is outlined in the next section.
@@ -68,10 +68,53 @@ In additional, the following _optional_ variables are available for customizatio
 The ultimate build target for this service is a Docker image, enabling easy deployment in a variety
 of settings. The image is defined in the [Dockerfile](./Dockerfile). The CI pipeline automatically
 builds a cross-platform (for ARM and AMD on Linux) image from this Dockerfile and publishes it as
-`ghcr.io/espressosystems/staking-ui-service:main`.
+`ghcr.io/espressosystems/staking-ui-service:latest`.
 
 If you are running Linux, you can build your own version of this image using `just build-docker`.
 
 Unfortunately, this is not so easy on MacOS, since Rust cross-compilation for Linux is...
 complicated. Mac users will have to make do with the published images:
-`docker pull ghcr.io/espressosystems/staking-ui-service:main`.
+`docker pull ghcr.io/espressosystems/staking-ui-service:latest`.
+
+## Demo
+
+A full-system demo is available via [demo/docker-compose.yaml](demo/docker-compose.yaml). This
+system includes:
+
+- A geth node running a local L1 devnet
+- An `espresso-dev-node` simulating an Espresso network
+- An instance of the staking UI service
+
+The demo can be controlled via the `demo` Just module:
+
+- `just demo::up`: start all services
+- `just demo::logs <service>`: print logs for a service
+- `just demo::down`: shut down all services and clean up
+
+The demo runs the staking service via the Docker tag
+`docker pull ghcr.io/espressosystems/staking-ui-service:latest`. By default this will pull the
+image from the GHCR registry. You can override this tag locally to run the demo with some changes
+that haven't been pushed yet, using the [Docker build instructions](#docker). You can replace your
+local image by pulling from the registry using `just demo::pull`.
+
+As mentioned above, it is only possible to build a local version of the staking service Docker if
+you are running on Linux. Otherwise, you can test local changes against the demo by starting all
+Docker services _except_ the staking UI service, and then running the staking service as a native
+executable, connecting to the Docker services via TCP. This is possible by running `just run-local`.
+
+### Limitations
+
+The current demo has some known limitations:
+
+- The Espresso dev node does not deploy a reward contract, so the reward contract address is set to
+  the zero address
+- Startup is slow because we deploy new contracts every time. This could potentially be improved by
+  creating an L1 image that has contracts already deployed
+
+### Testing the UI
+
+The primary purpose of this service is to be a backend for the staking UI. You can test the latest
+version of the UI against the local demo of the staking UI service using [your browser](https://bookish-doodle-kq5le1n.pages.github.io/?path=/story/sites-delegation-ui--local-dev-net&args=stakeTableContractAddress:0xefdc2a236dba7a8f60726b49abc79ee6b22ed445;espTokenContractAddress:0x80f43505d8d1a739504eb4237eb15b2e0048da8d&globals=backgrounds.grid:!true;outline:!true).
+
+At the bottom of the page, you will need to set the value of the `l1ValidatorServiceURL` control to
+`http://localshot:8080/v0/`.
