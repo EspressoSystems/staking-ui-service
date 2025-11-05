@@ -29,9 +29,9 @@ services:
       - RUST_LOG_FORMAT
       - ESPRESSO_DEV_NODE_VERSION=0.4
     healthcheck:
-      interval: 30s
+      interval: 10s
       timeout: 5s
-      retries: 5
+      retries: 30
       start_period: 30s
     depends_on:
       l1:
