@@ -213,7 +213,7 @@ mod test {
 
         tracing::info!("updates should be unavailable for genesis state");
         let err = client
-            .get::<FullNodeSetUpdate>(&format!("/nodes/all/{:x}/update", block_id(1).hash))
+            .get::<FullNodeSetUpdate>(&format!("/nodes/all/updates/{:x}", block_id(1).hash))
             .send()
             .await
             .unwrap_err();
@@ -230,7 +230,7 @@ mod test {
 
         tracing::info!("next update should contain the registration event");
         let update: FullNodeSetUpdate = client
-            .get(&format!("nodes/all/{:x}/update", block_id(2).hash))
+            .get(&format!("nodes/all/updates/{:x}", block_id(2).hash))
             .send()
             .await
             .unwrap();
@@ -245,7 +245,7 @@ mod test {
             .unwrap_err();
         assert_eq!(err.status(), StatusCode::NOT_FOUND);
         let err = client
-            .get::<FullNodeSetUpdate>(&format!("nodes/all/{:x}/update", block_id(100).hash))
+            .get::<FullNodeSetUpdate>(&format!("nodes/all/updates/{:x}", block_id(100).hash))
             .send()
             .await
             .unwrap_err();

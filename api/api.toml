@@ -104,7 +104,7 @@ snapshot will only come into effect in the following epoch.
 """
 
 [route.full_node_set_update]
-PATH = ["/nodes/all/:hash/update"]
+PATH = ["/nodes/all/updates/:hash"]
 ":hash" = "Literal"
 DOC = """
 Get the update needed to bring a snapshot of the full node set up to date with L1 block `:hash`.
