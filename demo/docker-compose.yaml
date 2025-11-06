@@ -1,13 +1,10 @@
 services:
   l1:
-    image: ghcr.io/espressosystems/geth-l1:main
+    image: ghcr.io/espressosystems/geth-l1-staging:main
     command: --dev --dev.period=1
     ports:
       - $ESPRESSO_SEQUENCER_L1_PORT:8545
       - $ESPRESSO_SEQUENCER_L1_WS_PORT:8546
-    volumes:
-      - "./geth-config/genesis.json:/genesis.json"
-      - "./geth-config/test-jwt-secret.txt:/config/test-jwt-secret.txt"
 
   espresso-dev-node:
     image: ghcr.io/espressosystems/espresso-sequencer/espresso-dev-node:20250826
