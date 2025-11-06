@@ -393,6 +393,7 @@ impl Persistence {
     }
 
     /// Apply a wallet diff to the database.
+    #[instrument(skip(self, tx, diff))]
     async fn apply_wallet_diff(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
