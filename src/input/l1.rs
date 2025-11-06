@@ -20,7 +20,7 @@ use crate::{
     types::{
         common::{
             Address, Delegation, ESPTokenAmount, L1BlockId, L1BlockInfo, NodeExit, NodeSetEntry,
-            PendingWithdrawal, Ratio, Timestamp,
+            PendingWithdrawal, Ratio, Timestamp, Withdrawal,
         },
         global::{FullNodeSetDiff, FullNodeSetSnapshot, FullNodeSetUpdate},
         wallet::{WalletDiff, WalletSnapshot, WalletUpdate},
@@ -579,32 +579,183 @@ impl Snapshot {
                         return Default::default();
                     }
 
-                    let diff = FullNodeSetDiff::NodeExit(NodeExit {
+                    let exit_time = input
+                        .timestamp
+                        .checked_add(self.block.exit_escrow_period)
+                        .unwrap();
+                    let node_diff = FullNodeSetDiff::NodeExit(NodeExit {
                         address: ev.validator,
-                        exit_time: input.timestamp + self.block.exit_escrow_period,
+                        exit_time,
                     });
 
-                    // TODO we should also emit a `WalletDiff::NodeExited` for each wallet that is
-                    // delegated to the exiting validator.
+                    let wallet_diffs = self
+                        .wallets
+                        .iter()
+                        .flat_map(|(wallet_address, wallet)| {
+                            wallet
+                                .nodes
+                                .iter()
+                                .filter(|delegation| delegation.node == ev.validator)
+                                .map(move |delegation| {
+                                    let pending_exit = PendingWithdrawal {
+                                        delegator: *wallet_address,
+                                        node: ev.validator,
+                                        amount: delegation.amount,
+                                        available_time: exit_time,
+                                    };
+                                    (*wallet_address, WalletDiff::NodeExited(pending_exit))
+                                })
+                        })
+                        .collect::<Vec<_>>();
+
+                    (vec![node_diff], wallet_diffs)
+                }
+                StakeTableV2Events::ConsensusKeysUpdated(ev) => {
+                    let node = self.node_set.get(&ev.account).unwrap_or_else(|| {
+                        panic!(
+                            "got ConsensusKeysUpdated event for non existent validator: {}",
+                            ev.account
+                        )
+                    });
+
+                    let diff = FullNodeSetDiff::NodeUpdate(NodeSetEntry {
+                        address: ev.account,
+                        staking_key: PubKey::from(ev.blsVK).into(),
+                        stake: node.stake,
+                        commission: node.commission,
+                    });
                     (vec![diff], vec![])
                 }
-                StakeTableV2Events::ConsensusKeysUpdated(_) => {
-                    todo!("implement event handling for StakeTableV2Events::ConsensusKeysUpdated")
+                StakeTableV2Events::ConsensusKeysUpdatedV2(ev) => {
+                    if let Err(err) = ev.authenticate() {
+                        tracing::warn!("got invalid ConsensusKeysUpdatedV2 event: {err:#}");
+                        return Default::default();
+                    }
+
+                    let node = self.node_set.get(&ev.account).unwrap_or_else(|| {
+                        panic!(
+                            "got ConsensusKeysUpdatedV2 event for non existent validator: {}",
+                            ev.account
+                        )
+                    });
+
+                    let diff = FullNodeSetDiff::NodeUpdate(NodeSetEntry {
+                        address: ev.account,
+                        staking_key: PubKey::from(ev.blsVK).into(),
+                        stake: node.stake,
+                        commission: node.commission,
+                    });
+                    (vec![diff], vec![])
                 }
-                StakeTableV2Events::ConsensusKeysUpdatedV2(_) => {
-                    todo!("implement event handling for StakeTableV2Events::ConsensusKeysUpdatedV2")
+                StakeTableV2Events::CommissionUpdated(ev) => {
+                    let node = self.node_set.get(&ev.validator).unwrap_or_else(|| {
+                        panic!(
+                            "got CommissionUpdated event for non existent validator: {}",
+                            ev.validator
+                        )
+                    });
+
+                    let diff = FullNodeSetDiff::NodeUpdate(NodeSetEntry {
+                        address: ev.validator,
+                        staking_key: node.staking_key.clone(),
+                        stake: node.stake,
+                        commission: Ratio::new(
+                            ev.newCommission.into(),
+                            COMMISSION_BASIS_POINTS.into(),
+                        ),
+                    });
+                    (vec![diff], vec![])
                 }
-                StakeTableV2Events::CommissionUpdated(_) => {
-                    todo!("implement event handling for StakeTableV2Events::CommissionUpdated")
+                StakeTableV2Events::Delegated(ev) => {
+                    let node = self.node_set.get(&ev.validator).unwrap_or_else(|| {
+                        panic!(
+                            "got Delegated event for non existent validator: {}",
+                            ev.validator
+                        )
+                    });
+
+                    let node_diff = FullNodeSetDiff::NodeUpdate(NodeSetEntry {
+                        address: ev.validator,
+                        staking_key: node.staking_key.clone(),
+                        commission: node.commission,
+
+                        stake: node.stake + ev.amount,
+                    });
+
+                    let delegation = Delegation {
+                        delegator: ev.delegator,
+                        node: ev.validator,
+                        amount: ev.amount,
+                    };
+                    let wallet_diff = WalletDiff::DelegatedToNode(delegation);
+
+                    (vec![node_diff], vec![(ev.delegator, wallet_diff)])
                 }
-                StakeTableV2Events::Delegated(_) => {
-                    todo!("implement event handling for StakeTableV2Events::Delegated")
+                StakeTableV2Events::Undelegated(ev) => {
+                    let node = self.node_set.get(&ev.validator).unwrap_or_else(|| {
+                        panic!(
+                            "got Undelegated event for non existent validator: {}",
+                            ev.validator
+                        )
+                    });
+
+                    let node_diff = FullNodeSetDiff::NodeUpdate(NodeSetEntry {
+                        address: ev.validator,
+                        staking_key: node.staking_key.clone(),
+                        commission: node.commission,
+                        stake: node.stake - ev.amount,
+                    });
+
+                    let pending_withdrawal = PendingWithdrawal {
+                        delegator: ev.delegator,
+                        node: ev.validator,
+                        amount: ev.amount,
+                        available_time: input.timestamp + self.block.exit_escrow_period,
+                    };
+                    let wallet_diff = WalletDiff::UndelegatedFromNode(pending_withdrawal);
+
+                    (vec![node_diff], vec![(ev.delegator, wallet_diff)])
                 }
-                StakeTableV2Events::Undelegated(_) => {
-                    todo!("implement event handling for StakeTableV2Events::Undelegated")
-                }
-                StakeTableV2Events::Withdrawal(_) => {
-                    todo!("implement event handling for StakeTableV2Events::Withdrawal")
+                StakeTableV2Events::Withdrawal(ev) => {
+                    let wallet = self.wallets.get(&ev.account).unwrap_or_else(|| {
+                        panic!(
+                            "got Withdrawal event for non existent wallet: {}",
+                            ev.account
+                        )
+                    });
+
+                    if let Some(pending) = wallet
+                        .pending_undelegations
+                        .iter()
+                        .find(|p| p.delegator == ev.account && p.amount == ev.amount)
+                    {
+                        let withdrawal = Withdrawal {
+                            delegator: ev.account,
+                            node: pending.node,
+                            amount: ev.amount,
+                        };
+                        let wallet_diff = WalletDiff::UndelegationWithdrawal(withdrawal);
+                        return (vec![], vec![(ev.account, wallet_diff)]);
+                    }
+
+                    if let Some(pending) = wallet
+                        .pending_exits
+                        .iter()
+                        .find(|p| p.delegator == ev.account && p.amount == ev.amount)
+                    {
+                        let withdrawal = Withdrawal {
+                            delegator: ev.account,
+                            node: pending.node,
+                            amount: ev.amount,
+                        };
+                        let wallet_diff = WalletDiff::NodeExitWithdrawal(withdrawal);
+                        return (vec![], vec![(ev.account, wallet_diff)]);
+                    }
+
+                    panic!(
+                        "got Withdrawal event but no pending exit/undelegation account {} with amount {}",
+                        ev.account, ev.amount
+                    );
                 }
                 // These events are not relevant to this service. We still list them out explicitly
                 // (rather than matching on _) so that it is clear that we are not missing any
