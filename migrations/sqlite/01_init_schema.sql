@@ -40,25 +40,6 @@ CREATE TABLE delegation (
 CREATE INDEX delegation_by_node ON delegation (node);
 CREATE INDEX delegation_by_status ON delegation (delegator, unlocks_at, withdrawal_amount);
 
--- -- Espresso Block tracking
--- -- Stores information about the current Espresso epoch
--- CREATE TABLE espresso_block (
---     number BIGINT PRIMARY KEY,
---     view BIGINT NOT NULL,
---     epoch BIGINT NOT NULL,
---     epoch_first_block BIGINT NOT NULL
--- );
-
--- -- Active Validator Set
--- -- Stores statistics for validators active in the current epoch
--- CREATE TABLE active_node (
---     staking_key TEXT PRIMARY KEY,
---     address TEXT NOT NULL UNIQUE,
---     votes INTEGER NOT NULL,
---     proposals INTEGER NOT NULL,
---     slots INTEGER NOT NULL
--- );
-
 -- Rewards
 -- Stores total accrued rewards for each account
 CREATE TABLE lifetime_rewards (
