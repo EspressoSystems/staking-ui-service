@@ -19,6 +19,7 @@ jobs:
   demo:
     name: demo
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
