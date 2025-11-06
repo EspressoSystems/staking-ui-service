@@ -579,10 +579,7 @@ impl Snapshot {
                         return Default::default();
                     }
 
-                    let exit_time = input
-                        .timestamp
-                        .checked_add(self.block.exit_escrow_period)
-                        .unwrap();
+                    let exit_time = input.timestamp + self.block.exit_escrow_period;
                     let node_diff = FullNodeSetDiff::NodeExit(NodeExit {
                         address: ev.validator,
                         exit_time,
