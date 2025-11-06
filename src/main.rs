@@ -1,4 +1,4 @@
-use std::{path::PathBuf, process::exit, sync::Arc};
+use std::{process::exit, sync::Arc};
 
 use async_lock::RwLock;
 use clap::{Parser, ValueEnum};
@@ -36,9 +36,9 @@ struct Options {
     #[clap(flatten)]
     l1_options: L1ClientOptions,
 
-    /// Location for persistent storage.
-    #[clap(long, env = "ESPRESSO_STAKING_SERVICE_STORAGE")]
-    storage: PathBuf,
+    /// Persistence options.
+    #[clap(flatten)]
+    persistence: sql::PersistenceOptions,
 
     /// Port for the HTTP server.
     #[clap(
@@ -65,7 +65,7 @@ impl Options {
         let genesis = Snapshot::empty(genesis_block);
 
         let l1_input = RpcStream::new(self.l1_options).await?;
-        let storage = sql::Persistence::new(&self.storage).await?;
+        let storage = sql::Persistence::new(&self.persistence).await?;
 
         // Create server state.
         let l1 = Arc::new(RwLock::new(l1::State::new(storage, genesis).await?));
@@ -161,7 +161,10 @@ mod test {
                 ..Default::default()
             },
             port,
-            storage: tmp.path().join("staking-ui-storage"),
+            persistence: sql::PersistenceOptions {
+                path: tmp.path().join("temp.db"),
+                max_connections: 5,
+            },
             log_format: Some(LogFormat::Json),
         };
 

@@ -9985,6 +9985,7 @@ name = "staking-ui-service"
 version = "0.1.0"
 dependencies = [
  "alloy",
+ "anyhow",
  "async-lock 3.4.1",
  "bitvec",
  "clap 4.5.51",
@@ -10004,6 +10005,8 @@ dependencies = [
  "portpicker",
  "rand 0.8.5",
  "serde",
+ "serde_json",
+ "sqlx",
  "staking-cli",
  "staking-ui-service",
  "surf-disco",

@@ -220,9 +220,11 @@ pub fn block_snapshot(number: u64) -> L1BlockSnapshot {
 pub fn make_node(i: usize) -> NodeSetEntry {
     let address = Address::random();
     let staking_key = TaggedBase64::new("KEY", &i.to_le_bytes()).unwrap();
+    let state_key = TaggedBase64::new("STATEKEY", &i.to_le_bytes()).unwrap();
     NodeSetEntry {
         address,
         staking_key,
+        state_key,
         stake: i.try_into().unwrap(),
         commission: Ratio::new(5, 100),
     }

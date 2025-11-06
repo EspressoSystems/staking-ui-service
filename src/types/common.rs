@@ -19,6 +19,14 @@ impl Ratio {
     pub fn new(num: usize, den: usize) -> Self {
         Self((num as f32) / (den as f32))
     }
+
+    pub fn from_f32(value: f32) -> Self {
+        Self(value)
+    }
+
+    pub fn as_f32(self) -> f32 {
+        self.0
+    }
 }
 
 /// An entry in the full node set.
@@ -29,6 +37,9 @@ pub struct NodeSetEntry {
 
     /// The key used for the node for signing consensus messages.
     pub staking_key: TaggedBase64,
+
+    /// state verifying key
+    pub state_key: TaggedBase64,
 
     /// Total stake currently attributed to the node.
     pub stake: ESPTokenAmount,

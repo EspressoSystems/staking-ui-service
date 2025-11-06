@@ -13,6 +13,7 @@ use futures::stream::{Stream, StreamExt};
 use hotshot_contract_adapter::sol_types::{
     RewardClaim::RewardClaimEvents, StakeTableV2::StakeTableV2Events,
 };
+use hotshot_types::light_client::StateVerKey;
 use tracing::instrument;
 
 use crate::{
@@ -445,13 +446,13 @@ impl L1BlockSnapshot {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Snapshot {
     /// The L1 block.
-    block: L1BlockSnapshot,
+    pub block: L1BlockSnapshot,
 
     /// The full node set as of this L1 block.
-    node_set: NodeSet,
+    pub node_set: NodeSet,
 
     /// The state of each wallet as of this L1 block.
-    wallets: Wallets,
+    pub wallets: Wallets,
 }
 
 impl Snapshot {
@@ -530,6 +531,7 @@ impl Snapshot {
                     let diff = FullNodeSetDiff::NodeUpdate(NodeSetEntry {
                         address: ev.account,
                         staking_key: PubKey::from(ev.blsVK).into(),
+                        state_key: StateVerKey::from(ev.schnorrVK).into(),
                         commission: Ratio::new(
                             ev.commission.into(),
                             COMMISSION_BASIS_POINTS.into(),
@@ -545,6 +547,7 @@ impl Snapshot {
                     let diff = FullNodeSetDiff::NodeUpdate(NodeSetEntry {
                         address: ev.account,
                         staking_key: PubKey::from(ev.blsVk).into(),
+                        state_key: StateVerKey::from(ev.schnorrVk).into(),
                         commission: Ratio::new(
                             ev.commission.into(),
                             COMMISSION_BASIS_POINTS.into(),
@@ -657,7 +660,7 @@ impl Wallets {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Wallet {
     /// Nodes that this user is delegating to.
-    nodes: im::Vector<Delegation>,
+    pub nodes: im::Vector<Delegation>,
 
     /// Stake that has been undelegated but not yet withdrawn.
     pub pending_undelegations: im::Vector<PendingWithdrawal>,
@@ -1382,6 +1385,7 @@ mod test {
         let expected = NodeSetEntry {
             address: event.account,
             staking_key: PubKey::from(event.blsVK).into(),
+            state_key: StateVerKey::from(event.schnorrVK).into(),
             commission: Ratio::new(event.commission as usize, COMMISSION_BASIS_POINTS as usize),
             stake: Default::default(),
         };
@@ -1478,6 +1482,7 @@ mod test {
                 FullNodeSetDiff::NodeUpdate(NodeSetEntry {
                     address: node.account,
                     staking_key: PubKey::from(node.blsVK).into(),
+                    state_key: StateVerKey::from(node.schnorrVK).into(),
                     stake: Default::default(),
                     commission: Ratio::new(
                         node.commission as usize,
