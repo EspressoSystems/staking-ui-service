@@ -89,6 +89,7 @@ impl Persistence {
     /// - L1 block info (hash, number, timestamp, exit escrow period)
     /// - Full node set (all registered validators)
     /// - All wallet states (delegations, pending withdrawals, claimed rewards)
+    #[instrument(skip(self))]
     async fn load_finalized_snapshot(&self) -> Result<Option<Snapshot>> {
         tracing::info!("loading finalized snapshot from database");
 
@@ -219,6 +220,7 @@ impl Persistence {
         Ok(Some(snapshot))
     }
 
+    #[instrument(skip(self, snapshot))]
     async fn save_snapshot(&self, snapshot: &Snapshot) -> Result<()> {
         tracing::info!(block = ?snapshot.block, "saving snapshot");
 
