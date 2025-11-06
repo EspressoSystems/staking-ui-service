@@ -12,7 +12,7 @@ use alloy::primitives::U256;
 use anyhow::Context;
 use clap::Parser;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
-use std::{collections::HashMap, path::PathBuf, str::FromStr};
+use std::{path::PathBuf, str::FromStr};
 use tracing::instrument;
 
 /// Options for persistence.
@@ -37,13 +37,6 @@ pub struct PersistenceOptions {
 #[derive(Debug, Clone)]
 pub struct Persistence {
     pool: SqlitePool,
-}
-
-#[derive(Default)]
-struct DelegationEntry {
-    amount: U256,
-    unlocks_at: u64,
-    withdrawal_amount: U256,
 }
 
 impl Persistence {
@@ -218,137 +211,6 @@ impl Persistence {
 
         tracing::info!(block = ?snapshot.block, "loaded finalized snapshot");
         Ok(Some(snapshot))
-    }
-
-    #[instrument(skip(self, snapshot))]
-    async fn save_snapshot(&self, snapshot: &Snapshot) -> Result<()> {
-        tracing::info!(block = ?snapshot.block, "saving snapshot");
-
-        let mut tx = self.pool.begin().await?;
-        sqlx::query("DELETE FROM delegation")
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("DELETE FROM wallet").execute(&mut *tx).await?;
-        sqlx::query("DELETE FROM node").execute(&mut *tx).await?;
-        sqlx::query("DELETE FROM l1_block")
-            .execute(&mut *tx)
-            .await?;
-
-        // Insert new block info
-        sqlx::query(
-            "INSERT INTO l1_block (hash, number, parent_hash, timestamp, exit_escrow_period)
-             VALUES ($1, $2, $3, $4, $5)",
-        )
-        .bind(snapshot.block.id().hash.to_string())
-        .bind(snapshot.block.id().number as i64)
-        .bind(snapshot.block.id().parent.to_string())
-        .bind(snapshot.block.timestamp() as i64)
-        .bind(snapshot.block.exit_escrow_period as i64)
-        .execute(&mut *tx)
-        .await?;
-
-        if !snapshot.node_set.is_empty() {
-            let mut query_builder = sqlx::QueryBuilder::new(
-                "INSERT INTO node (address, staking_key, state_key, commission) ",
-            );
-
-            query_builder.push_values(snapshot.node_set.iter(), |mut b, (_address, node)| {
-                b.push_bind(node.address.to_string())
-                    .push_bind(node.staking_key.to_string())
-                    .push_bind(node.state_key.to_string())
-                    .push_bind(node.commission.as_f32() as f64);
-            });
-
-            query_builder.build().execute(&mut *tx).await?;
-        }
-
-        if !snapshot.wallets.is_empty() {
-            let mut wallet_builder =
-                sqlx::QueryBuilder::new("INSERT INTO wallet (address, claimed_rewards) ");
-
-            wallet_builder.push_values(snapshot.wallets.iter(), |mut b, (address, wallet)| {
-                b.push_bind(address.to_string())
-                    .push_bind(wallet.claimed_rewards.to_string());
-            });
-
-            wallet_builder.build().execute(&mut *tx).await?;
-        }
-
-        // Collect all delegations into a single batch
-        let mut all_delegations = Vec::new();
-
-        for (address, wallet) in snapshot.wallets.iter() {
-            let mut delegation_map: HashMap<Address, DelegationEntry> = HashMap::new();
-
-            // Add active delegations
-            for delegation in &wallet.nodes {
-                delegation_map.insert(
-                    delegation.node,
-                    DelegationEntry {
-                        amount: delegation.amount,
-                        ..Default::default()
-                    },
-                );
-            }
-
-            for withdrawal in &wallet.pending_undelegations {
-                let entry = delegation_map.get_mut(&withdrawal.node).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "Invalid state: pending undelegation for node {} but no delegation exists for wallet {address}",
-                        withdrawal.node
-                    )
-                })?;
-                entry.unlocks_at = withdrawal.available_time;
-                entry.withdrawal_amount = withdrawal.amount;
-                entry.amount = entry.amount.checked_sub(withdrawal.amount).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "Underflow: withdrawal amount {} exceeds delegated amount {}",
-                        withdrawal.amount,
-                        entry.amount
-                    )
-                })?;
-            }
-
-            for withdrawal in &wallet.pending_exits {
-                let entry = delegation_map.get_mut(&withdrawal.node).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "Invalid state: pending exit for node {} but no delegation exists for wallet {address}",
-                        withdrawal.node
-                    )
-                })?;
-                entry.amount = withdrawal.amount;
-                entry.unlocks_at = withdrawal.available_time;
-                entry.withdrawal_amount = U256::ZERO;
-            }
-
-            for (node, state) in delegation_map {
-                all_delegations.push((address, node, state));
-            }
-        }
-
-        // Batch insert all delegations
-        if !all_delegations.is_empty() {
-            let mut delegation_builder = sqlx::QueryBuilder::new(
-                "INSERT INTO delegation (delegator, node, amount, unlocks_at, withdrawal_amount) ",
-            );
-
-            delegation_builder.push_values(
-                all_delegations.iter(),
-                |mut b, (address, node, state)| {
-                    b.push_bind(address.to_string())
-                        .push_bind(node.to_string())
-                        .push_bind(state.amount.to_string())
-                        .push_bind(state.unlocks_at as i64)
-                        .push_bind(state.withdrawal_amount.to_string());
-                },
-            );
-
-            delegation_builder.build().execute(&mut *tx).await?;
-        }
-
-        tx.commit().await?;
-        tracing::info!("snapshot saved");
-        Ok(())
     }
 
     /// Apply a full node set diff to the database.
@@ -595,7 +457,25 @@ impl L1Persistence for Persistence {
     }
 
     async fn save_genesis(&self, snapshot: Snapshot) -> Result<()> {
-        self.save_snapshot(&snapshot).await
+        tracing::info!(block = ?snapshot.block, "saving genesis L1 block");
+
+        let mut tx = self.pool.begin().await?;
+
+        sqlx::query(
+            "INSERT INTO l1_block (hash, number, parent_hash, timestamp, exit_escrow_period)
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(snapshot.block.id().hash.to_string())
+        .bind(snapshot.block.id().number as i64)
+        .bind(snapshot.block.id().parent.to_string())
+        .bind(snapshot.block.timestamp() as i64)
+        .bind(snapshot.block.exit_escrow_period as i64)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        tracing::info!("genesis L1 block saved");
+        Ok(())
     }
 
     #[instrument(skip(self, node_set_diff, wallets_diff))]
@@ -649,16 +529,12 @@ impl L1Persistence for Persistence {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::input::l1::testing::{block_snapshot, make_node, validator_registered_event};
-    use crate::input::l1::{NodeSet, Wallet, Wallets};
-    use crate::types::common::{NodeExit, NodeSetEntry, PendingWithdrawal};
+    use crate::input::l1::testing::{block_snapshot, make_node};
+    use crate::types::common::{NodeExit, PendingWithdrawal, Withdrawal};
     use crate::types::global::FullNodeSetDiff;
-    use espresso_types::{PubKey, v0_3::COMMISSION_BASIS_POINTS};
-    use hotshot_types::light_client::StateVerKey;
-    use rand::SeedableRng;
-    use rand::rngs::StdRng;
     use tempfile::TempDir;
 
+    /// Tests the complete persistence lifecycle
     #[tokio::test]
     async fn test_snapshot_save_apply_load() {
         let temp_dir = TempDir::new().unwrap();
@@ -676,179 +552,111 @@ mod tests {
         let node3 = make_node(3);
         let node4 = make_node(4);
 
-        let mut initial_node_set = NodeSet::default();
-        initial_node_set.apply(&FullNodeSetDiff::NodeUpdate(node1.clone()));
-        initial_node_set.apply(&FullNodeSetDiff::NodeUpdate(node2.clone()));
-        initial_node_set.apply(&FullNodeSetDiff::NodeUpdate(node3.clone()));
-
         let delegator1 = Address::random();
         let delegator2 = Address::random();
         let delegator3 = Address::random();
 
-        let mut initial_wallets = Wallets::default();
-
-        let wallet1 = Wallet {
-            nodes: im::Vector::from(vec![
-                Delegation {
-                    delegator: delegator1,
-                    node: node1.address,
-                    amount: U256::from(5000000u64),
-                },
-                Delegation {
-                    delegator: delegator1,
-                    node: node2.address,
-                    amount: U256::from(3000000u64),
-                },
-            ]),
-            pending_undelegations: im::Vector::new(),
-            pending_exits: im::Vector::new(),
-            claimed_rewards: U256::ZERO,
-        };
-        initial_wallets.insert(delegator1, wallet1);
-
-        let wallet2 = Wallet {
-            nodes: im::Vector::from(vec![
-                Delegation {
-                    delegator: delegator2,
-                    node: node1.address,
-                    amount: U256::from(500000u64),
-                },
-                Delegation {
-                    delegator: delegator2,
-                    node: node2.address,
-                    amount: U256::from(10000000u64),
-                },
-                Delegation {
-                    delegator: delegator2,
-                    node: node3.address,
-                    amount: U256::from(2000000u64),
-                },
-            ]),
-            pending_undelegations: im::Vector::from(vec![PendingWithdrawal {
-                delegator: delegator2,
-                node: node1.address,
-                amount: U256::from(500000u64),
-                available_time: 900,
-            }]),
-            pending_exits: im::Vector::new(),
-            claimed_rewards: U256::ZERO,
-        };
-        initial_wallets.insert(delegator2, wallet2);
-
-        let initial_snapshot = Snapshot::new(
-            block_snapshot(100),
-            initial_node_set.clone(),
-            initial_wallets.clone(),
-        );
-
+        let genesis_snapshot = Snapshot::empty(block_snapshot(100));
         persistence
-            .save_genesis(initial_snapshot.clone())
+            .save_genesis(genesis_snapshot.clone())
             .await
             .unwrap();
 
-        let loaded_genesis = persistence
+        let snapshot = persistence
             .load_finalized_snapshot()
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(loaded_genesis.block.number(), 100);
-        assert_eq!(loaded_genesis.node_set.len(), 3);
-        assert!(
-            loaded_genesis
-                .node_set
-                .iter()
-                .any(|(_, n)| n.address == node1.address)
-        );
-        assert!(
-            loaded_genesis
-                .node_set
-                .iter()
-                .any(|(_, n)| n.address == node2.address)
-        );
-        assert!(
-            loaded_genesis
-                .node_set
-                .iter()
-                .any(|(_, n)| n.address == node3.address)
-        );
-        assert_eq!(loaded_genesis.wallets.len(), 2);
-        let loaded_wallet1 = loaded_genesis.wallets.get(&delegator1).unwrap();
-        assert_eq!(loaded_wallet1.nodes.len(), 2);
-        assert_eq!(loaded_wallet1.pending_exits.len(), 0);
-        assert_eq!(loaded_wallet1.claimed_rewards, U256::ZERO);
-        let loaded_wallet2 = loaded_genesis.wallets.get(&delegator2).unwrap();
-        assert_eq!(loaded_wallet2.nodes.len(), 2);
-        assert!(loaded_wallet2.nodes.iter().any(|d| d.node == node2.address));
-        assert!(loaded_wallet2.nodes.iter().any(|d| d.node == node3.address));
-        assert!(!loaded_wallet2.nodes.iter().any(|d| d.node == node1.address));
-        assert_eq!(loaded_wallet2.pending_undelegations.len(), 1);
-        assert_eq!(
-            loaded_wallet2.pending_undelegations[0].amount,
-            U256::from(500000u64)
-        );
-        assert_eq!(loaded_wallet2.pending_exits.len(), 0);
-        assert_eq!(loaded_wallet2.claimed_rewards, U256::ZERO);
+        assert_eq!(snapshot.block.number(), 100);
+        assert_eq!(snapshot.node_set.len(), 0);
+        assert_eq!(snapshot.wallets.len(), 0);
 
-        let mut rng = StdRng::from_seed([42; 32]);
-        let validator_event = validator_registered_event(&mut rng);
-        let node5 = NodeSetEntry {
-            address: validator_event.account,
-            staking_key: PubKey::from(validator_event.blsVK).into(),
-            state_key: StateVerKey::from(validator_event.schnorrVK).into(),
-            commission: Ratio::new(
-                validator_event.commission.into(),
-                COMMISSION_BASIS_POINTS.into(),
-            ),
-            stake: U256::ZERO,
-        };
-
-        let node_set_diffs = vec![
+        // Block 100: Register 4 nodes, set up initial delegations, delegator1 withdraws and claims rewards
+        let initial_node_set_diffs = vec![
+            FullNodeSetDiff::NodeUpdate(node1.clone()),
+            FullNodeSetDiff::NodeUpdate(node2.clone()),
+            FullNodeSetDiff::NodeUpdate(node3.clone()),
             FullNodeSetDiff::NodeUpdate(node4.clone()),
-            FullNodeSetDiff::NodeUpdate(node5.clone()),
-            FullNodeSetDiff::NodeExit(NodeExit {
-                address: node2.address,
-                exit_time: 1200,
-            }),
         ];
 
-        let wallet_diffs = vec![
+        let initial_wallet_diffs = vec![
+            // Delegator1 delegates to node1
+            (
+                delegator1,
+                WalletDiff::DelegatedToNode(Delegation {
+                    delegator: delegator1,
+                    node: node1.address,
+                    amount: U256::from(6000000u64), // Initial amount before undelegation
+                }),
+            ),
+            // Delegator1 undelegates from node1
             (
                 delegator1,
                 WalletDiff::UndelegatedFromNode(PendingWithdrawal {
                     delegator: delegator1,
                     node: node1.address,
                     amount: U256::from(1000000u64),
-                    available_time: 1100,
+                    available_time: 800,
                 }),
             ),
+            // Delegator1 withdraws the undelegation and then claims rewards
             (
                 delegator1,
-                WalletDiff::NodeExited(PendingWithdrawal {
+                WalletDiff::UndelegationWithdrawal(Withdrawal {
+                    delegator: delegator1,
+                    node: node1.address,
+                    amount: U256::from(1000000u64),
+                }),
+            ),
+            // Delegator1 claims rewards after withdrawal
+            (delegator1, WalletDiff::ClaimedRewards(500u64)),
+            // Delegator1 delegates to node2
+            (
+                delegator1,
+                WalletDiff::DelegatedToNode(Delegation {
                     delegator: delegator1,
                     node: node2.address,
                     amount: U256::from(3000000u64),
-                    available_time: 1200,
                 }),
             ),
+            // Delegator2 delegates to node1
             (
                 delegator2,
-                WalletDiff::NodeExited(PendingWithdrawal {
+                WalletDiff::DelegatedToNode(Delegation {
+                    delegator: delegator2,
+                    node: node1.address,
+                    amount: U256::from(1000000u64),
+                }),
+            ),
+            // Delegator2 undelegates from node1
+            (
+                delegator2,
+                WalletDiff::UndelegatedFromNode(PendingWithdrawal {
+                    delegator: delegator2,
+                    node: node1.address,
+                    amount: U256::from(500000u64),
+                    available_time: 900,
+                }),
+            ),
+            // Delegator2 delegates to node2
+            (
+                delegator2,
+                WalletDiff::DelegatedToNode(Delegation {
                     delegator: delegator2,
                     node: node2.address,
                     amount: U256::from(10000000u64),
-                    available_time: 1200,
                 }),
             ),
-            (delegator1, WalletDiff::ClaimedRewards(1500u64)),
-            (delegator2, WalletDiff::ClaimedRewards(750u64)),
+            // Delegator2 delegates to node3
             (
-                delegator3,
+                delegator2,
                 WalletDiff::DelegatedToNode(Delegation {
-                    delegator: delegator3,
-                    node: node5.address,
-                    amount: U256::from(15000000u64),
+                    delegator: delegator2,
+                    node: node3.address,
+                    amount: U256::from(2000000u64),
                 }),
             ),
+            // Delegator3 delegates to node4
             (
                 delegator3,
                 WalletDiff::DelegatedToNode(Delegation {
@@ -859,13 +667,242 @@ mod tests {
             ),
         ];
 
-        let updated_block = block_snapshot(101);
+        persistence
+            .apply_events(
+                block_snapshot(100),
+                initial_node_set_diffs,
+                initial_wallet_diffs,
+            )
+            .await
+            .unwrap();
+
+        // Verify state after block 100
+        let snapshot_after_block_100 = persistence
+            .load_finalized_snapshot()
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(snapshot_after_block_100.block.number(), 100);
+        assert_eq!(snapshot_after_block_100.node_set.len(), 4);
+        assert_eq!(snapshot_after_block_100.wallets.len(), 3);
+
+        // Verify delegator1 after block 100
+        let wallet1_block100 = snapshot_after_block_100.wallets.get(&delegator1).unwrap();
+        assert_eq!(wallet1_block100.nodes.len(), 2);
+        let node1_del = wallet1_block100
+            .nodes
+            .iter()
+            .find(|d| d.node == node1.address)
+            .unwrap();
+        assert_eq!(node1_del.amount, U256::from(5000000u64));
+        assert_eq!(wallet1_block100.pending_undelegations.len(), 0);
+        assert_eq!(wallet1_block100.claimed_rewards, U256::from(500u64));
+
+        // Verify delegator2 after block 100
+        let wallet2_block100 = snapshot_after_block_100.wallets.get(&delegator2).unwrap();
+        assert_eq!(wallet2_block100.nodes.len(), 3);
+        assert_eq!(wallet2_block100.pending_undelegations.len(), 1);
+        assert_eq!(wallet2_block100.claimed_rewards, U256::ZERO);
+
+        // Verify delegator3 after block 100
+        let wallet3_block100 = snapshot_after_block_100.wallets.get(&delegator3).unwrap();
+        assert_eq!(wallet3_block100.nodes.len(), 1);
+        assert_eq!(wallet3_block100.pending_exits.len(), 0);
+
+        // Block 101: Node4 exits, triggering NodeExited for delegator3
+        let node_exit_diffs = vec![FullNodeSetDiff::NodeExit(NodeExit {
+            address: node4.address,
+            exit_time: 1500,
+        })];
+
+        let node_exit_wallet_diffs = vec![(
+            delegator3,
+            WalletDiff::NodeExited(PendingWithdrawal {
+                delegator: delegator3,
+                node: node4.address,
+                amount: U256::from(8000000u64),
+                available_time: 1500,
+            }),
+        )];
+
+        // Apply node4 exit in block 101
+        persistence
+            .apply_events(block_snapshot(101), node_exit_diffs, node_exit_wallet_diffs)
+            .await
+            .unwrap();
+
+        // Verify state after block 101
+        let snapshot = persistence
+            .load_finalized_snapshot()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.block.number(), 101);
+        assert_eq!(snapshot.node_set.len(), 3); // node4 exited
+        assert!(
+            snapshot
+                .node_set
+                .iter()
+                .any(|(_, n)| n.address == node1.address)
+        );
+        assert!(
+            snapshot
+                .node_set
+                .iter()
+                .any(|(_, n)| n.address == node2.address)
+        );
+        assert!(
+            snapshot
+                .node_set
+                .iter()
+                .any(|(_, n)| n.address == node3.address)
+        );
+        // node4 should NOT be in the node set anymore since it exited
+        assert!(
+            !snapshot
+                .node_set
+                .iter()
+                .any(|(_, n)| n.address == node4.address)
+        );
+        assert_eq!(snapshot.wallets.len(), 3);
+
+        // Verify delegator1
+        let loaded_wallet1 = snapshot.wallets.get(&delegator1).unwrap();
+        assert_eq!(loaded_wallet1.nodes.len(), 2);
+
+        // Delegator1 had 6M, undelegated 1M
+        let node1_delegation = loaded_wallet1
+            .nodes
+            .iter()
+            .find(|d| d.node == node1.address)
+            .expect("should have delegation to node1");
+        assert_eq!(node1_delegation.amount, U256::from(5000000u64));
+
+        assert_eq!(loaded_wallet1.pending_exits.len(), 0);
+        assert_eq!(loaded_wallet1.pending_undelegations.len(), 0);
+        assert_eq!(loaded_wallet1.claimed_rewards, U256::from(500u64));
+
+        // Verify delegator2
+        let loaded_wallet2 = snapshot.wallets.get(&delegator2).unwrap();
+        assert_eq!(loaded_wallet2.nodes.len(), 3); // node1, node2, node3
+
+        // Check node1 still has remaining delegation after undelegation
+        let node1_delegation = loaded_wallet2
+            .nodes
+            .iter()
+            .find(|d| d.node == node1.address)
+            .expect("should have remaining delegation to node1");
+        assert_eq!(node1_delegation.amount, U256::from(500000u64));
+
+        assert!(loaded_wallet2.nodes.iter().any(|d| d.node == node2.address));
+        assert!(loaded_wallet2.nodes.iter().any(|d| d.node == node3.address));
+        assert_eq!(loaded_wallet2.pending_undelegations.len(), 1);
+        assert_eq!(
+            loaded_wallet2.pending_undelegations[0].amount,
+            U256::from(500000u64)
+        );
+        assert_eq!(loaded_wallet2.pending_exits.len(), 0);
+        assert_eq!(loaded_wallet2.claimed_rewards, U256::ZERO);
+
+        // Verify delegator3
+        let loaded_wallet3 = snapshot.wallets.get(&delegator3).unwrap();
+        assert_eq!(loaded_wallet3.nodes.len(), 0);
+        assert_eq!(loaded_wallet3.pending_undelegations.len(), 0);
+        assert_eq!(loaded_wallet3.pending_exits.len(), 1);
+        assert_eq!(loaded_wallet3.pending_exits[0].node, node4.address);
+        assert_eq!(
+            loaded_wallet3.pending_exits[0].amount,
+            U256::from(8000000u64)
+        );
+        assert_eq!(loaded_wallet3.pending_exits[0].available_time, 1500);
+        assert_eq!(loaded_wallet3.claimed_rewards, U256::ZERO);
+
+        // Block 102: Register node5, node2 exits, withdrawals and claim rewards
+        let node5 = make_node(5);
+
+        let node_set_diffs = vec![
+            FullNodeSetDiff::NodeUpdate(node5.clone()),
+            FullNodeSetDiff::NodeExit(NodeExit {
+                address: node2.address,
+                exit_time: 1200,
+            }),
+        ];
+
+        let wallet_diffs = vec![
+            // Delegator1 undelegates 1M from node1
+            (
+                delegator1,
+                WalletDiff::UndelegatedFromNode(PendingWithdrawal {
+                    delegator: delegator1,
+                    node: node1.address,
+                    amount: U256::from(1000000u64),
+                    available_time: 1100,
+                }),
+            ),
+            // Node2 exits
+            // delegator1's delegation moves to pending_exits
+            (
+                delegator1,
+                WalletDiff::NodeExited(PendingWithdrawal {
+                    delegator: delegator1,
+                    node: node2.address,
+                    amount: U256::from(3000000u64),
+                    available_time: 1200,
+                }),
+            ),
+            // Node2 exits
+            //  delegator2 delegation moves to pending_exits
+            (
+                delegator2,
+                WalletDiff::NodeExited(PendingWithdrawal {
+                    delegator: delegator2,
+                    node: node2.address,
+                    amount: U256::from(10000000u64),
+                    available_time: 1200,
+                }),
+            ),
+            // Delegator2 completes withdrawal of undelegation from block 100
+            (
+                delegator2,
+                WalletDiff::UndelegationWithdrawal(Withdrawal {
+                    delegator: delegator2,
+                    node: node1.address,
+                    amount: U256::from(500000u64),
+                }),
+            ),
+            // Delegator3 withdrawal from exited node4
+            (
+                delegator3,
+                WalletDiff::NodeExitWithdrawal(Withdrawal {
+                    delegator: delegator3,
+                    node: node4.address,
+                    amount: U256::from(8000000u64),
+                }),
+            ),
+            // Delegator1 claims  rewards
+            (delegator1, WalletDiff::ClaimedRewards(1500u64)),
+            // Delegator2 claims rewards after withdrawal
+            (delegator2, WalletDiff::ClaimedRewards(750u64)),
+            // Delegator3 delegates to new node5
+            (
+                delegator3,
+                WalletDiff::DelegatedToNode(Delegation {
+                    delegator: delegator3,
+                    node: node5.address,
+                    amount: U256::from(15000000u64),
+                }),
+            ),
+        ];
+
+        let updated_block = block_snapshot(102);
 
         persistence
             .apply_events(updated_block, node_set_diffs, wallet_diffs)
             .await
             .unwrap();
 
+        // Verify final state after block 102
         let loaded_snapshot = persistence
             .load_finalized_snapshot()
             .await
@@ -873,7 +910,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(loaded_snapshot.block, updated_block);
-        assert_eq!(loaded_snapshot.node_set.len(), 4);
+        assert_eq!(loaded_snapshot.node_set.len(), 3); // node1, node3, node5 (node2 and node4 exited)
 
         assert!(
             loaded_snapshot
@@ -881,6 +918,7 @@ mod tests {
                 .iter()
                 .any(|(_, n)| n.address == node1.address)
         );
+        // node2 exited in block 102
         assert!(
             !loaded_snapshot
                 .node_set
@@ -893,8 +931,9 @@ mod tests {
                 .iter()
                 .any(|(_, n)| n.address == node3.address)
         );
+        // node4 exited in block 101
         assert!(
-            loaded_snapshot
+            !loaded_snapshot
                 .node_set
                 .iter()
                 .any(|(_, n)| n.address == node4.address)
@@ -910,7 +949,7 @@ mod tests {
             .wallets
             .get(&delegator1)
             .expect("wallet1 should exist");
-        assert_eq!(wallet1.claimed_rewards, U256::from(1500u64));
+        assert_eq!(wallet1.claimed_rewards, U256::from(2000u64));
         assert_eq!(wallet1.nodes.len(), 1);
         assert_eq!(wallet1.nodes[0].node, node1.address);
         assert_eq!(wallet1.nodes[0].amount, U256::from(4000000u64));
@@ -927,10 +966,15 @@ mod tests {
             .wallets
             .get(&delegator2)
             .expect("wallet2 should exist");
-        assert_eq!(wallet2.claimed_rewards, U256::from(750u64));
-        assert_eq!(wallet2.nodes.len(), 1);
+        assert_eq!(wallet2.claimed_rewards, U256::from(750u64)); // Claimed in block 102
+        assert_eq!(wallet2.nodes.len(), 2); // node1  and node3 
 
-        assert!(!wallet2.nodes.iter().any(|d| d.node == node1.address));
+        let node1_delegation = wallet2
+            .nodes
+            .iter()
+            .find(|d| d.node == node1.address)
+            .expect("should still have delegation to node1");
+        assert_eq!(node1_delegation.amount, U256::from(500000u64));
 
         let node3_delegation = wallet2
             .nodes
@@ -939,12 +983,7 @@ mod tests {
             .expect("should have delegation to node3");
         assert_eq!(node3_delegation.amount, U256::from(2000000u64));
 
-        assert_eq!(wallet2.pending_undelegations.len(), 1);
-        assert_eq!(wallet2.pending_undelegations[0].node, node1.address);
-        assert_eq!(
-            wallet2.pending_undelegations[0].amount,
-            U256::from(500000u64)
-        );
+        assert_eq!(wallet2.pending_undelegations.len(), 0);
 
         assert_eq!(wallet2.pending_exits.len(), 1);
         assert_eq!(wallet2.pending_exits[0].node, node2.address);
@@ -955,20 +994,15 @@ mod tests {
             .get(&delegator3)
             .expect("wallet3 should exist");
         assert_eq!(wallet3.claimed_rewards, U256::ZERO);
-        assert_eq!(wallet3.nodes.len(), 2);
+        assert_eq!(wallet3.nodes.len(), 1); // Only node5 delegation remains
         let node5_delegation = wallet3
             .nodes
             .iter()
             .find(|d| d.node == node5.address)
             .expect("should have delegation to node5");
         assert_eq!(node5_delegation.amount, U256::from(15000000u64));
-        let node4_delegation = wallet3
-            .nodes
-            .iter()
-            .find(|d| d.node == node4.address)
-            .expect("should have delegation to node4");
-        assert_eq!(node4_delegation.amount, U256::from(8000000u64));
         assert_eq!(wallet3.pending_undelegations.len(), 0);
+        // NodeExitWithdrawal completed, so no more pending_exits
         assert_eq!(wallet3.pending_exits.len(), 0);
     }
 }
