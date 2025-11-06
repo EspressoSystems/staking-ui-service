@@ -648,7 +648,7 @@ mod tests {
     use super::*;
     use crate::input::l1::testing::{block_snapshot, make_node, validator_registered_event};
     use crate::input::l1::{NodeSet, Wallet, Wallets};
-    use crate::types::common::{ESPTokenAmount, NodeExit, NodeSetEntry, PendingWithdrawal};
+    use crate::types::common::{NodeExit, NodeSetEntry, PendingWithdrawal};
     use crate::types::global::FullNodeSetDiff;
     use espresso_types::{PubKey, v0_3::COMMISSION_BASIS_POINTS};
     use hotshot_types::light_client::StateVerKey;
@@ -781,7 +781,7 @@ mod tests {
         assert_eq!(loaded_wallet2.pending_undelegations.len(), 1);
         assert_eq!(
             loaded_wallet2.pending_undelegations[0].amount,
-            ESPTokenAmount::from(U256::from(500000u64))
+            U256::from(500000u64)
         );
         assert_eq!(loaded_wallet2.pending_exits.len(), 0);
         assert_eq!(loaded_wallet2.claimed_rewards, U256::ZERO);
@@ -910,21 +910,15 @@ mod tests {
         assert_eq!(wallet1.claimed_rewards, U256::from(1500u64));
         assert_eq!(wallet1.nodes.len(), 1);
         assert_eq!(wallet1.nodes[0].node, node1.address);
-        assert_eq!(
-            wallet1.nodes[0].amount,
-            ESPTokenAmount::from(U256::from(4000000u64))
-        );
+        assert_eq!(wallet1.nodes[0].amount, U256::from(4000000u64));
         assert_eq!(wallet1.pending_undelegations.len(), 1);
         assert_eq!(
             wallet1.pending_undelegations[0].amount,
-            ESPTokenAmount::from(U256::from(1000000u64))
+            U256::from(1000000u64)
         );
         assert_eq!(wallet1.pending_exits.len(), 1);
         assert_eq!(wallet1.pending_exits[0].node, node2.address);
-        assert_eq!(
-            wallet1.pending_exits[0].amount,
-            ESPTokenAmount::from(U256::from(3000000u64))
-        );
+        assert_eq!(wallet1.pending_exits[0].amount, U256::from(3000000u64));
 
         let wallet2 = loaded_snapshot
             .wallets
@@ -940,24 +934,18 @@ mod tests {
             .iter()
             .find(|d| d.node == node3.address)
             .expect("should have delegation to node3");
-        assert_eq!(
-            node3_delegation.amount,
-            ESPTokenAmount::from(U256::from(2000000u64))
-        );
+        assert_eq!(node3_delegation.amount, U256::from(2000000u64));
 
         assert_eq!(wallet2.pending_undelegations.len(), 1);
         assert_eq!(wallet2.pending_undelegations[0].node, node1.address);
         assert_eq!(
             wallet2.pending_undelegations[0].amount,
-            ESPTokenAmount::from(U256::from(500000u64))
+            U256::from(500000u64)
         );
 
         assert_eq!(wallet2.pending_exits.len(), 1);
         assert_eq!(wallet2.pending_exits[0].node, node2.address);
-        assert_eq!(
-            wallet2.pending_exits[0].amount,
-            ESPTokenAmount::from(U256::from(10000000u64))
-        );
+        assert_eq!(wallet2.pending_exits[0].amount, U256::from(10000000u64));
 
         let wallet3 = loaded_snapshot
             .wallets
@@ -970,19 +958,13 @@ mod tests {
             .iter()
             .find(|d| d.node == node5.address)
             .expect("should have delegation to node5");
-        assert_eq!(
-            node5_delegation.amount,
-            ESPTokenAmount::from(U256::from(15000000u64))
-        );
+        assert_eq!(node5_delegation.amount, U256::from(15000000u64));
         let node4_delegation = wallet3
             .nodes
             .iter()
             .find(|d| d.node == node4.address)
             .expect("should have delegation to node4");
-        assert_eq!(
-            node4_delegation.amount,
-            ESPTokenAmount::from(U256::from(8000000u64))
-        );
+        assert_eq!(node4_delegation.amount, U256::from(8000000u64));
         assert_eq!(wallet3.pending_undelegations.len(), 0);
         assert_eq!(wallet3.pending_exits.len(), 0);
     }
