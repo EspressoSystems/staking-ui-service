@@ -792,7 +792,7 @@ pub struct Wallets(im::HashMap<Address, Wallet>);
 impl Wallets {
     /// Mutate the state by applying a diff to the indicated account.
     pub fn apply(&mut self, address: Address, diff: &WalletDiff) {
-        let wallet = self.0.entry(address).or_insert_with(Wallet::default);
+        let wallet = self.0.entry(address).or_default();
 
         // Apply the diff to the wallet
         wallet.apply(diff);
@@ -844,7 +844,7 @@ impl Wallet {
                     existing.amount += delegation.amount;
                 } else {
                     // Add new delegation to this node
-                    self.nodes.push_back(delegation.clone());
+                    self.nodes.push_back(*delegation);
                 }
             }
             WalletDiff::UndelegatedFromNode(pending) => {
@@ -862,7 +862,7 @@ impl Wallet {
                     self.nodes.remove(idx);
                 }
                 // Add to pending undelegations
-                self.pending_undelegations.push_back(pending.clone());
+                self.pending_undelegations.push_back(*pending);
             }
             WalletDiff::NodeExited(pending) => {
                 // Remove delegation to the exited node
@@ -873,7 +873,7 @@ impl Wallet {
                     .expect("attempted to process exit for node with no delegation");
                 self.nodes.remove(idx);
                 // Add to pending exits
-                self.pending_exits.push_back(pending.clone());
+                self.pending_exits.push_back(*pending);
             }
             WalletDiff::UndelegationWithdrawal(withdrawal) => {
                 // Remove from pending undelegations
