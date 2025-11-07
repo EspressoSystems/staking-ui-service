@@ -791,8 +791,11 @@ pub struct Wallets(im::HashMap<Address, Wallet>);
 
 impl Wallets {
     /// Mutate the state by applying a diff to the indicated account.
-    pub fn apply(&mut self, _address: Address, _diff: &WalletDiff) {
-        // TODO
+    pub fn apply(&mut self, address: Address, diff: &WalletDiff) {
+        let wallet = self.0.entry(address).or_insert_with(Wallet::default);
+
+        // Apply the diff to the wallet
+        wallet.apply(diff);
     }
 }
 
@@ -830,8 +833,67 @@ impl Wallet {
     }
 
     /// Mutate this wallet by applying a diff.
-    pub fn apply(&mut self, _diff: &WalletDiff) {
-        // TODO
+    pub fn apply(&mut self, diff: &WalletDiff) {
+        match diff {
+            WalletDiff::ClaimedRewards(amount) => {
+                self.claimed_rewards += *amount;
+            }
+            WalletDiff::DelegatedToNode(delegation) => {
+                if let Some(existing) = self.nodes.iter_mut().find(|d| d.node == delegation.node) {
+                    // Update existing delegation amount
+                    existing.amount += delegation.amount;
+                } else {
+                    // Add new delegation to this node
+                    self.nodes.push_back(delegation.clone());
+                }
+            }
+            WalletDiff::UndelegatedFromNode(pending) => {
+                let idx = self
+                    .nodes
+                    .iter()
+                    .position(|d| d.node == pending.node)
+                    .expect("attempted to undelegate from node with no delegation");
+                let delegation = &mut self.nodes[idx];
+                // Reduce the delegation by the undelegated amount
+                delegation.amount -= pending.amount;
+
+                // If the delegation is now zero, remove it
+                if delegation.amount.is_zero() {
+                    self.nodes.remove(idx);
+                }
+                // Add to pending undelegations
+                self.pending_undelegations.push_back(pending.clone());
+            }
+            WalletDiff::NodeExited(pending) => {
+                // Remove delegation to the exited node
+                let idx = self
+                    .nodes
+                    .iter()
+                    .position(|d| d.node == pending.node)
+                    .expect("attempted to process exit for node with no delegation");
+                self.nodes.remove(idx);
+                // Add to pending exits
+                self.pending_exits.push_back(pending.clone());
+            }
+            WalletDiff::UndelegationWithdrawal(withdrawal) => {
+                // Remove from pending undelegations
+                let idx = self
+                    .pending_undelegations
+                    .iter()
+                    .position(|p| p.node == withdrawal.node && p.amount == withdrawal.amount)
+                    .expect("attempted to withdraw undelegation that is not pending");
+                self.pending_undelegations.remove(idx);
+            }
+            WalletDiff::NodeExitWithdrawal(withdrawal) => {
+                // Remove from pending exits
+                let idx = self
+                    .pending_exits
+                    .iter()
+                    .position(|p| p.node == withdrawal.node && p.amount == withdrawal.amount)
+                    .expect("attempted to withdraw node exit that is not pending");
+                self.pending_exits.remove(idx);
+            }
+        }
     }
 }
 
