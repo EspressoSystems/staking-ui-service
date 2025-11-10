@@ -19,13 +19,17 @@ impl Ratio {
     pub fn new(num: usize, den: usize) -> Self {
         Self((num as f32) / (den as f32))
     }
+}
 
-    pub fn from_f32(value: f32) -> Self {
+impl From<f32> for Ratio {
+    fn from(value: f32) -> Self {
         Self(value)
     }
+}
 
-    pub fn as_f32(self) -> f32 {
-        self.0
+impl From<Ratio> for f32 {
+    fn from(val: Ratio) -> Self {
+        val.0
     }
 }
 

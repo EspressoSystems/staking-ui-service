@@ -15,6 +15,7 @@ CREATE TABLE node (
     address TEXT PRIMARY KEY,
     staking_key TEXT NOT NULL UNIQUE,
     state_key TEXT NOT NULL UNIQUE,
+    stake TEXT NOT NULL,
     commission REAL NOT NULL
 );
 
