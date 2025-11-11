@@ -27,7 +27,7 @@ run-profile profile *args:
         rm -r "$storage"
     }
     trap cleanup EXIT
-    cargo run --profile {{profile}} -- --storage "${storage}" {{args}}
+    cargo run --profile {{profile}} -- --path "${storage}" {{args}}
 
 run-decaf:
     just run \
