@@ -1,4 +1,4 @@
-use std::{path::PathBuf, process::exit, sync::Arc};
+use std::{process::exit, sync::Arc};
 
 use async_lock::RwLock;
 use clap::{Parser, ValueEnum};
@@ -9,6 +9,7 @@ use staking_ui_service::{
     input::l1::{self, RpcStream, Snapshot, options::L1ClientOptions},
     persistence::sql,
 };
+use tokio::time::sleep;
 use tracing_subscriber::{EnvFilter, fmt::format::FmtSpan};
 
 /// Controls how logs are displayed and how backtraces are logged on panic.
@@ -36,15 +37,15 @@ struct Options {
     #[clap(flatten)]
     l1_options: L1ClientOptions,
 
-    /// Location for persistent storage.
-    #[clap(long, env = "ESPRESSO_STAKING_SERVICE_STORAGE")]
-    storage: PathBuf,
+    /// Persistence options.
+    #[clap(flatten)]
+    persistence: sql::PersistenceOptions,
 
     /// Port for the HTTP server.
     #[clap(
         short,
         long,
-        env = "ESPRESSO_SATKING_SERVICE_PORT",
+        env = "ESPRESSO_STAKING_SERVICE_PORT",
         default_value = "8080"
     )]
     port: u16,
@@ -60,12 +61,30 @@ impl Options {
 
         // Get genesis state.
         let l1_provider = self.l1_options.provider()?.0;
-        let genesis_block =
-            l1::provider::load_genesis(&l1_provider, self.l1_options.stake_table_address).await?;
+        let genesis_block = loop {
+            // We can fail to load the genesis block for various reasons, e.g. the stake table
+            // contract is not deployed yet, or the initialization block has not finalized. These
+            // are usually encountered in tests where we are deploying stuff and starting up the
+            // service around the same time, but it is also possible to fail here in production, if,
+            // say, the L1 provider has a failure. In any case our best chance of avoiding manual
+            // intervention is to retry until we succeed, or until the container orchtestrator gives
+            // up and restarts the service. (Since we haven't started the HTTP server yet, the
+            // service will not be "healthy" at this stage).
+            match l1::provider::load_genesis(&l1_provider, self.l1_options.stake_table_address)
+                .await
+            {
+                Ok(genesis) => break genesis,
+                Err(err) => {
+                    tracing::warn!("error loading L1 genesis, will retry: {err:#}");
+                    sleep(self.l1_options.l1_retry_delay).await;
+                }
+            }
+        };
+        tracing::info!(?genesis_block, "loaded L1 genesis");
         let genesis = Snapshot::empty(genesis_block);
 
         let l1_input = RpcStream::new(self.l1_options).await?;
-        let storage = sql::Persistence::new(&self.storage).await?;
+        let storage = sql::Persistence::new(&self.persistence).await?;
 
         // Create server state.
         let l1 = Arc::new(RwLock::new(l1::State::new(storage, genesis).await?));
@@ -144,10 +163,7 @@ mod test {
     async fn e2e_smoke_test() {
         let port = pick_unused_port().unwrap();
         let tmp = tempdir().unwrap();
-        let anvil = Anvil::new()
-            .block_time(1)
-            .args(["--slots-in-an-epoch", "0"])
-            .spawn();
+        let anvil = Anvil::new().block_time(1).spawn();
         let deployment = ContractDeployment::deploy(anvil.endpoint_url())
             .await
             .unwrap();
@@ -161,7 +177,10 @@ mod test {
                 ..Default::default()
             },
             port,
-            storage: tmp.path().join("staking-ui-storage"),
+            persistence: sql::PersistenceOptions {
+                path: tmp.path().join("temp.db"),
+                max_connections: 5,
+            },
             log_format: Some(LogFormat::Json),
         };
 
