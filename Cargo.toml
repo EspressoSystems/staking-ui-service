@@ -8,6 +8,7 @@ license = "mit"
 default = []
 testing = [
     "espresso-contract-deployer",
+    "espresso-types/testing",
     "hotshot-state-prover",
     "jf-signature",
     "rand",
@@ -28,6 +29,7 @@ cld = "0.5"
 committable = { git = "https://github.com/EspressoSystems/commit.git", features = [
     "ark-serialize",
 ] }
+derivative = "2"
 derive_more = "2.0"
 espresso-types = { git = "https://github.com/EspressoSystems/espresso-network.git" }
 futures = "0.3"

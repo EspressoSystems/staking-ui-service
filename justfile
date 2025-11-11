@@ -54,8 +54,9 @@ test *args:
     cargo nextest run --locked --workspace --verbose {{args}}
 
 coverage:
-    cargo llvm-cov nextest
-    cargo llvm-cov report --html
+    cargo llvm-cov nextest --ignore-filename-regex testing.rs
+    cargo llvm-cov report --html --ignore-filename-regex testing.rs
+    @echo "HTML report available at file://${CARGO_TARGET_DIR:-target}/llvm-cov/html/index.html"
 
 build-docker: (build "release")
     docker build \

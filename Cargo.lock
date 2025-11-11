@@ -3759,6 +3759,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "espresso-macros"
+version = "0.1.0"
+source = "git+https://github.com/EspressoSystems/espresso-macros.git?tag=0.1.0#9e0b0258c99757c567676c4dd92f1501db0cf580"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 1.0.109",
+]
+
+[[package]]
 name = "espresso-systems-common"
 version = "0.4.0"
 source = "git+https://github.com/espressosystems/espresso-systems-common?tag=0.4.0#5abd890f79014a86db31286e1f3a529f161e69de"
@@ -4900,6 +4910,7 @@ dependencies = [
  "derivative",
  "derive_more 2.0.1",
  "either",
+ "espresso-macros",
  "futures",
  "hotshot",
  "hotshot-events-service",
@@ -4912,7 +4923,9 @@ dependencies = [
  "jf-merkle-tree-compat",
  "lazy_static",
  "log",
+ "portpicker",
  "prometheus",
+ "rand 0.8.5",
  "refinery",
  "refinery-core",
  "semver 1.0.27",
@@ -4922,6 +4935,7 @@ dependencies = [
  "sqlx",
  "surf-disco",
  "tagged-base64",
+ "tempfile",
  "tide-disco",
  "time 0.3.44",
  "tokio",
@@ -9991,6 +10005,7 @@ dependencies = [
  "clap 4.5.51",
  "cld",
  "committable",
+ "derivative",
  "derive_more 2.0.1",
  "espresso-contract-deployer",
  "espresso-types",
