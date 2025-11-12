@@ -123,6 +123,8 @@ impl EspressoClient for QueryServiceClient {
     async fn current_epoch(&self) -> Result<u64> {
         let block_height = self.inner.get::<u64>("node/block-height").send().await?;
         let latest_block = block_height - 1;
+
+        tracing::debug!(latest_block, "getting current epoch from latest block");
         Ok(epoch_from_block_number(latest_block, self.epoch_height))
     }
 
@@ -249,9 +251,43 @@ mod test {
             .unwrap();
         tracing::info!(first_epoch);
         let next_epoch = loop {
+            // What epoch does the client think it is?
+            let mut epoch_from_client = client.current_epoch().await.unwrap();
+
+            // Grab the expected epoch directly from consensus.
             let leaf = network.server.decided_leaf().await;
             let epoch = *leaf.epoch(EPOCH_HEIGHT).unwrap();
-            assert_eq!(client.current_epoch().await.unwrap(), epoch);
+
+            if epoch_from_client != epoch {
+                // It's possible for the consensus epoch to run slightly ahead of the client, both
+                // because we sampled it later, and because the client is ultimately reading from
+                // the node's database, and there is a very small delay in data propagating from the
+                // consensus object to the database. If the client is behind, though, it should not
+                // be far behind, and it should catch up very quickly.
+                assert_eq!(epoch_from_client + 1, epoch);
+                // This should only happen if we have just now changed epochs.
+                assert_eq!(
+                    leaf.height() % EPOCH_HEIGHT,
+                    1,
+                    "client is behind consensus, but we didn't just enter a new epoch at height {}",
+                    leaf.height()
+                );
+                tracing::info!(
+                    epoch_from_client,
+                    epoch,
+                    "client is 1 epoch behind consensus, waiting for it to catch up"
+                );
+                sleep(Duration::from_secs(2)).await;
+                epoch_from_client = client.current_epoch().await.unwrap();
+            }
+
+            tracing::info!(
+                epoch,
+                epoch_from_client,
+                "comparing epoch from client vs epoch from last decided leaf {}",
+                leaf.height()
+            );
+            assert_eq!(epoch_from_client, epoch);
 
             if epoch > first_epoch {
                 tracing::info!(height = leaf.height(), epoch, first_epoch, "changed epoch");
