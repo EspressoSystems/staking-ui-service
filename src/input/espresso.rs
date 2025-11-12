@@ -34,6 +34,7 @@ use crate::{
     },
 };
 
+pub mod client;
 pub mod testing;
 
 #[derive(Clone, Debug)]
@@ -387,6 +388,13 @@ impl EpochState {
         epoch_height: u64,
         epoch: u64,
     ) -> Result<Self> {
+        // We require the first epoch at least to be completed, so we have a "previous" epoch from
+        // which we can get the stake table and DRB result for this epoch.
+        ensure!(
+            epoch > 1,
+            Error::internal().context("Espresso state must be started after epoch 1")
+        );
+
         tracing::info!("fetching epoch state");
         let stake_table = espresso
             .stake_table_for_epoch(epoch)

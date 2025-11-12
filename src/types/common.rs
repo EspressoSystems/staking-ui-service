@@ -12,7 +12,7 @@ pub type ESPTokenAmount = U256;
 pub type Timestamp = u64;
 
 /// A ratio between 0 and 1.
-#[derive(Clone, Copy, Debug, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, PartialOrd, Deserialize, Serialize)]
 pub struct Ratio(f32);
 
 impl Ratio {
