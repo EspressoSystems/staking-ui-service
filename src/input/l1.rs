@@ -619,6 +619,7 @@ impl Snapshot {
                     let diff = FullNodeSetDiff::NodeUpdate(NodeSetEntry {
                         address: ev.account,
                         staking_key: PubKey::from(ev.blsVK).into(),
+                        state_key: node.state_key.clone(),
                         stake: node.stake,
                         commission: node.commission,
                     });
@@ -640,6 +641,7 @@ impl Snapshot {
                     let diff = FullNodeSetDiff::NodeUpdate(NodeSetEntry {
                         address: ev.account,
                         staking_key: PubKey::from(ev.blsVK).into(),
+                        state_key: node.state_key.clone(),
                         stake: node.stake,
                         commission: node.commission,
                     });
@@ -656,6 +658,7 @@ impl Snapshot {
                     let diff = FullNodeSetDiff::NodeUpdate(NodeSetEntry {
                         address: ev.validator,
                         staking_key: node.staking_key.clone(),
+                        state_key: node.state_key.clone(),
                         stake: node.stake,
                         commission: Ratio::new(
                             ev.newCommission.into(),
@@ -675,8 +678,8 @@ impl Snapshot {
                     let node_diff = FullNodeSetDiff::NodeUpdate(NodeSetEntry {
                         address: ev.validator,
                         staking_key: node.staking_key.clone(),
+                        state_key: node.state_key.clone(),
                         commission: node.commission,
-
                         stake: node.stake + ev.amount,
                     });
 
@@ -700,6 +703,7 @@ impl Snapshot {
                     let node_diff = FullNodeSetDiff::NodeUpdate(NodeSetEntry {
                         address: ev.validator,
                         staking_key: node.staking_key.clone(),
+                        state_key: node.state_key.clone(),
                         commission: node.commission,
                         stake: node.stake - ev.amount,
                     });
@@ -722,6 +726,9 @@ impl Snapshot {
                         )
                     });
 
+                    // TODO:
+                    // handle multiple undelegations of same amount
+                    // from different nodes
                     if let Some(pending) = wallet
                         .pending_undelegations
                         .iter()
@@ -773,10 +780,13 @@ impl Snapshot {
                     (vec![], vec![])
                 }
             },
-            L1Event::Reward(_) => {
-                // TODO
-                (vec![], vec![])
-            }
+            L1Event::Reward(ev) => match ev.as_ref() {
+                RewardClaimEvents::RewardsClaimed(claimed) => {
+                    let wallet_diff = WalletDiff::ClaimedRewards(claimed.amount);
+                    (vec![], vec![(claimed.user, wallet_diff)])
+                }
+                _ => (vec![], vec![]),
+            },
         }
     }
 }
@@ -1045,9 +1055,11 @@ pub trait L1Persistence: Send {
 mod test {
     use std::time::{Duration, Instant};
 
+    use crate::types::common::Address;
+    use alloy::primitives::U256;
     use espresso_types::{StakeTableState, v0_3::StakeTableEvent};
     use hotshot_contract_adapter::sol_types::StakeTableV2::{
-        ExitEscrowPeriodUpdated, ValidatorExit,
+        Delegated, ExitEscrowPeriodUpdated, Undelegated, ValidatorExit, Withdrawal,
     };
     use tide_disco::{Error as _, StatusCode};
 
@@ -1716,5 +1728,94 @@ mod test {
                 })
             ]
         );
+    }
+
+    // tests edge case where a delegator can have both
+    // a pending undelegation AND a pending exit for the same validator.
+    #[test]
+    fn test_simultaneous_pending_undelegation_and_exit() {
+        let delegator = Address::random();
+
+        // Create a validator registration event
+        let validator_reg = validator_registered_event(rand::thread_rng());
+        let validator_address = validator_reg.account;
+
+        // Register validator and delegate
+        let events = vec![
+            StakeTableV2Events::ValidatorRegisteredV2(validator_reg.clone()),
+            StakeTableV2Events::Delegated(Delegated {
+                delegator,
+                validator: validator_address,
+                amount: U256::from(1000),
+            }),
+        ];
+        let block1 = test_events(events);
+
+        // Verify delegation exists
+        let wallet = block1.state.wallets.get(&delegator).unwrap();
+        assert_eq!(wallet.nodes.len(), 1);
+        assert_eq!(wallet.nodes[0].amount, U256::from(1000));
+        assert_eq!(wallet.pending_undelegations.len(), 0);
+        assert_eq!(wallet.pending_exits.len(), 0);
+
+        // undelegation of 400 tokens
+        let block2 = block1.next(&BlockInput::empty(2).with_event(
+            StakeTableV2Events::Undelegated(Undelegated {
+                delegator,
+                validator: validator_address,
+                amount: U256::from(400),
+            }),
+        ));
+
+        // Verify
+        let wallet = block2.state.wallets.get(&delegator).unwrap();
+        assert_eq!(wallet.nodes.len(), 1);
+        assert_eq!(wallet.nodes[0].amount, U256::from(600)); // Remaining delegation
+        assert_eq!(wallet.pending_undelegations.len(), 1);
+        assert_eq!(wallet.pending_undelegations[0].amount, U256::from(400));
+        assert_eq!(wallet.pending_exits.len(), 0);
+
+        // Validator exits
+        let block3 = block2.next(&BlockInput::empty(3).with_event(
+            StakeTableV2Events::ValidatorExit(ValidatorExit {
+                validator: validator_address,
+            }),
+        ));
+
+        // Verify both pending operations exists
+        let wallet = block3.state.wallets.get(&delegator).unwrap();
+        assert_eq!(wallet.nodes.len(), 0);
+        assert_eq!(wallet.pending_undelegations.len(), 1);
+        assert_eq!(wallet.pending_undelegations[0].amount, U256::from(400));
+        assert_eq!(wallet.pending_exits.len(), 1);
+        assert_eq!(wallet.pending_exits[0].amount, U256::from(600)); // Exit for remaining delegation
+
+        // Withdraw the undelegation
+        let block4 = block3.next(
+            &BlockInput::empty(4).with_event(StakeTableV2Events::Withdrawal(Withdrawal {
+                account: delegator,
+                amount: U256::from(400),
+            })),
+        );
+
+        // Verify undelegation withdrawn but exit still pending
+        let wallet = block4.state.wallets.get(&delegator).unwrap();
+        assert_eq!(wallet.nodes.len(), 0);
+        assert_eq!(wallet.pending_undelegations.len(), 0);
+        assert_eq!(wallet.pending_exits.len(), 1);
+        assert_eq!(wallet.pending_exits[0].amount, U256::from(600));
+
+        // Withdraw the exit
+        let block5 = block4.next(
+            &BlockInput::empty(5).with_event(StakeTableV2Events::Withdrawal(Withdrawal {
+                account: delegator,
+                amount: U256::from(600),
+            })),
+        );
+
+        let wallet = block5.state.wallets.get(&delegator).unwrap();
+        assert_eq!(wallet.nodes.len(), 0);
+        assert_eq!(wallet.pending_undelegations.len(), 0);
+        assert_eq!(wallet.pending_exits.len(), 0);
     }
 }
