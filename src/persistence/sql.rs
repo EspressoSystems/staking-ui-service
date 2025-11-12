@@ -3,7 +3,9 @@ use crate::{
     Result,
     input::l1::{L1BlockSnapshot, L1Persistence, NodeSet, Snapshot, Wallet, Wallets},
     types::{
-        common::{Address, Delegation, L1BlockId, NodeSetEntry, PendingWithdrawal, Ratio},
+        common::{
+            Address, Delegation, L1BlockId, NodeSetEntry, PendingWithdrawal, Ratio, WithdrawalType,
+        },
         global::FullNodeSetDiff,
         wallet::WalletDiff,
     },
@@ -146,59 +148,66 @@ impl Persistence {
                         let claimed_rewards = U256::from_str(&claimed_rewards_str)
                             .context("failed to parse claimed rewards")?;
 
-                        let delegation_rows = sqlx::query_as::<_, (String, String, i64, String)>(
-                            "SELECT node, amount, unlocks_at, withdrawal_amount
-                     FROM delegation
-                     WHERE delegator = $1
-                     ORDER BY unlocks_at ASC, withdrawal_amount ASC",
+                        // Get active delegations
+                        let delegation_rows = sqlx::query_as::<_, (String, String)>(
+                            "SELECT node, amount
+                             FROM delegation
+                             WHERE delegator = $1",
                         )
                         .bind(&wallet_address)
                         .fetch_all(&pool)
                         .await?;
 
                         let mut nodes = im::Vector::new();
-                        let mut pending_undelegations = im::Vector::new();
-                        let mut pending_exits = im::Vector::new();
-
-                        // We use unlocks_at and withdrawal_amount to determine the delegation status
-                        for (node_str, amount_str, unlocks_at, withdrawal_amount_str) in
-                            delegation_rows
-                        {
+                        for (node_str, amount_str) in delegation_rows {
                             let node: Address =
                                 node_str.parse().context("failed to parse node address")?;
                             let amount = U256::from_str(&amount_str)
                                 .context("failed to parse delegation amount")?;
-                            let withdrawal_amount = U256::from_str(&withdrawal_amount_str)
-                                .context("failed to parse withdrawal amount")?;
-                            if withdrawal_amount.is_zero() && unlocks_at != 0 {
-                                //  Node exit
-                                pending_exits.push_back(PendingWithdrawal {
-                                    delegator: address,
-                                    node,
-                                    amount,
-                                    available_time: unlocks_at as u64,
-                                });
-                            } else if unlocks_at != 0 && !withdrawal_amount.is_zero() {
-                                // Partial undelegation
-                                if !amount.is_zero() {
-                                    nodes.push_back(Delegation {
-                                        delegator: address,
-                                        node,
-                                        amount,
-                                    });
-                                }
-                                pending_undelegations.push_back(PendingWithdrawal {
-                                    delegator: address,
-                                    node,
-                                    amount: withdrawal_amount,
-                                    available_time: unlocks_at as u64,
-                                });
-                            } else if !amount.is_zero() {
+                            if !amount.is_zero() {
                                 nodes.push_back(Delegation {
                                     delegator: address,
                                     node,
                                     amount,
                                 });
+                            }
+                        }
+
+                        // Get pending withdrawals
+                        let pending_rows = sqlx::query_as::<_, (String, String, String, i64)>(
+                            "SELECT node, withdrawal_type, amount, unlocks_at
+                             FROM pending_withdrawals
+                             WHERE delegator = $1
+                             ORDER BY unlocks_at ASC",
+                        )
+                        .bind(&wallet_address)
+                        .fetch_all(&pool)
+                        .await?;
+
+                        let mut pending_undelegations = im::Vector::new();
+                        let mut pending_exits = im::Vector::new();
+
+                        for (node_str, withdrawal_type_str, amount_str, available_time) in
+                            pending_rows
+                        {
+                            let node: Address =
+                                node_str.parse().context("failed to parse node address")?;
+                            let amount = U256::from_str(&amount_str)
+                                .context("failed to parse pending amount")?;
+                            let withdrawal_type = WithdrawalType::try_from(withdrawal_type_str)?;
+
+                            let withdrawal = PendingWithdrawal {
+                                delegator: address,
+                                node,
+                                amount,
+                                available_time: available_time as u64,
+                            };
+
+                            match withdrawal_type {
+                                WithdrawalType::Undelegation => {
+                                    pending_undelegations.push_back(withdrawal)
+                                }
+                                WithdrawalType::Exit => pending_exits.push_back(withdrawal),
                             }
                         }
 
@@ -240,10 +249,10 @@ impl Persistence {
                     "INSERT INTO node (address, staking_key, state_key, commission, stake)
                      VALUES ($1, $2, $3, $4, $5)
                      ON CONFLICT(address) DO UPDATE SET
-                        staking_key = excluded.staking_key,
-                        state_key = excluded.state_key,
-                        commission = excluded.commission,
-                        stake = excluded.stake",
+                         staking_key = excluded.staking_key,
+                         state_key = excluded.state_key,
+                         commission = excluded.commission,
+                         stake = excluded.stake",
                 )
                 .bind(node.address.to_string())
                 .bind(node.staking_key.to_string())
@@ -349,8 +358,8 @@ impl Persistence {
 
                 // upsert
                 sqlx::query(
-                    "INSERT INTO delegation (delegator, node, amount, unlocks_at, withdrawal_amount)
-                     VALUES ($1, $2, $3, 0, '0')
+                    "INSERT INTO delegation (delegator, node, amount)
+                     VALUES ($1, $2, $3)
                      ON CONFLICT(delegator, node) DO UPDATE SET
                         amount = excluded.amount",
                 )
@@ -361,18 +370,27 @@ impl Persistence {
                 .await?;
             }
             WalletDiff::UndelegatedFromNode(withdrawal) => {
-                let (amount, unlocks_at, withdrawal_amount) = sqlx::query_as::<_, (String, i64, String)>(
-                    "SELECT amount, unlocks_at, withdrawal_amount FROM delegation WHERE delegator = $1 AND node = $2",
+                let (amount,) = sqlx::query_as::<_, (String,)>(
+                    "SELECT amount FROM delegation WHERE delegator = $1 AND node = $2",
                 )
                 .bind(withdrawal.delegator.to_string())
                 .bind(withdrawal.node.to_string())
                 .fetch_one(&mut **tx)
                 .await?;
 
-                // Sanity check: ensure there's no pending withdrawal already
-                if unlocks_at != 0 || withdrawal_amount != "0" {
+                // Sanity check: ensure there's no pending undelegation already
+                let pending_exists = sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS(SELECT 1 FROM pending_withdrawals
+                     WHERE delegator = $1 AND node = $2 AND withdrawal_type = 'undelegation')",
+                )
+                .bind(withdrawal.delegator.to_string())
+                .bind(withdrawal.node.to_string())
+                .fetch_one(&mut **tx)
+                .await?;
+
+                if pending_exists {
                     return Err(anyhow::anyhow!(
-                        "pending withdrawal already exists for delegator {} to node {}",
+                        "pending undelegation already exists for delegator {} to node {}",
                         withdrawal.delegator,
                         withdrawal.node
                     ))
@@ -389,68 +407,9 @@ impl Persistence {
                     },
                 )?;
 
-                // Update delegation: decrement amount and set unlocks_at and withdrawal_amount
-                let result = sqlx::query(
-                    "UPDATE delegation
-                     SET amount = $1,
-                         unlocks_at = $2,
-                         withdrawal_amount = $3
-                     WHERE delegator = $4 AND node = $5",
-                )
-                .bind(new_amount.to_string())
-                .bind(withdrawal.available_time as i64)
-                .bind(withdrawal.amount.to_string())
-                .bind(withdrawal.delegator.to_string())
-                .bind(withdrawal.node.to_string())
-                .execute(&mut **tx)
-                .await?;
-
-                if result.rows_affected() != 1 {
-                    return Err(anyhow::anyhow!(
-                        "Expected to update 1 delegation row, but {} were affected",
-                        result.rows_affected()
-                    ))
-                    .map_err(Into::into);
-                }
-            }
-            WalletDiff::NodeExited(withdrawal) => {
-                // Mark all delegations to this node as exits
-                let result = sqlx::query(
-                    "UPDATE delegation
-                     SET unlocks_at = $1, withdrawal_amount = '0'
-                     WHERE delegator = $2 AND node = $3",
-                )
-                .bind(withdrawal.available_time as i64)
-                .bind(withdrawal.delegator.to_string())
-                .bind(withdrawal.node.to_string())
-                .execute(&mut **tx)
-                .await?;
-
-                if result.rows_affected() != 1 {
-                    return Err(anyhow::anyhow!(
-                        "Expected to update 1 delegation row, but {} were affected",
-                        result.rows_affected()
-                    ))
-                    .map_err(Into::into);
-                }
-            }
-            WalletDiff::UndelegationWithdrawal(withdrawal) => {
-                let (amount,) = sqlx::query_as::<_, (String,)>(
-                    "UPDATE delegation
-                     SET unlocks_at = 0,
-                         withdrawal_amount = '0'
-                     WHERE delegator = $1 AND node = $2
-                     RETURNING amount",
-                )
-                .bind(withdrawal.delegator.to_string())
-                .bind(withdrawal.node.to_string())
-                .fetch_one(&mut **tx)
-                .await?;
-
-                let remaining_amount = U256::from_str(&amount)
-                    .context("failed to parse remaining delegation amount")?;
-
-                if remaining_amount.is_zero() {
+                // If new amount is zero, delete the delegation
+                // otherwise update it
+                if new_amount.is_zero() {
                     let result =
                         sqlx::query("DELETE FROM delegation WHERE delegator = $1 AND node = $2")
                             .bind(withdrawal.delegator.to_string())
@@ -465,9 +424,43 @@ impl Persistence {
                         ))
                         .map_err(Into::into);
                     }
+                } else {
+                    // Update delegation amount
+                    let result = sqlx::query(
+                        "UPDATE delegation
+                         SET amount = $1
+                         WHERE delegator = $2 AND node = $3",
+                    )
+                    .bind(new_amount.to_string())
+                    .bind(withdrawal.delegator.to_string())
+                    .bind(withdrawal.node.to_string())
+                    .execute(&mut **tx)
+                    .await?;
+
+                    if result.rows_affected() != 1 {
+                        return Err(anyhow::anyhow!(
+                            "Expected to update 1 delegation row, but {} were affected",
+                            result.rows_affected()
+                        ))
+                        .map_err(Into::into);
+                    }
                 }
+
+                // Insert pending undelegation
+                sqlx::query(
+                    "INSERT INTO pending_withdrawals (delegator, node, withdrawal_type, amount, unlocks_at)
+                     VALUES ($1, $2, $3, $4, $5)",
+                )
+                .bind(withdrawal.delegator.to_string())
+                .bind(withdrawal.node.to_string())
+                .bind(String::from(WithdrawalType::Undelegation))
+                .bind(withdrawal.amount.to_string())
+                .bind(withdrawal.available_time as i64)
+                .execute(&mut **tx)
+                .await?;
             }
-            WalletDiff::NodeExitWithdrawal(withdrawal) => {
+            WalletDiff::NodeExited(withdrawal) => {
+                // Delete the delegation as node has exited
                 let result = sqlx::query(
                     "DELETE FROM delegation
                      WHERE delegator = $1 AND node = $2",
@@ -479,7 +472,61 @@ impl Persistence {
 
                 if result.rows_affected() != 1 {
                     return Err(anyhow::anyhow!(
-                        "Expected to delete 1 delegation row, but {} were affected",
+                        "Expected to delete 1 delegation for node exit, but {} were affected",
+                        result.rows_affected()
+                    ))
+                    .map_err(Into::into);
+                }
+
+                // Insert pending exit with the amount from the withdrawal
+                sqlx::query(
+                    "INSERT INTO pending_withdrawals (delegator, node, withdrawal_type, amount, unlocks_at)
+                     VALUES ($1, $2, $3, $4, $5)
+                     ON CONFLICT(delegator, node, withdrawal_type) DO UPDATE SET
+                         amount = excluded.amount,
+                         unlocks_at = excluded.unlocks_at",
+                )
+                .bind(withdrawal.delegator.to_string())
+                .bind(withdrawal.node.to_string())
+                .bind(String::from(WithdrawalType::Exit))
+                .bind(withdrawal.amount.to_string())
+                .bind(withdrawal.available_time as i64)
+                .execute(&mut **tx)
+                .await?;
+            }
+            WalletDiff::UndelegationWithdrawal(withdrawal) => {
+                // Delete the pending undelegation withdrawal
+                let result = sqlx::query(
+                    "DELETE FROM pending_withdrawals
+                     WHERE delegator = $1 AND node = $2 AND withdrawal_type = 'undelegation'",
+                )
+                .bind(withdrawal.delegator.to_string())
+                .bind(withdrawal.node.to_string())
+                .execute(&mut **tx)
+                .await?;
+
+                if result.rows_affected() != 1 {
+                    return Err(anyhow::anyhow!(
+                        "Expected to delete 1 pending undelegation, but {} were affected",
+                        result.rows_affected()
+                    ))
+                    .map_err(Into::into);
+                }
+            }
+            WalletDiff::NodeExitWithdrawal(withdrawal) => {
+                // Delete the pending exit withdrawal
+                let result = sqlx::query(
+                    "DELETE FROM pending_withdrawals
+                     WHERE delegator = $1 AND node = $2 AND withdrawal_type = 'exit'",
+                )
+                .bind(withdrawal.delegator.to_string())
+                .bind(withdrawal.node.to_string())
+                .execute(&mut **tx)
+                .await?;
+
+                if result.rows_affected() != 1 {
+                    return Err(anyhow::anyhow!(
+                        "Expected to delete 1 pending exit, but {} were affected",
                         result.rows_affected()
                     ))
                     .map_err(Into::into);
@@ -535,11 +582,11 @@ impl L1Persistence for Persistence {
         // Update L1 block info
         sqlx::query(
             "UPDATE l1_block SET
-                hash = $1,
-                number = $2,
-                parent_hash = $3,
-                timestamp = $4,
-                exit_escrow_period = $5",
+                 hash = $1,
+                 number = $2,
+                 parent_hash = $3,
+                 timestamp = $4,
+                 exit_escrow_period = $5",
         )
         .bind(block.hash().to_string())
         .bind(block.number() as i64)
@@ -647,8 +694,8 @@ mod tests {
                     amount: U256::from(1000000u64),
                 }),
             ),
-            // Delegator1 claims rewards after withdrawal
-            (delegator1, WalletDiff::ClaimedRewards(500u64)),
+            // Delegator1 claims rewards
+            (delegator1, WalletDiff::ClaimedRewards(U256::from(500))),
             // Delegator1 delegates to node2
             (
                 delegator1,
@@ -920,9 +967,9 @@ mod tests {
                 }),
             ),
             // Delegator1 claims  rewards
-            (delegator1, WalletDiff::ClaimedRewards(1500u64)),
-            // Delegator2 claims rewards after withdrawal
-            (delegator2, WalletDiff::ClaimedRewards(750u64)),
+            (delegator1, WalletDiff::ClaimedRewards(U256::from(1500))),
+            // Delegator2 claims rewards
+            (delegator2, WalletDiff::ClaimedRewards(U256::from(750))),
             // Delegator3 delegates to new node5
             (
                 delegator3,
