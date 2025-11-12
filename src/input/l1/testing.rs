@@ -1,7 +1,7 @@
 #![cfg(any(test, feature = "testing"))]
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     pin::Pin,
     task::{Context, Poll},
     time::Duration,
@@ -9,7 +9,7 @@ use std::{
 
 use alloy::{
     network::EthereumWallet,
-    primitives::{FixedBytes, U256, keccak256},
+    primitives::{Address, FixedBytes, U256, keccak256},
     providers::{ProviderBuilder, WalletProvider},
     rpc::types::TransactionReceipt,
     signers::local::PrivateKeySigner,
@@ -23,9 +23,10 @@ use espresso_contract_deployer::{
 use hotshot_contract_adapter::{
     sol_types::{
         G1PointSol,
+        RewardClaim::RewardsClaimed,
         StakeTableV2::{
-            self, ExitEscrowPeriodUpdated, ValidatorExit, ValidatorRegistered,
-            ValidatorRegisteredV2,
+            self, Delegated, ExitEscrowPeriodUpdated, Undelegated, ValidatorExit,
+            ValidatorRegistered, ValidatorRegisteredV2, Withdrawal,
         },
     },
     stake_table::{StateSignatureSol, sign_address_bls, sign_address_schnorr},
@@ -228,6 +229,10 @@ pub fn make_node(i: usize) -> NodeSetEntry {
 #[derive(Debug)]
 pub struct EventGenerator {
     nodes: HashSet<Address>,
+    delegations: HashMap<(Address, Address), U256>,
+    pending_undelegations: HashMap<(Address, Address), U256>,
+    pending_exits: HashMap<(Address, Address), U256>,
+    exited_nodes: HashSet<Address>,
     rng: StdRng,
     stake_table_only: bool,
 }
@@ -236,6 +241,10 @@ impl Default for EventGenerator {
     fn default() -> Self {
         Self {
             nodes: Default::default(),
+            delegations: Default::default(),
+            pending_undelegations: Default::default(),
+            pending_exits: Default::default(),
+            exited_nodes: Default::default(),
             rng: StdRng::from_seed(Default::default()),
             stake_table_only: false,
         }
@@ -268,8 +277,12 @@ impl Iterator for EventGenerator {
 
             // Other contract events that the UI service cares about but consensus does not.
             const EXIT_ESCROW_PERIOD_UPDATED: usize = 3;
+            const DELEGATE: usize = 4;
+            const UNDELEGATE: usize = 5;
+            const WITHDRAWAL: usize = 6;
+            const CLAIM_REWARDS: usize = 7;
 
-            const MAX_EVENT_TYPE: usize = 4;
+            const MAX_EVENT_TYPE: usize = 8;
 
             // Generate the code for a random event type.
             let max = if self.stake_table_only {
@@ -307,7 +320,23 @@ impl Iterator for EventGenerator {
                         // If there are none try again.
                         continue;
                     };
+
+                    // Move all delegations to this node to pending exits
+                    // and remove from delegations
+                    let exits: Vec<_> = self
+                        .delegations
+                        .iter()
+                        .filter(|((_, n), _)| *n == node)
+                        .map(|((d, n), amount)| ((*d, *n), *amount))
+                        .collect();
+
+                    for (key, amount) in exits {
+                        self.delegations.remove(&key);
+                        self.pending_exits.insert(key, amount);
+                    }
+
                     self.nodes.remove(&node);
+                    self.exited_nodes.insert(node);
                     StakeTableV2Events::ValidatorExit(ValidatorExit { validator: node }).into()
                 }
 
@@ -317,6 +346,104 @@ impl Iterator for EventGenerator {
                         newExitEscrowPeriod: self.rng.next_u64(),
                     })
                     .into()
+                }
+
+                DELEGATE => {
+                    // Choose a random validator to delegate to.
+                    let Some(&validator) = self.nodes.iter().choose(&mut self.rng) else {
+                        continue;
+                    };
+
+                    let delegator = Address::random();
+                    let amount = U256::from(self.rng.gen_range(100u64..10000u64));
+                    let key = (delegator, validator);
+                    self.delegations.insert(key, amount);
+
+                    StakeTableV2Events::Delegated(Delegated {
+                        delegator,
+                        validator,
+                        amount,
+                    })
+                    .into()
+                }
+
+                UNDELEGATE => {
+                    if self.delegations.is_empty() {
+                        continue;
+                    };
+
+                    let (key, amount) = self
+                        .delegations
+                        .iter()
+                        .choose(&mut self.rng)
+                        .map(|(k, v)| (*k, *v))
+                        .unwrap();
+
+                    let (delegator, node) = key;
+
+                    let undelegate_amount =
+                        (amount * U256::from(self.rng.gen_range(1u64..50u64))) / U256::from(100);
+
+                    let remaining = amount - undelegate_amount;
+
+                    // Update or remove delegation based on remaining amount
+                    if remaining.is_zero() {
+                        self.delegations.remove(&key);
+                    } else {
+                        self.delegations.insert(key, remaining);
+                    }
+
+                    self.pending_undelegations.insert(key, undelegate_amount);
+
+                    StakeTableV2Events::Undelegated(Undelegated {
+                        delegator,
+                        validator: node,
+                        amount: undelegate_amount,
+                    })
+                    .into()
+                }
+
+                WITHDRAWAL => {
+                    let pending_undelegations: Vec<_> =
+                        self.pending_undelegations.keys().copied().collect();
+                    let pending_exits: Vec<_> = self.pending_exits.keys().copied().collect();
+
+                    let total = pending_undelegations.len() + pending_exits.len();
+                    if total == 0 {
+                        continue;
+                    }
+
+                    // Choose a random withdrawal and remove it
+                    let idx = self.rng.gen_range(0..total);
+                    let (account, _node, amount) = if idx < pending_undelegations.len() {
+                        let key = pending_undelegations[idx];
+                        let amount = self.pending_undelegations.remove(&key).unwrap();
+                        (key.0, key.1, amount)
+                    } else {
+                        let key = pending_exits[idx - pending_undelegations.len()];
+                        let amount = self.pending_exits.remove(&key).unwrap();
+                        (key.0, key.1, amount)
+                    };
+
+                    StakeTableV2Events::Withdrawal(Withdrawal { account, amount }).into()
+                }
+
+                CLAIM_REWARDS => {
+                    let delegators: Vec<Address> = self
+                        .delegations
+                        .keys()
+                        .map(|(d, _)| *d)
+                        .collect::<HashSet<_>>()
+                        .into_iter()
+                        .collect();
+
+                    if delegators.is_empty() {
+                        continue;
+                    }
+                    let user = *delegators.iter().choose(&mut self.rng).unwrap();
+                    let amount = U256::from(self.rng.gen_range(10u64..1000u64));
+
+                    RewardClaimEvents::RewardsClaimed(RewardsClaimed { user, amount }).into()
                 }
 
                 _ => unreachable!(),
