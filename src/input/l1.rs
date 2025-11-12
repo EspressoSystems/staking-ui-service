@@ -859,11 +859,14 @@ impl Wallet {
                 }
             }
             WalletDiff::UndelegatedFromNode(pending) => {
+                let node = pending.node;
                 let idx = self
                     .nodes
                     .iter()
                     .position(|d| d.node == pending.node)
-                    .expect("attempted to undelegate from node with no delegation");
+                    .unwrap_or_else(|| {
+                        panic!("attempted to undelegate from node {node} with no delegation")
+                    });
                 let delegation = &mut self.nodes[idx];
                 // Reduce the delegation by the undelegated amount
                 delegation.amount -= pending.amount;
@@ -877,31 +880,44 @@ impl Wallet {
             }
             WalletDiff::NodeExited(pending) => {
                 // Remove delegation to the exited node
+                let node = pending.node;
                 let idx = self
                     .nodes
                     .iter()
                     .position(|d| d.node == pending.node)
-                    .expect("attempted to process exit for node with no delegation");
+                    .unwrap_or_else(|| {
+                        panic!("attempted to process exit for node {node} with no delegation")
+                    });
                 self.nodes.remove(idx);
                 // Add to pending exits
                 self.pending_exits.push_back(*pending);
             }
             WalletDiff::UndelegationWithdrawal(withdrawal) => {
                 // Remove from pending undelegations
+                let node = withdrawal.node;
+                let amount = withdrawal.amount;
                 let idx = self
                     .pending_undelegations
                     .iter()
                     .position(|p| p.node == withdrawal.node && p.amount == withdrawal.amount)
-                    .expect("attempted to withdraw undelegation that is not pending");
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "attempted to withdraw undelegation from node {node} amount: {amount}"
+                        )
+                    });
                 self.pending_undelegations.remove(idx);
             }
             WalletDiff::NodeExitWithdrawal(withdrawal) => {
                 // Remove from pending exits
+                let node = withdrawal.node;
+                let amount = withdrawal.amount;
                 let idx = self
                     .pending_exits
                     .iter()
                     .position(|p| p.node == withdrawal.node && p.amount == withdrawal.amount)
-                    .expect("attempted to withdraw node exit that is not pending");
+                    .unwrap_or_else(|| {
+                        panic!("attempted to withdraw node exit from node {node} amount: {amount}")
+                    });
                 self.pending_exits.remove(idx);
             }
         }

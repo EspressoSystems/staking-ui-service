@@ -1206,7 +1206,7 @@ mod tests {
             let current_block = current_state.latest_l1_block().number;
 
             if current_block >= genesis_block_number + target_blocks {
-                println!("Reached target block: {}", current_block);
+                println!("Reached target block: {current_block}");
                 break;
             }
         }
@@ -1329,14 +1329,13 @@ mod tests {
 
                         assert_eq!(
                             wallet_delegation.amount, *delegated_amount,
-                            "Delegation amount mismatch: delegator {} to validator {}",
-                            delegator_address, node.address,
+                            "Delegation amount mismatch: delegator {delegator_address} to validator {}",
+                            node.address,
                         );
                     }
                     Err(e) => {
                         panic!(
-                            "Delegator {} wallet not found in subscription state but exists in L1 validator delegators: {}",
-                            delegator_address, e
+                            "Delegator {delegator_address} wallet not found in subscription state but exists in L1 validator delegators: {e}"
                         );
                     }
                 }

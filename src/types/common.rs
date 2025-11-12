@@ -184,7 +184,7 @@ impl TryFrom<String> for WithdrawalType {
         match value.as_str() {
             "undelegation" => Ok(WithdrawalType::Undelegation),
             "exit" => Ok(WithdrawalType::Exit),
-            _ => Err(anyhow::anyhow!("Unknown withdrawal type: {}", value)),
+            _ => Err(anyhow::anyhow!("Unknown withdrawal type: {value}")),
         }
     }
 }
