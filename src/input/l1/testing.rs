@@ -3,14 +3,16 @@
 use std::{
     collections::{HashMap, HashSet},
     pin::Pin,
+    sync::Arc,
     task::{Context, Poll},
     time::Duration,
 };
 
+use crate::types::common::NodeSetEntry;
 use alloy::{
     network::EthereumWallet,
     primitives::{Address, FixedBytes, U256, keccak256},
-    providers::{ProviderBuilder, WalletProvider},
+    providers::{ProviderBuilder, WalletProvider, ext::AnvilApi},
     rpc::types::TransactionReceipt,
     signers::local::PrivateKeySigner,
     sol_types::SolValue,
@@ -25,8 +27,8 @@ use hotshot_contract_adapter::{
         G1PointSol,
         RewardClaim::RewardsClaimed,
         StakeTableV2::{
-            self, Delegated, ExitEscrowPeriodUpdated, Undelegated, ValidatorExit,
-            ValidatorRegistered, ValidatorRegisteredV2, Withdrawal,
+            self, ConsensusKeysUpdatedV2, Delegated, ExitEscrowPeriodUpdated, Undelegated,
+            ValidatorExit, ValidatorRegistered, ValidatorRegisteredV2, Withdrawal,
         },
     },
     stake_table::{StateSignatureSol, sign_address_bls, sign_address_schnorr},
@@ -42,8 +44,6 @@ use rand::{CryptoRng, Rng, RngCore, SeedableRng, rngs::StdRng, seq::IteratorRand
 use staking_cli::demo::{DelegationConfig, StakingTransactions};
 use tide_disco::{Error as _, StatusCode, Url};
 use tokio::{task::spawn, time::sleep};
-
-use crate::types::common::NodeSetEntry;
 
 use super::*;
 
@@ -275,15 +275,16 @@ impl Iterator for EventGenerator {
             const DELEGATE: usize = 3;
             const UNDELEGATE: usize = 4;
             const WITHDRAWAL: usize = 5;
+            const KEY_UPDATE: usize = 6;
 
-            const MAX_STAKE_TABLE_EVENT_TYPE: usize = 6;
+            const MAX_STAKE_TABLE_EVENT_TYPE: usize = 7;
 
             // Other contract events that the UI service cares about but consensus does not.
-            const EXIT_ESCROW_PERIOD_UPDATED: usize = 6;
+            const EXIT_ESCROW_PERIOD_UPDATED: usize = 7;
 
-            const CLAIM_REWARDS: usize = 7;
+            const CLAIM_REWARDS: usize = 8;
 
-            const MAX_EVENT_TYPE: usize = 8;
+            const MAX_EVENT_TYPE: usize = 9;
 
             // Generate the code for a random event type.
             let max = if self.stake_table_only {
@@ -442,6 +443,32 @@ impl Iterator for EventGenerator {
                     };
 
                     StakeTableV2Events::Withdrawal(Withdrawal { account, amount }).into()
+                }
+
+                KEY_UPDATE => {
+                    let Some(&node) = self.nodes.iter().choose(&mut self.rng) else {
+                        continue;
+                    };
+
+                    let mut new_seed = [0u8; 32];
+                    self.rng.fill_bytes(&mut new_seed);
+                    let index = self.rng.next_u64();
+
+                    let new_bls_key = BLSKeyPair::generate(&mut StdRng::from_seed(new_seed));
+                    let new_schnorr_key = StateKeyPair::generate_from_seed_indexed(new_seed, index);
+
+                    let bls_sig: G1PointSol = sign_address_bls(&new_bls_key, node).into();
+                    let schnorr_sig: StateSignatureSol =
+                        sign_address_schnorr(&new_schnorr_key, node).into();
+
+                    StakeTableV2Events::ConsensusKeysUpdatedV2(ConsensusKeysUpdatedV2 {
+                        account: node,
+                        blsVK: new_bls_key.ver_key().into(),
+                        schnorrVK: new_schnorr_key.ver_key().into(),
+                        blsSig: bls_sig.into(),
+                        schnorrSig: schnorr_sig.into(),
+                    })
+                    .into()
                 }
 
                 CLAIM_REWARDS => {
@@ -780,7 +807,11 @@ impl ContractDeployment {
     }
 
     pub fn spawn_task(&self) -> BackgroundStakeTableOps {
-        BackgroundStakeTableOps::spawn(self.rpc_url.clone(), self.stake_table_addr)
+        BackgroundStakeTableOps::spawn(self.rpc_url.clone(), self.stake_table_addr, None)
+    }
+
+    pub fn spawn_task_with_interval(&self, interval: Duration) -> BackgroundStakeTableOps {
+        BackgroundStakeTableOps::spawn(self.rpc_url.clone(), self.stake_table_addr, Some(interval))
     }
 }
 
@@ -803,216 +834,330 @@ struct ValidatorInfo {
     delegators: Vec<DelegatorInfo>,
 }
 
-impl BackgroundStakeTableOps {
-    pub fn spawn(rpc_url: Url, stake_table_addr: Address) -> Self {
-        let task_handle = tokio::spawn(async move {
-            let mut validator_index = 0u64;
-            let mut registered_validators = Vec::<ValidatorInfo>::new();
-            let mut rng = StdRng::from_entropy();
+struct BackgroundTaskState {
+    rpc_url: Url,
+    stake_table_addr: Address,
+    validator_index: u64,
+    registered_validators: Vec<ValidatorInfo>,
+    pending_undelegations: HashSet<(Address, Address)>,
+    pending_exits: HashSet<(Address, Address)>,
+    delegator_providers: HashMap<Address, HttpProviderWithWallet>,
+    rng: StdRng,
+}
 
-            for i in 0u64.. {
-                let operation = rng.gen_range(0..4);
+impl BackgroundTaskState {
+    fn new(rpc_url: Url, stake_table_addr: Address) -> Self {
+        Self {
+            rpc_url,
+            stake_table_addr,
+            validator_index: 0,
+            registered_validators: Vec::new(),
+            pending_undelegations: HashSet::new(),
+            pending_exits: HashSet::new(),
+            delegator_providers: HashMap::new(),
+            rng: StdRng::from_entropy(),
+        }
+    }
 
-                match operation {
-                    0 => {
-                        let seed = [validator_index as u8; 32];
-                        let signer = build_signer(DEV_MNEMONIC, validator_index as u32);
-                        let bls_key = BLSKeyPair::generate(&mut StdRng::from_seed(seed));
-                        let schnorr_key =
-                            StateKeyPair::generate_from_seed_indexed(seed, validator_index);
+    async fn run(&mut self, operation: usize) {
+        match operation {
+            0 => self.register_validator().await,
+            1 => self.update_consensus_keys().await,
+            2 => self.undelegate().await,
+            3 => self.deregister_validator().await,
+            4 => self.withdrawal().await,
+            _ => unreachable!(),
+        }
+    }
 
-                        let provider = ProviderBuilder::new()
-                            .wallet(EthereumWallet::from(build_signer(DEV_MNEMONIC, 0)))
-                            .connect_http(rpc_url.clone());
+    async fn register_validator(&mut self) {
+        let seed = [self.validator_index as u8; 32];
+        let signer = build_signer(DEV_MNEMONIC, self.validator_index as u32);
+        let bls_key = BLSKeyPair::generate(&mut StdRng::from_seed(seed));
+        let schnorr_key = StateKeyPair::generate_from_seed_indexed(seed, self.validator_index);
 
-                        match StakingTransactions::create(
-                            rpc_url.clone(),
-                            &provider,
-                            stake_table_addr,
-                            vec![(signer.clone(), bls_key.clone(), schnorr_key.clone())],
-                            DelegationConfig::MultipleDelegators,
-                        )
-                        .await
-                        {
-                            Ok(mut staking_txns) => {
-                                let validator_provider =
-                                    staking_txns.provider(signer.address()).unwrap().clone();
+        let deployer = build_signer(DEV_MNEMONIC, 0);
+        let provider = ProviderBuilder::new()
+            .wallet(EthereumWallet::from(deployer.clone()))
+            .connect_http(self.rpc_url.clone());
 
-                                let delegator_infos: Vec<DelegatorInfo> = staking_txns
-                                    .delegations()
-                                    .iter()
-                                    .filter(|d| d.validator == signer.address())
-                                    .filter_map(|d| {
-                                        let provider = staking_txns.provider(d.from)?.clone();
+        match StakingTransactions::create(
+            self.rpc_url.clone(),
+            &provider,
+            self.stake_table_addr,
+            vec![(signer.clone(), bls_key.clone(), schnorr_key.clone())],
+            DelegationConfig::MultipleDelegators,
+        )
+        .await
+        {
+            Ok(mut staking_txns) => {
+                let validator_provider = staking_txns.provider(signer.address()).unwrap().clone();
 
-                                        Some(DelegatorInfo {
-                                            address: d.from,
-                                            provider,
-                                        })
-                                    })
-                                    .collect();
+                let delegator_infos: Vec<DelegatorInfo> = staking_txns
+                    .delegations()
+                    .iter()
+                    .filter(|d| d.validator == signer.address())
+                    .filter_map(|d| {
+                        let provider = staking_txns.provider(d.from)?.clone();
+                        Some(DelegatorInfo {
+                            address: d.from,
+                            provider,
+                        })
+                    })
+                    .collect();
 
-                                if staking_txns.apply_all().await.is_ok() {
-                                    println!(
-                                        "Background: Registered validator #{validator_index} with {} delegators",
-                                        delegator_infos.len(),
-                                    );
+                if staking_txns.apply_all().await.is_ok() {
+                    println!(
+                        "Background: Registered validator #{} with {} delegators",
+                        self.validator_index,
+                        delegator_infos.len(),
+                    );
 
-                                    registered_validators.push(ValidatorInfo {
-                                        index: validator_index,
-                                        address: signer.address(),
-                                        provider: validator_provider,
-                                        delegators: delegator_infos,
-                                    });
-                                }
-                            }
-                            Err(e) => {
-                                eprintln!(
-                                    "Background: Failed to create staking transactions for validator #{validator_index}: {e:?}"
-                                );
-                            }
-                        }
-                        validator_index += 1;
+                    for delegator_info in &delegator_infos {
+                        self.delegator_providers
+                            .insert(delegator_info.address, delegator_info.provider.clone());
                     }
 
-                    1 => {
-                        // Update consensus keys on a random registered validator
-                        if registered_validators.is_empty() {
-                            continue;
-                        }
-                        let idx = rng.gen_range(0..registered_validators.len());
-                        let validator = &registered_validators[idx];
-
-                        let seed = (validator.index * 10000 + i).to_le_bytes();
-                        let mut new_seed = [0u8; 32];
-                        new_seed[..8].copy_from_slice(&seed);
-
-                        let new_bls_key = BLSKeyPair::generate(&mut StdRng::from_seed(new_seed));
-                        let new_schnorr_key =
-                            StateKeyPair::generate_from_seed_indexed(new_seed, validator.index);
-
-                        let bls_sig: G1PointSol =
-                            sign_address_bls(&new_bls_key, validator.address).into();
-                        let schnorr_sig: StateSignatureSol =
-                            sign_address_schnorr(&new_schnorr_key, validator.address).into();
-
-                        match StakeTableV2::new(stake_table_addr, &validator.provider)
-                            .updateConsensusKeysV2(
-                                new_bls_key.ver_key().into(),
-                                new_schnorr_key.ver_key().into(),
-                                bls_sig.into(),
-                                schnorr_sig.into(),
-                            )
-                            .send()
-                            .await
-                        {
-                            Ok(pending) => match pending.get_receipt().await {
-                                Ok(receipt) => println!(
-                                    "Background: Updated keys for validator #{} (tx: {:?})",
-                                    validator.index, receipt.transaction_hash
-                                ),
-                                Err(e) => println!(
-                                    "Background: Failed to get receipt for validator #{}: {e:?}",
-                                    validator.index
-                                ),
-                            },
-                            Err(e) => println!(
-                                "Background: Failed to update keys for validator #{}: {e:?}",
-                                validator.index
-                            ),
-                        }
-                    }
-
-                    2 => {
-                        // Undelegate from a random delegator of a random validator
-                        if registered_validators.is_empty() {
-                            continue;
-                        }
-                        let val_idx = rng.gen_range(0..registered_validators.len());
-                        let validator = &registered_validators[val_idx];
-
-                        if !validator.delegators.is_empty() {
-                            let del_idx = rng.gen_range(0..validator.delegators.len());
-                            let delegator = &validator.delegators[del_idx];
-
-                            let provider = ProviderBuilder::new().connect_http(rpc_url.clone());
-                            let stake_table = StakeTableV2::new(stake_table_addr, &provider);
-
-                            if let Ok(delegated_amount) = stake_table
-                                .delegations(validator.address, delegator.address)
-                                .call()
-                                .await
-                                && delegated_amount > U256::ZERO
-                            {
-                                let undelegate_amount = delegated_amount / U256::from(2);
-
-                                match StakeTableV2::new(stake_table_addr, &delegator.provider)
-                                    .undelegate(validator.address, undelegate_amount)
-                                    .send()
-                                    .await
-                                {
-                                    Ok(pending) => match pending.get_receipt().await {
-                                        Ok(receipt) => println!(
-                                            "Background: Undelegated {} ESP from validator #{} by delegator {:?} (tx: {:?})",
-                                            undelegate_amount / U256::from(10).pow(U256::from(18)),
-                                            validator.index,
-                                            delegator.address,
-                                            receipt.transaction_hash
-                                        ),
-                                        Err(e) => println!(
-                                            "Background: Failed to get undelegate receipt for validator #{}: {e:?}",
-                                            validator.index
-                                        ),
-                                    },
-                                    Err(e) => println!(
-                                        "Background: Failed to undelegate from validator #{}: {e:?}",
-                                        validator.index
-                                    ),
-                                }
-                            }
-                        }
-                    }
-
-                    3 => {
-                        // Deregister a random validator
-                        if registered_validators.is_empty() {
-                            continue;
-                        }
-                        let idx = rng.gen_range(0..registered_validators.len());
-                        let validator = &registered_validators[idx];
-
-                        match StakeTableV2::new(stake_table_addr, &validator.provider)
-                            .deregisterValidator()
-                            .send()
-                            .await
-                        {
-                            Ok(pending) => match pending.get_receipt().await {
-                                Ok(_) => {
-                                    println!(
-                                        "Background: Validator #{} deregistered",
-                                        validator.index,
-                                    );
-
-                                    registered_validators.remove(idx);
-                                }
-                                Err(e) => println!(
-                                    "Background: Failed to get deregister receipt for validator #{}: {e:?}",
-                                    validator.index
-                                ),
-                            },
-                            Err(e) => {
-                                println!(
-                                    "Background: Failed to deregister validator #{}: {e:?}",
-                                    validator.index
-                                );
-                            }
-                        }
-                    }
-
-                    _ => unreachable!(),
+                    self.registered_validators.push(ValidatorInfo {
+                        index: self.validator_index,
+                        address: signer.address(),
+                        provider: validator_provider,
+                        delegators: delegator_infos,
+                    });
                 }
+            }
+            Err(e) => {
+                eprintln!(
+                    "Background: Failed to create staking transactions for validator #{}: {e:?}",
+                    self.validator_index
+                );
 
-                sleep(Duration::from_millis(200)).await;
+                let _ = provider
+                    .anvil_set_balance(
+                        provider.default_signer_address(),
+                        U256::from(100_000) * U256::from(10).pow(U256::from(18)),
+                    ) // 100k ETH)
+                    .await;
+            }
+        }
+        self.validator_index += 1;
+    }
+
+    async fn update_consensus_keys(&mut self) {
+        if self.registered_validators.is_empty() {
+            return;
+        }
+
+        let idx = self.rng.gen_range(0..self.registered_validators.len());
+        let validator = &self.registered_validators[idx];
+
+        let mut new_seed = [0u8; 32];
+        self.rng.fill_bytes(&mut new_seed);
+
+        let new_bls_key = BLSKeyPair::generate(&mut StdRng::from_seed(new_seed));
+        let new_schnorr_key = StateKeyPair::generate_from_seed_indexed(new_seed, validator.index);
+
+        let bls_sig: G1PointSol = sign_address_bls(&new_bls_key, validator.address).into();
+        let schnorr_sig: StateSignatureSol =
+            sign_address_schnorr(&new_schnorr_key, validator.address).into();
+
+        match StakeTableV2::new(self.stake_table_addr, &validator.provider)
+            .updateConsensusKeysV2(
+                new_bls_key.ver_key().into(),
+                new_schnorr_key.ver_key().into(),
+                bls_sig.into(),
+                schnorr_sig.into(),
+            )
+            .send()
+            .await
+        {
+            Ok(pending) => match pending.get_receipt().await {
+                Ok(receipt) => println!(
+                    "Background: Updated keys for validator #{} (tx: {:?})",
+                    validator.index, receipt.transaction_hash
+                ),
+                Err(e) => println!(
+                    "Background: Failed to get receipt for validator #{}: {e:?}",
+                    validator.index
+                ),
+            },
+            Err(e) => println!(
+                "Background: Failed to update keys for validator #{}: {e:?}",
+                validator.index
+            ),
+        }
+    }
+
+    async fn undelegate(&mut self) {
+        if self.registered_validators.is_empty() {
+            return;
+        }
+
+        let val_idx = self.rng.gen_range(0..self.registered_validators.len());
+        let validator = &self.registered_validators[val_idx];
+
+        if validator.delegators.is_empty() {
+            return;
+        }
+
+        let del_idx = self.rng.gen_range(0..validator.delegators.len());
+        let delegator = &validator.delegators[del_idx];
+        let key = (validator.address, delegator.address);
+
+        if self.pending_undelegations.contains(&key) {
+            return;
+        }
+
+        let provider = ProviderBuilder::new().connect_http(self.rpc_url.clone());
+        let stake_table = StakeTableV2::new(self.stake_table_addr, &provider);
+
+        if let Ok(delegated_amount) = stake_table
+            .delegations(validator.address, delegator.address)
+            .call()
+            .await
+            && delegated_amount > U256::ZERO
+        {
+            let undelegate_amount = delegated_amount / U256::from(2);
+
+            match StakeTableV2::new(self.stake_table_addr, &delegator.provider)
+                .undelegate(validator.address, undelegate_amount)
+                .send()
+                .await
+            {
+                Ok(pending_tx) => match pending_tx.get_receipt().await {
+                    Ok(receipt) => {
+                        println!(
+                            "Background: Undelegated {} ESP from validator #{} by delegator {:?} (tx: {:?})",
+                            undelegate_amount / U256::from(10).pow(U256::from(18)),
+                            validator.index,
+                            delegator.address,
+                            receipt.transaction_hash
+                        );
+                        self.pending_undelegations.insert(key);
+                    }
+                    Err(e) => println!(
+                        "Background: Failed to get undelegate receipt for validator #{}: {e:?}",
+                        validator.index
+                    ),
+                },
+                Err(e) => println!(
+                    "Background: Failed to undelegate from validator #{}: {e:?}",
+                    validator.index
+                ),
+            }
+        }
+    }
+
+    async fn deregister_validator(&mut self) {
+        if self.registered_validators.is_empty() {
+            return;
+        }
+
+        let idx = self.rng.gen_range(0..self.registered_validators.len());
+        let validator = &self.registered_validators[idx];
+
+        match StakeTableV2::new(self.stake_table_addr, &validator.provider)
+            .deregisterValidator()
+            .send()
+            .await
+        {
+            Ok(pending) => match pending.get_receipt().await {
+                Ok(_) => {
+                    println!("Background: Validator #{} deregistered", validator.index);
+
+                    for delegator in &validator.delegators {
+                        let key = (validator.address, delegator.address);
+                        self.pending_exits.insert(key);
+                    }
+
+                    self.registered_validators.remove(idx);
+                }
+                Err(e) => println!(
+                    "Background: Failed to get deregister receipt for validator #{}: {e:?}",
+                    validator.index
+                ),
+            },
+            Err(e) => {
+                println!(
+                    "Background: Failed to deregister validator #{}: {e:?}",
+                    validator.index
+                );
+            }
+        }
+    }
+
+    async fn withdrawal(&mut self) {
+        let total_pending = self.pending_undelegations.len() + self.pending_exits.len();
+        if total_pending == 0 {
+            return;
+        }
+
+        let idx = self.rng.gen_range(0..total_pending);
+        let (key, is_exit) = if idx < self.pending_undelegations.len() {
+            (*self.pending_undelegations.iter().nth(idx).unwrap(), false)
+        } else {
+            (
+                *self
+                    .pending_exits
+                    .iter()
+                    .nth(idx - self.pending_undelegations.len())
+                    .unwrap(),
+                true,
+            )
+        };
+
+        let (validator_addr, delegator_addr) = key;
+
+        if let Some(provider) = self.delegator_providers.get(&delegator_addr) {
+            let result = if is_exit {
+                StakeTableV2::new(self.stake_table_addr, &provider)
+                    .claimValidatorExit(validator_addr)
+                    .send()
+                    .await
+            } else {
+                StakeTableV2::new(self.stake_table_addr, &provider)
+                    .claimWithdrawal(validator_addr)
+                    .send()
+                    .await
+            };
+
+            match result {
+                Ok(pending_tx) => match pending_tx.get_receipt().await {
+                    Ok(receipt) => {
+                        println!(
+                            "Background: Withdrawal from {:?} (tx: {:?})",
+                            validator_addr, receipt.transaction_hash
+                        );
+                        if is_exit {
+                            self.pending_exits.remove(&key);
+                        } else {
+                            self.pending_undelegations.remove(&key);
+                        }
+                    }
+                    Err(e) => println!("Background: Failed to get withdrawal receipt: {e:?}"),
+                },
+                Err(e) => {
+                    // if exit escrow period is not over
+                    if !e.to_string().contains("0x5a774357") {
+                        println!("Background: Withdrawal failed: {e:?}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl BackgroundStakeTableOps {
+    pub fn spawn(rpc_url: Url, stake_table_addr: Address, interval: Option<Duration>) -> Self {
+        let interval = interval.unwrap_or(Duration::from_millis(500));
+
+        let task_handle = tokio::spawn(async move {
+            let mut state = BackgroundTaskState::new(rpc_url, stake_table_addr);
+
+            loop {
+                let event = state.rng.gen_range(0..5);
+                state.run(event).await;
+                sleep(interval).await;
             }
         });
 
@@ -1021,7 +1166,6 @@ impl BackgroundStakeTableOps {
         }
     }
 }
-
 impl Drop for BackgroundStakeTableOps {
     fn drop(&mut self) {
         if let Some(handle) = self.task_handle.take() {

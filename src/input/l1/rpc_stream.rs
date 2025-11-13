@@ -1190,22 +1190,25 @@ mod tests {
                 .unwrap(),
         ));
 
-        let background_task = deployment.spawn_task();
+        let background_task = deployment.spawn_task_with_interval(Duration::from_millis(100));
 
         // Subscribe to the stream in a background task
         let state_clone = state.clone();
         let subscription_task =
             tokio::spawn(async move { State::subscribe(state_clone, stream).await });
 
-        let target_blocks = 200;
+        let target_blocks = 1200;
         let genesis_block_number = genesis_block.number();
 
         loop {
             sleep(Duration::from_secs(1)).await;
             let current_state = state.read().await;
             let current_block = current_state.latest_l1_block().number;
+            let blocks_processed = current_block - genesis_block_number;
 
-            if current_block >= genesis_block_number + target_blocks {
+            println!("Processed {blocks_processed} / {target_blocks} blocks");
+
+            if blocks_processed >= target_blocks {
                 println!("Reached target block: {current_block}");
                 break;
             }
@@ -1316,7 +1319,6 @@ mod tests {
 
             // Verify wallets
             for (delegator_address, delegated_amount) in &l1_validator.delegators {
-                println!("addr={delegator_address}, amount={delegated_amount}");
                 match state_from_subscription
                     .wallet(*delegator_address, subscription_latest_block.hash)
                 {
