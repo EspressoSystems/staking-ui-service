@@ -615,7 +615,7 @@ impl Snapshot {
                     let diff = FullNodeSetDiff::NodeUpdate(NodeSetEntry {
                         address: ev.account,
                         staking_key: PubKey::from(ev.blsVK).into(),
-                        state_key: node.state_key.clone(),
+                        state_key: StateVerKey::from(ev.schnorrVK).into(),
                         stake: node.stake,
                         commission: node.commission,
                     });
@@ -637,7 +637,7 @@ impl Snapshot {
                     let diff = FullNodeSetDiff::NodeUpdate(NodeSetEntry {
                         address: ev.account,
                         staking_key: PubKey::from(ev.blsVK).into(),
-                        state_key: node.state_key.clone(),
+                        state_key: StateVerKey::from(ev.schnorrVK).into(),
                         stake: node.stake,
                         commission: node.commission,
                     });
