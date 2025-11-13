@@ -16,7 +16,7 @@ lint *args:
     cargo clippy --all-targets {{args}} -- -D warnings
 
 build profile="dev" *args:
-    cargo build --profile {{profile}} {{args}}
+    cargo build --profile  {{profile}} --features testing {{args}}
 
 run-profile profile *args:
     #!/usr/bin/env bash
@@ -27,13 +27,14 @@ run-profile profile *args:
         rm -r "$storage"
     }
     trap cleanup EXIT
-    cargo run --profile {{profile}} -- --path "${storage}" {{args}}
+    cargo run --profile {{profile}} --features testing -- --path "${storage}" {{args}}
 
 run-decaf:
     just run \
         --stake-table-address 0x40304fbe94d5e7d1492dd90c53a2d63e8506a037 \
         --reward-contract-address 0x0000000000000000000000000000000000000000 \
-        --http-providers "${SEPOLIA_RPC_URL:-https://ethereum-sepolia.publicnode.com}"
+        --http-providers "${SEPOLIA_RPC_URL:-https://ethereum-sepolia.publicnode.com}" \
+        --espresso-url https://cache.decaf.testnet.espresso.network/v1/
 
 run-local: build
     #!/usr/bin/env bash
@@ -46,7 +47,8 @@ run-local: build
         --stake-table-address 0xefdc2a236dba7a8f60726b49abc79ee6b22ed445 \
         --reward-contract-address 0x0000000000000000000000000000000000000000 \
         --http-providers http://localhost:8545 \
-        --l1-ws-provider ws://localhost:8546
+        --l1-ws-provider ws://localhost:8546 \
+        --espresso-url http://localhost:24000/v1
 
 run *args: (run-profile "dev" args)
 
