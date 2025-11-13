@@ -1197,7 +1197,7 @@ mod tests {
         let subscription_task =
             tokio::spawn(async move { State::subscribe(state_clone, stream).await });
 
-        let target_blocks = 1200;
+        let target_blocks = 400;
         let genesis_block_number = genesis_block.number();
 
         loop {

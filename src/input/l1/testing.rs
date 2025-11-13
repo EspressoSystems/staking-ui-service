@@ -670,7 +670,7 @@ impl Default for DeploymentConfig {
             deployer_index: 0,
             blocks_per_epoch: 100,
             epoch_start_block: 1,
-            exit_escrow_period_secs: 250,
+            exit_escrow_period_secs: 90,
             token_name: "Espresso".to_string(),
             token_symbol: "ESP".to_string(),
             initial_token_supply: 3_590_000_000,
