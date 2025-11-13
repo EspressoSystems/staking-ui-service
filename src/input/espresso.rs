@@ -78,8 +78,9 @@ pub struct State<S, C> {
 
 impl<S: EspressoPersistence, C: EspressoClient> State<S, C> {
     pub async fn new(storage: S, espresso: C) -> Result<Self> {
+        let current_epoch = espresso.wait_for_epochs().await;
+
         // Fetch the current epoch state.
-        let current_epoch = espresso.current_epoch().await?;
         let epoch_height = espresso.epoch_height().await?;
         let epoch = EpochState::download(&espresso, epoch_height, current_epoch)
             .await
@@ -542,8 +543,10 @@ impl ActiveNode {
 
 /// Interface for querying data from Espresso.
 pub trait EspressoClient: Clone {
-    /// Get the number of the epoch that Espresso is currently in.
-    fn current_epoch(&self) -> impl Send + Future<Output = Result<u64>>;
+    /// Wait until epochs begin, in case the service is started before the POS upgrade.
+    ///
+    /// Eventually resolves with the current epoch number.
+    fn wait_for_epochs(&self) -> impl Send + Future<Output = u64>;
 
     /// Get the configured epoch height, in blocks.
     fn epoch_height(&self) -> impl Send + Future<Output = Result<u64>>;

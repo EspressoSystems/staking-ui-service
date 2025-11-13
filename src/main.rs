@@ -6,7 +6,14 @@ use futures::{FutureExt, future::try_join_all};
 use log_panics::BacktraceMode;
 use staking_ui_service::{
     Result, app,
-    input::l1::{self, RpcCatchup, RpcStream, Snapshot, options::L1ClientOptions},
+    input::{
+        espresso::{
+            self,
+            client::{QueryServiceClient, QueryServiceOptions},
+            testing::MemoryStorage,
+        },
+        l1::{self, RpcCatchup, RpcStream, Snapshot, options::L1ClientOptions},
+    },
     persistence::sql,
 };
 use tokio::time::sleep;
@@ -37,6 +44,10 @@ struct Options {
     #[clap(flatten)]
     l1_options: L1ClientOptions,
 
+    /// Espresso client options.
+    #[clap(flatten)]
+    espresso_options: QueryServiceOptions,
+
     /// Persistence options.
     #[clap(flatten)]
     persistence: sql::PersistenceOptions,
@@ -60,7 +71,11 @@ impl Options {
         self.init_logging();
 
         // Get genesis state.
-        let l1_provider = self.l1_options.provider()?.0;
+        let l1_provider = self
+            .l1_options
+            .provider()
+            .map_err(|err| err.context("creating L1 provider"))?
+            .0;
         let genesis_block = loop {
             // We can fail to load the genesis block for various reasons, e.g. the stake table
             // contract is not deployed yet, or the initialization block has not finalized. These
@@ -83,24 +98,44 @@ impl Options {
         tracing::info!(?genesis_block, "loaded L1 genesis");
         let genesis = Snapshot::empty(genesis_block);
 
+        // Connect to L1.
         let l1_catchup = RpcCatchup::new(&self.l1_options)?;
-        let l1_input = RpcStream::new(self.l1_options).await?;
-        let storage = sql::Persistence::new(&self.persistence).await?;
+        let l1_input = RpcStream::new(self.l1_options)
+            .await
+            .map_err(|err| err.context("opening L1 RPC stream"))?;
+        let l1_storage = sql::Persistence::new(&self.persistence)
+            .await
+            .map_err(|err| err.context("opening L1 storage"))?;
+
+        // Connect to Espresso.
+        let espresso_input = QueryServiceClient::new(self.espresso_options)
+            .await
+            .map_err(|err| err.context("connecting to Espresso query service"))?;
+        // TODO use real persistence.
+        let espresso_storage = MemoryStorage::default();
 
         // Create server state.
         let l1 = Arc::new(RwLock::new(
-            l1::State::new(storage, genesis, &l1_catchup).await?,
+            l1::State::new(l1_storage, genesis, &l1_catchup)
+                .await
+                .map_err(|err| err.context("initializing L1 state"))?,
         ));
-        let app = app::State::new(l1.clone());
+        let espresso = Arc::new(RwLock::new(
+            espresso::State::new(espresso_storage, espresso_input)
+                .await
+                .map_err(|err| err.context("initializing Espresso state"))?,
+        ));
+        let app = app::State::new(l1.clone(), espresso.clone());
 
         // Create tasks that will run in parallel.
         let l1_task = l1::State::subscribe(l1, l1_input);
+        let espresso_task = espresso::State::update_task(espresso);
         let http_task = app.serve(self.port);
 
         // Run all tasks. Terminate if any background task fails (they should all run forever, but
         // if one does fail it is better to loudly crash than to continue running in some weird
         // state).
-        try_join_all([l1_task.boxed(), http_task.boxed()]).await?;
+        try_join_all([l1_task.boxed(), espresso_task.boxed(), http_task.boxed()]).await?;
         Ok(())
     }
 
@@ -153,6 +188,7 @@ mod test {
 
     use alloy::node_bindings::Anvil;
     use portpicker::pick_unused_port;
+    use staking_ui_service::input::espresso::testing::start_pos_network;
     use staking_ui_service::types::common::L1BlockId;
     use staking_ui_service::{Error, input::l1::testing::ContractDeployment};
     use surf_disco::Client;
@@ -167,18 +203,23 @@ mod test {
         let port = pick_unused_port().unwrap();
         let tmp = tempdir().unwrap();
         let anvil = Anvil::new().block_time(1).spawn();
-        let deployment = ContractDeployment::deploy(anvil.endpoint_url())
-            .await
-            .unwrap();
+        let l1_http = anvil.endpoint_url();
+        let l1_ws = anvil.ws_endpoint_url();
+        let deployment = ContractDeployment::deploy(l1_http.clone()).await.unwrap();
+
+        let espresso_port = pick_unused_port().unwrap();
+        let (mut network, _storage) = start_pos_network(espresso_port).await;
+        let espresso_url = format!("http://localhost:{espresso_port}").parse().unwrap();
 
         let opt = Options {
             l1_options: L1ClientOptions {
-                http_providers: vec![anvil.endpoint_url()],
-                l1_ws_provider: Some(vec![anvil.ws_endpoint_url()]),
+                http_providers: vec![l1_http],
+                l1_ws_provider: Some(vec![l1_ws]),
                 stake_table_address: deployment.stake_table_addr,
                 reward_contract_address: deployment.reward_claim_addr,
                 ..Default::default()
             },
+            espresso_options: QueryServiceOptions::new(espresso_url),
             port,
             persistence: sql::PersistenceOptions {
                 path: tmp.path().join("temp.db"),
@@ -187,7 +228,9 @@ mod test {
             log_format: Some(LogFormat::Json),
         };
 
-        let task = spawn(opt.run());
+        let task = spawn(async move {
+            opt.run().await.unwrap();
+        });
 
         let client: Client<Error, StaticVersion<0, 1>> =
             Client::new(format!("http://localhost:{port}").parse().unwrap());
@@ -217,5 +260,7 @@ mod test {
 
         task.abort();
         let _ = task.await;
+
+        network.stop_consensus().await;
     }
 }
