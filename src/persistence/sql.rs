@@ -3,9 +3,7 @@ use crate::{
     Result,
     input::l1::{L1BlockSnapshot, L1Persistence, NodeSet, Snapshot, Wallet, Wallets},
     types::{
-        common::{
-            Address, Delegation, L1BlockId, NodeSetEntry, PendingWithdrawal, Ratio, WithdrawalType,
-        },
+        common::{Address, Delegation, L1BlockId, NodeSetEntry, PendingWithdrawal, Ratio},
         global::FullNodeSetDiff,
         wallet::WalletDiff,
     },
@@ -158,18 +156,19 @@ impl Persistence {
                         .fetch_all(&pool)
                         .await?;
 
-                        let mut nodes = im::Vector::new();
+                        let mut nodes = im::OrdMap::new();
                         for (node_str, amount_str) in delegation_rows {
                             let node: Address =
                                 node_str.parse().context("failed to parse node address")?;
                             let amount = U256::from_str(&amount_str)
                                 .context("failed to parse delegation amount")?;
                             if !amount.is_zero() {
-                                nodes.push_back(Delegation {
+                                let delegation = Delegation {
                                     delegator: address,
                                     node,
                                     amount,
-                                });
+                                };
+                                nodes.insert(node, delegation);
                             }
                         }
 
@@ -177,15 +176,14 @@ impl Persistence {
                         let pending_rows = sqlx::query_as::<_, (String, String, String, i64)>(
                             "SELECT node, withdrawal_type, amount, unlocks_at
                              FROM pending_withdrawals
-                             WHERE delegator = $1
-                             ORDER BY unlocks_at ASC",
+                             WHERE delegator = $1",
                         )
                         .bind(&wallet_address)
                         .fetch_all(&pool)
                         .await?;
 
-                        let mut pending_undelegations = im::Vector::new();
-                        let mut pending_exits = im::Vector::new();
+                        let mut pending_undelegations = im::OrdMap::new();
+                        let mut pending_exits = im::OrdMap::new();
 
                         for (node_str, withdrawal_type_str, amount_str, available_time) in
                             pending_rows
@@ -205,9 +203,11 @@ impl Persistence {
 
                             match withdrawal_type {
                                 WithdrawalType::Undelegation => {
-                                    pending_undelegations.push_back(withdrawal)
+                                    pending_undelegations.insert(node, withdrawal);
                                 }
-                                WithdrawalType::Exit => pending_exits.push_back(withdrawal),
+                                WithdrawalType::Exit => {
+                                    pending_exits.insert(node, withdrawal);
+                                }
                             }
                         }
 
@@ -378,25 +378,6 @@ impl Persistence {
                 .fetch_one(&mut **tx)
                 .await?;
 
-                // Sanity check: ensure there's no pending undelegation already
-                let pending_exists = sqlx::query_scalar::<_, bool>(
-                    "SELECT EXISTS(SELECT 1 FROM pending_withdrawals
-                     WHERE delegator = $1 AND node = $2 AND withdrawal_type = 'undelegation')",
-                )
-                .bind(withdrawal.delegator.to_string())
-                .bind(withdrawal.node.to_string())
-                .fetch_one(&mut **tx)
-                .await?;
-
-                if pending_exists {
-                    return Err(anyhow::anyhow!(
-                        "pending undelegation already exists for delegator {} to node {}",
-                        withdrawal.delegator,
-                        withdrawal.node
-                    ))
-                    .map_err(Into::into);
-                }
-
                 let current_amount = U256::from_str(&amount).unwrap_or(U256::ZERO);
                 let new_amount = current_amount.checked_sub(withdrawal.amount).ok_or_else(
                     || {
@@ -447,6 +428,7 @@ impl Persistence {
                 }
 
                 // Insert pending undelegation
+                // we expect this to fail if there's already a pending undelegation
                 sqlx::query(
                     "INSERT INTO pending_withdrawals (delegator, node, withdrawal_type, amount, unlocks_at)
                      VALUES ($1, $2, $3, $4, $5)",
@@ -479,12 +461,10 @@ impl Persistence {
                 }
 
                 // Insert pending exit with the amount from the withdrawal
+                // we expect this to fail if there is already a pending exit
                 sqlx::query(
                     "INSERT INTO pending_withdrawals (delegator, node, withdrawal_type, amount, unlocks_at)
-                     VALUES ($1, $2, $3, $4, $5)
-                     ON CONFLICT(delegator, node, withdrawal_type) DO UPDATE SET
-                         amount = excluded.amount,
-                         unlocks_at = excluded.unlocks_at",
+                     VALUES ($1, $2, $3, $4, $5)",
                 )
                 .bind(withdrawal.delegator.to_string())
                 .bind(withdrawal.node.to_string())
@@ -534,6 +514,36 @@ impl Persistence {
             }
         }
         Ok(())
+    }
+}
+
+/// Type of pending withdrawal
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum WithdrawalType {
+    /// Withdrawal due to pending undelegation
+    Undelegation,
+    /// Full withdrawal due to validator exit
+    Exit,
+}
+
+impl TryFrom<String> for WithdrawalType {
+    type Error = anyhow::Error;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        match value.as_str() {
+            "undelegation" => Ok(WithdrawalType::Undelegation),
+            "exit" => Ok(WithdrawalType::Exit),
+            _ => Err(anyhow::anyhow!("Unknown withdrawal type: {value}")),
+        }
+    }
+}
+
+impl From<WithdrawalType> for String {
+    fn from(val: WithdrawalType) -> Self {
+        match val {
+            WithdrawalType::Undelegation => "undelegation".to_string(),
+            WithdrawalType::Exit => "exit".to_string(),
+        }
     }
 }
 
@@ -776,11 +786,7 @@ mod tests {
         // Verify delegator1 after block 100
         let wallet1_block100 = snapshot_after_block_100.wallets.get(&delegator1).unwrap();
         assert_eq!(wallet1_block100.nodes.len(), 2);
-        let node1_del = wallet1_block100
-            .nodes
-            .iter()
-            .find(|d| d.node == node1.address)
-            .unwrap();
+        let node1_del = wallet1_block100.nodes.get(&node1.address).unwrap();
         assert_eq!(node1_del.amount, U256::from(5000000u64));
         assert_eq!(wallet1_block100.pending_undelegations.len(), 0);
         assert_eq!(wallet1_block100.claimed_rewards, U256::from(500u64));
@@ -860,8 +866,7 @@ mod tests {
         // Delegator1 had 6M, undelegated 1M
         let node1_delegation = loaded_wallet1
             .nodes
-            .iter()
-            .find(|d| d.node == node1.address)
+            .get(&node1.address)
             .expect("should have delegation to node1");
         assert_eq!(node1_delegation.amount, U256::from(5000000u64));
 
@@ -876,16 +881,19 @@ mod tests {
         // Check node1 still has remaining delegation after undelegation
         let node1_delegation = loaded_wallet2
             .nodes
-            .iter()
-            .find(|d| d.node == node1.address)
+            .get(&node1.address)
             .expect("should have remaining delegation to node1");
         assert_eq!(node1_delegation.amount, U256::from(500000u64));
 
-        assert!(loaded_wallet2.nodes.iter().any(|d| d.node == node2.address));
-        assert!(loaded_wallet2.nodes.iter().any(|d| d.node == node3.address));
+        assert!(loaded_wallet2.nodes.contains_key(&node2.address));
+        assert!(loaded_wallet2.nodes.contains_key(&node3.address));
         assert_eq!(loaded_wallet2.pending_undelegations.len(), 1);
         assert_eq!(
-            loaded_wallet2.pending_undelegations[0].amount,
+            loaded_wallet2
+                .pending_undelegations
+                .get(&node1.address)
+                .unwrap()
+                .amount,
             U256::from(500000u64)
         );
         assert_eq!(loaded_wallet2.pending_exits.len(), 0);
@@ -896,12 +904,10 @@ mod tests {
         assert_eq!(loaded_wallet3.nodes.len(), 0);
         assert_eq!(loaded_wallet3.pending_undelegations.len(), 0);
         assert_eq!(loaded_wallet3.pending_exits.len(), 1);
-        assert_eq!(loaded_wallet3.pending_exits[0].node, node4.address);
-        assert_eq!(
-            loaded_wallet3.pending_exits[0].amount,
-            U256::from(8000000u64)
-        );
-        assert_eq!(loaded_wallet3.pending_exits[0].available_time, 1500);
+        let node4_exit = loaded_wallet3.pending_exits.get(&node4.address).unwrap();
+        assert_eq!(node4_exit.node, node4.address);
+        assert_eq!(node4_exit.amount, U256::from(8000000u64));
+        assert_eq!(node4_exit.available_time, 1500);
         assert_eq!(loaded_wallet3.claimed_rewards, U256::ZERO);
 
         // Block 102: Register node5, node2 exits, withdrawals and claim rewards
@@ -1037,43 +1043,61 @@ mod tests {
             .expect("wallet1 should exist");
         assert_eq!(wallet1.claimed_rewards, U256::from(2000u64));
         assert_eq!(wallet1.nodes.len(), 1);
-        assert_eq!(wallet1.nodes[0].node, node1.address);
-        assert_eq!(wallet1.nodes[0].amount, U256::from(4000000u64));
+        let node1_delegation = wallet1
+            .nodes
+            .get(&node1.address)
+            .expect("should have delegation to node1");
+        assert_eq!(node1_delegation.node, node1.address);
+        assert_eq!(node1_delegation.amount, U256::from(4000000u64));
         assert_eq!(wallet1.pending_undelegations.len(), 1);
         assert_eq!(
-            wallet1.pending_undelegations[0].amount,
+            wallet1
+                .pending_undelegations
+                .get(&node1.address)
+                .unwrap()
+                .amount,
             U256::from(1000000u64)
         );
         assert_eq!(wallet1.pending_exits.len(), 1);
-        assert_eq!(wallet1.pending_exits[0].node, node2.address);
-        assert_eq!(wallet1.pending_exits[0].amount, U256::from(3000000u64));
+        assert_eq!(
+            wallet1.pending_exits.get(&node2.address).unwrap().node,
+            node2.address
+        );
+        assert_eq!(
+            wallet1.pending_exits.get(&node2.address).unwrap().amount,
+            U256::from(3000000u64)
+        );
 
         let wallet2 = loaded_snapshot
             .wallets
             .get(&delegator2)
             .expect("wallet2 should exist");
         assert_eq!(wallet2.claimed_rewards, U256::from(750u64)); // Claimed in block 102
-        assert_eq!(wallet2.nodes.len(), 2); // node1  and node3 
+        assert_eq!(wallet2.nodes.len(), 2); // node1  and node3
 
         let node1_delegation = wallet2
             .nodes
-            .iter()
-            .find(|d| d.node == node1.address)
+            .get(&node1.address)
             .expect("should still have delegation to node1");
         assert_eq!(node1_delegation.amount, U256::from(500000u64));
 
         let node3_delegation = wallet2
             .nodes
-            .iter()
-            .find(|d| d.node == node3.address)
+            .get(&node3.address)
             .expect("should have delegation to node3");
         assert_eq!(node3_delegation.amount, U256::from(2000000u64));
 
         assert_eq!(wallet2.pending_undelegations.len(), 0);
 
         assert_eq!(wallet2.pending_exits.len(), 1);
-        assert_eq!(wallet2.pending_exits[0].node, node2.address);
-        assert_eq!(wallet2.pending_exits[0].amount, U256::from(10000000u64));
+        assert_eq!(
+            wallet2.pending_exits.get(&node2.address).unwrap().node,
+            node2.address
+        );
+        assert_eq!(
+            wallet2.pending_exits.get(&node2.address).unwrap().amount,
+            U256::from(10000000u64)
+        );
 
         let wallet3 = loaded_snapshot
             .wallets
@@ -1083,8 +1107,7 @@ mod tests {
         assert_eq!(wallet3.nodes.len(), 1); // Only node5 delegation remains
         let node5_delegation = wallet3
             .nodes
-            .iter()
-            .find(|d| d.node == node5.address)
+            .get(&node5.address)
             .expect("should have delegation to node5");
         assert_eq!(node5_delegation.amount, U256::from(15000000u64));
         assert_eq!(wallet3.pending_undelegations.len(), 0);

@@ -589,20 +589,16 @@ impl Snapshot {
                     let wallet_diffs = self
                         .wallets
                         .iter()
-                        .flat_map(|(wallet_address, wallet)| {
-                            wallet
-                                .nodes
-                                .iter()
-                                .filter(|delegation| delegation.node == ev.validator)
-                                .map(move |delegation| {
-                                    let pending_exit = PendingWithdrawal {
-                                        delegator: *wallet_address,
-                                        node: ev.validator,
-                                        amount: delegation.amount,
-                                        available_time: exit_time,
-                                    };
-                                    (*wallet_address, WalletDiff::NodeExited(pending_exit))
-                                })
+                        .filter_map(|(wallet_address, wallet)| {
+                            wallet.nodes.get(&ev.validator).map(|delegation| {
+                                let pending_exit = PendingWithdrawal {
+                                    delegator: *wallet_address,
+                                    node: ev.validator,
+                                    amount: delegation.amount,
+                                    available_time: exit_time,
+                                };
+                                (*wallet_address, WalletDiff::NodeExited(pending_exit))
+                            })
                         })
                         .collect::<Vec<_>>();
 
@@ -729,10 +725,10 @@ impl Snapshot {
                     // TODO:
                     // handle multiple undelegations of same amount
                     // from different nodes
-                    if let Some(pending) = wallet
+                    if let Some((_, pending)) = wallet
                         .pending_undelegations
                         .iter()
-                        .find(|p| p.delegator == ev.account && p.amount == ev.amount)
+                        .find(|(_, p)| p.delegator == ev.account && p.amount == ev.amount)
                     {
                         let withdrawal = Withdrawal {
                             delegator: ev.account,
@@ -743,10 +739,10 @@ impl Snapshot {
                         return (vec![], vec![(ev.account, wallet_diff)]);
                     }
 
-                    if let Some(pending) = wallet
+                    if let Some((_, pending)) = wallet
                         .pending_exits
                         .iter()
-                        .find(|p| p.delegator == ev.account && p.amount == ev.amount)
+                        .find(|(_, p)| p.delegator == ev.account && p.amount == ev.amount)
                     {
                         let withdrawal = Withdrawal {
                             delegator: ev.account,
@@ -819,13 +815,13 @@ impl Wallets {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Wallet {
     /// Nodes that this user is delegating to.
-    pub nodes: im::Vector<Delegation>,
+    pub nodes: im::OrdMap<Address, Delegation>,
 
     /// Stake that has been undelegated but not yet withdrawn.
-    pub pending_undelegations: im::Vector<PendingWithdrawal>,
+    pub pending_undelegations: im::OrdMap<Address, PendingWithdrawal>,
 
     /// Stake previously delegated to nodes that have exited.
-    pub pending_exits: im::Vector<PendingWithdrawal>,
+    pub pending_exits: im::OrdMap<Address, PendingWithdrawal>,
 
     /// Total amount of rewards ever claimed from the contract.
     pub claimed_rewards: ESPTokenAmount,
@@ -835,9 +831,21 @@ impl Wallet {
     /// Convert this wallet into the public API representation of a wallet snapshot.
     pub fn into_snapshot(self, l1_block: L1BlockInfo) -> WalletSnapshot {
         WalletSnapshot {
-            nodes: self.nodes.into_iter().collect(),
-            pending_undelegations: self.pending_undelegations.into_iter().collect(),
-            pending_exits: self.pending_exits.into_iter().collect(),
+            nodes: self
+                .nodes
+                .into_iter()
+                .map(|(_, delegation)| delegation)
+                .collect(),
+            pending_undelegations: self
+                .pending_undelegations
+                .into_iter()
+                .map(|(_, withdrawal)| withdrawal)
+                .collect(),
+            pending_exits: self
+                .pending_exits
+                .into_iter()
+                .map(|(_, withdrawal)| withdrawal)
+                .collect(),
             claimed_rewards: self.claimed_rewards,
             l1_block,
         }
@@ -850,75 +858,64 @@ impl Wallet {
                 self.claimed_rewards += *amount;
             }
             WalletDiff::DelegatedToNode(delegation) => {
-                if let Some(existing) = self.nodes.iter_mut().find(|d| d.node == delegation.node) {
-                    // Update existing delegation amount
-                    existing.amount += delegation.amount;
-                } else {
-                    // Add new delegation to this node
-                    self.nodes.push_back(*delegation);
-                }
+                self.nodes
+                    .entry(delegation.node)
+                    .and_modify(|d| {
+                        // Update existing delegation amount
+                        d.amount += delegation.amount;
+                    })
+                    .or_insert(*delegation);
             }
             WalletDiff::UndelegatedFromNode(pending) => {
                 let node = pending.node;
-                let idx = self
-                    .nodes
-                    .iter()
-                    .position(|d| d.node == pending.node)
-                    .unwrap_or_else(|| {
-                        panic!("attempted to undelegate from node {node} with no delegation")
-                    });
-                let delegation = &mut self.nodes[idx];
+                let delegation = self.nodes.get_mut(&pending.node).unwrap_or_else(|| {
+                    panic!("attempted to undelegate from node {node} with no delegation")
+                });
+
                 // Reduce the delegation by the undelegated amount
                 delegation.amount -= pending.amount;
 
                 // If the delegation is now zero, remove it
                 if delegation.amount.is_zero() {
-                    self.nodes.remove(idx);
+                    self.nodes.remove(&pending.node);
                 }
                 // Add to pending undelegations
-                self.pending_undelegations.push_back(*pending);
+                if self
+                    .pending_undelegations
+                    .insert(pending.node, *pending)
+                    .is_some()
+                {
+                    panic!("attempted to add duplicate pending undelegation for node {node}");
+                }
             }
             WalletDiff::NodeExited(pending) => {
                 // Remove delegation to the exited node
                 let node = pending.node;
-                let idx = self
-                    .nodes
-                    .iter()
-                    .position(|d| d.node == pending.node)
-                    .unwrap_or_else(|| {
-                        panic!("attempted to process exit for node {node} with no delegation")
-                    });
-                self.nodes.remove(idx);
+                if self.nodes.remove(&pending.node).is_none() {
+                    panic!("attempted to process exit for node {node} with no delegation");
+                }
                 // Add to pending exits
-                self.pending_exits.push_back(*pending);
+                self.pending_exits.insert(pending.node, *pending);
             }
             WalletDiff::UndelegationWithdrawal(withdrawal) => {
                 // Remove from pending undelegations
                 let node = withdrawal.node;
                 let amount = withdrawal.amount;
-                let idx = self
+                if self
                     .pending_undelegations
-                    .iter()
-                    .position(|p| p.node == withdrawal.node && p.amount == withdrawal.amount)
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "attempted to withdraw undelegation from node {node} amount: {amount}"
-                        )
-                    });
-                self.pending_undelegations.remove(idx);
+                    .remove(&withdrawal.node)
+                    .is_none()
+                {
+                    panic!("attempted to withdraw undelegation from node {node} amount: {amount}");
+                }
             }
             WalletDiff::NodeExitWithdrawal(withdrawal) => {
                 // Remove from pending exits
                 let node = withdrawal.node;
                 let amount = withdrawal.amount;
-                let idx = self
-                    .pending_exits
-                    .iter()
-                    .position(|p| p.node == withdrawal.node && p.amount == withdrawal.amount)
-                    .unwrap_or_else(|| {
-                        panic!("attempted to withdraw node exit from node {node} amount: {amount}")
-                    });
-                self.pending_exits.remove(idx);
+                if self.pending_exits.remove(&withdrawal.node).is_none() {
+                    panic!("attempted to withdraw node exit from node {node} amount: {amount}");
+                }
             }
         }
     }
@@ -1205,13 +1202,16 @@ mod test {
         finalized.wallets_update = None;
 
         let address = Address::random();
+        let node_address = Address::random();
         let delegation = Delegation {
             delegator: address,
-            node: Address::random(),
+            node: node_address,
             amount: Default::default(),
         };
+        let mut nodes = im::OrdMap::new();
+        nodes.insert(node_address, delegation);
         let wallet = Wallet {
-            nodes: vec![delegation].into(),
+            nodes,
             ..Default::default()
         };
 
@@ -1350,7 +1350,7 @@ mod test {
                     node,
                     amount: 1.try_into().unwrap(),
                 };
-                wallet.nodes.push_back(delegation);
+                wallet.nodes.insert(node, delegation);
             }
             block.state.wallets.insert(delegator, wallet);
         }
@@ -1770,7 +1770,10 @@ mod test {
         // Verify delegation exists
         let wallet = block1.state.wallets.get(&delegator).unwrap();
         assert_eq!(wallet.nodes.len(), 1);
-        assert_eq!(wallet.nodes[0].amount, U256::from(1000));
+        assert_eq!(
+            wallet.nodes.get(&validator_address).unwrap().amount,
+            U256::from(1000)
+        );
         assert_eq!(wallet.pending_undelegations.len(), 0);
         assert_eq!(wallet.pending_exits.len(), 0);
 
@@ -1786,9 +1789,19 @@ mod test {
         // Verify
         let wallet = block2.state.wallets.get(&delegator).unwrap();
         assert_eq!(wallet.nodes.len(), 1);
-        assert_eq!(wallet.nodes[0].amount, U256::from(600)); // Remaining delegation
+        assert_eq!(
+            wallet.nodes.get(&validator_address).unwrap().amount,
+            U256::from(600)
+        ); // Remaining delegation
         assert_eq!(wallet.pending_undelegations.len(), 1);
-        assert_eq!(wallet.pending_undelegations[0].amount, U256::from(400));
+        assert_eq!(
+            wallet
+                .pending_undelegations
+                .get(&validator_address)
+                .unwrap()
+                .amount,
+            U256::from(400)
+        );
         assert_eq!(wallet.pending_exits.len(), 0);
 
         // Validator exits
@@ -1802,9 +1815,19 @@ mod test {
         let wallet = block3.state.wallets.get(&delegator).unwrap();
         assert_eq!(wallet.nodes.len(), 0);
         assert_eq!(wallet.pending_undelegations.len(), 1);
-        assert_eq!(wallet.pending_undelegations[0].amount, U256::from(400));
+        assert_eq!(
+            wallet
+                .pending_undelegations
+                .get(&validator_address)
+                .unwrap()
+                .amount,
+            U256::from(400)
+        );
         assert_eq!(wallet.pending_exits.len(), 1);
-        assert_eq!(wallet.pending_exits[0].amount, U256::from(600)); // Exit for remaining delegation
+        assert_eq!(
+            wallet.pending_exits.get(&validator_address).unwrap().amount,
+            U256::from(600)
+        ); // Exit for remaining delegation
 
         // Withdraw the undelegation
         let block4 = block3.next(
@@ -1819,7 +1842,10 @@ mod test {
         assert_eq!(wallet.nodes.len(), 0);
         assert_eq!(wallet.pending_undelegations.len(), 0);
         assert_eq!(wallet.pending_exits.len(), 1);
-        assert_eq!(wallet.pending_exits[0].amount, U256::from(600));
+        assert_eq!(
+            wallet.pending_exits.get(&validator_address).unwrap().amount,
+            U256::from(600)
+        );
 
         // Withdraw the exit
         let block5 = block4.next(

@@ -272,14 +272,15 @@ impl Iterator for EventGenerator {
             const REGISTER: usize = 0;
             const REGISTER_V2: usize = 1;
             const DEREGISTER: usize = 2;
+            const DELEGATE: usize = 3;
+            const UNDELEGATE: usize = 4;
+            const WITHDRAWAL: usize = 5;
 
-            const MAX_STAKE_TABLE_EVENT_TYPE: usize = 3;
+            const MAX_STAKE_TABLE_EVENT_TYPE: usize = 6;
 
             // Other contract events that the UI service cares about but consensus does not.
-            const EXIT_ESCROW_PERIOD_UPDATED: usize = 3;
-            const DELEGATE: usize = 4;
-            const UNDELEGATE: usize = 5;
-            const WITHDRAWAL: usize = 6;
+            const EXIT_ESCROW_PERIOD_UPDATED: usize = 6;
+
             const CLAIM_REWARDS: usize = 7;
 
             const MAX_EVENT_TYPE: usize = 8;
@@ -353,11 +354,17 @@ impl Iterator for EventGenerator {
                     let Some(&validator) = self.nodes.iter().choose(&mut self.rng) else {
                         continue;
                     };
-
-                    let delegator = Address::random();
+                    let seed = self.rng.gen_range(1u64..101u64);
+                    let mut address_bytes = FixedBytes::<32>::default();
+                    address_bytes[..8].copy_from_slice(&seed.to_le_bytes());
+                    let delegator = Address::from_word(address_bytes);
                     let amount = U256::from(self.rng.gen_range(100u64..10000u64));
                     let key = (delegator, validator);
-                    self.delegations.insert(key, amount);
+
+                    self.delegations
+                        .entry(key)
+                        .and_modify(|existing| *existing += amount)
+                        .or_insert(amount);
 
                     StakeTableV2Events::Delegated(Delegated {
                         delegator,
@@ -372,11 +379,20 @@ impl Iterator for EventGenerator {
                         continue;
                     };
 
-                    let (key, amount) = self
+                    let delegations: Vec<_> = self
                         .delegations
                         .iter()
+                        .filter(|(key, _)| !self.pending_undelegations.contains_key(key))
+                        .collect();
+
+                    if delegations.is_empty() {
+                        continue;
+                    }
+
+                    let (key, amount) = delegations
+                        .iter()
                         .choose(&mut self.rng)
-                        .map(|(k, v)| (*k, *v))
+                        .map(|(k, v)| (**k, **v))
                         .unwrap();
 
                     let (delegator, node) = key;
@@ -996,7 +1012,7 @@ impl BackgroundStakeTableOps {
                     _ => unreachable!(),
                 }
 
-                sleep(Duration::from_millis(500)).await;
+                sleep(Duration::from_millis(200)).await;
             }
         });
 

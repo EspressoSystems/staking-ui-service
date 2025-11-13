@@ -1214,7 +1214,7 @@ mod tests {
         // Stop background operations
         drop(background_task);
         subscription_task.abort();
-        let _ = subscription_task.await.unwrap();
+        let _ = subscription_task.await;
 
         let subscription_latest_block = state.read().await.latest_l1_block();
         println!(
@@ -1321,11 +1321,7 @@ mod tests {
                     .wallet(*delegator_address, subscription_latest_block.hash)
                 {
                     Ok((wallet, _)) => {
-                        let wallet_delegation = wallet
-                            .nodes
-                            .iter()
-                            .find(|delegation| delegation.node == node.address)
-                            .expect("not found");
+                        let wallet_delegation = wallet.nodes.get(&node.address).expect("not found");
 
                         assert_eq!(
                             wallet_delegation.amount, *delegated_amount,

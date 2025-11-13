@@ -167,33 +167,3 @@ pub struct Withdrawal {
     /// The amount of stake.
     pub amount: ESPTokenAmount,
 }
-
-/// Type of pending withdrawal
-#[derive(Clone, Copy, Debug, PartialEq, Deserialize, Serialize)]
-pub enum WithdrawalType {
-    /// Withdrawal due to pending undelegation
-    Undelegation,
-    /// Full withdrawal due to validator exit
-    Exit,
-}
-
-impl TryFrom<String> for WithdrawalType {
-    type Error = anyhow::Error;
-
-    fn try_from(value: String) -> Result<Self, Self::Error> {
-        match value.as_str() {
-            "undelegation" => Ok(WithdrawalType::Undelegation),
-            "exit" => Ok(WithdrawalType::Exit),
-            _ => Err(anyhow::anyhow!("Unknown withdrawal type: {value}")),
-        }
-    }
-}
-
-impl From<WithdrawalType> for String {
-    fn from(val: WithdrawalType) -> Self {
-        match val {
-            WithdrawalType::Undelegation => "undelegation".to_string(),
-            WithdrawalType::Exit => "exit".to_string(),
-        }
-    }
-}
