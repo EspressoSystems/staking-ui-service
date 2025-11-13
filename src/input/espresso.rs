@@ -20,7 +20,7 @@ use hotshot_types::{
     },
     stake_table::StakeTableEntry,
     traits::{block_contents::BlockHeader, node_implementation::ConsensusTime},
-    utils::epoch_from_block_number,
+    utils::{epoch_from_block_number, transition_block_for_epoch},
 };
 use tokio::time::sleep;
 use tracing::instrument;
@@ -115,7 +115,7 @@ impl<S: EspressoPersistence, C: EspressoClient> State<S, C> {
 
                 // Set our state to the last block of the previous epoch, so that when we start up,
                 // the first block we process is the first block of this epoch.
-                let leaf = &epoch.prev_leaf;
+                let leaf = espresso.leaf(epoch.start_block(epoch_height) - 1).await?;
                 // TODO fetch the reward balance of every account as of the start of this epoch, so
                 // we can initialize our lifetime rewards storage.
                 (leaf.height(), leaf.view_number())
@@ -136,7 +136,7 @@ impl<S: EspressoPersistence, C: EspressoClient> State<S, C> {
     /// Get the active node set as of the latest Espresso block.
     pub async fn active_node_set(&self) -> Result<ActiveNodeSetSnapshot> {
         let active_nodes = self.storage.active_node_set().await?;
-        Ok(active_nodes.into_snapshot(self.epoch.start_block()))
+        Ok(active_nodes.into_snapshot(self.epoch.start_block(self.epoch_height)))
     }
 
     /// Get the changes to the active node set that occurred in the requested Espresso block.
@@ -336,16 +336,11 @@ struct EpochState {
     /// The delegators to each active node.
     #[allow(dead_code)]
     delegators: BTreeMap<Address, Vec<(Address, U256)>>,
-
-    /// The last leaf of the previous epoch.
-    ///
-    /// This leaf contains useful information about this current epoch, such as the DRB result.
-    prev_leaf: Leaf2,
 }
 
 impl EpochState {
     /// Construct the epoch state from a stake table and DRB result.
-    fn new(number: u64, nodes: ValidatorMap, drb_result: DrbResult, prev_leaf: Leaf2) -> Self {
+    fn new(number: u64, nodes: ValidatorMap, drb_result: DrbResult) -> Self {
         // Get active node addresses.
         let active_nodes = nodes.keys().copied().collect::<Vec<_>>();
         // Index active nodes by staking key.
@@ -377,7 +372,6 @@ impl EpochState {
             active_nodes,
             node_index,
             delegators,
-            prev_leaf,
         }
     }
 
@@ -401,27 +395,28 @@ impl EpochState {
             .await
             .map_err(|err| err.context("fetching stake table"))?;
 
-        // Get the DRB result from the last block of the previous epoch.
-        let prev_epoch_last_block = epoch_height * (epoch - 1);
-        let leaf = espresso.leaf(prev_epoch_last_block).await.map_err(|err| {
-            err.context(format!("fetching previous leaf {prev_epoch_last_block}"))
-        })?;
+        // Get the DRB result from the transition block of the previous epoch.
+        let transition_block = transition_block_for_epoch(epoch - 1, epoch_height);
+        let drb_leaf = espresso
+            .leaf(transition_block)
+            .await
+            .map_err(|err| err.context(format!("fetching transition leaf {transition_block}")))?;
         // Sanity check that we actually got a block from the previous epoch.
         ensure!(
-            leaf.epoch(epoch_height).as_deref().copied() == Some(epoch - 1),
+            drb_leaf.epoch(epoch_height).as_deref().copied() == Some(epoch - 1),
             Error::internal().context(format!(
-                "previous leaf {leaf:?} is not from expected epoch {} (epoch_height={epoch_height})",
+                "transition leaf {drb_leaf:?} is not from expected epoch {} (epoch_height={epoch_height})",
                 epoch - 1
             ))
         );
-        let drb_result = leaf.next_drb_result.ok_or_else(|| {
+        let drb_result = drb_leaf.next_drb_result.ok_or_else(|| {
             Error::internal().context(format!(
-                "last block of epoch {} (height {prev_epoch_last_block}) does not have next epoch DRB result",
+                "transition block of epoch {} (height {transition_block}) does not have next epoch DRB result",
                 epoch - 1,
             ))
         })?;
 
-        Ok(Self::new(epoch, stake_table, drb_result, leaf))
+        Ok(Self::new(epoch, stake_table, drb_result))
     }
 
     /// The index of the leader for `view`.
@@ -444,8 +439,8 @@ impl EpochState {
     }
 
     /// The block number of the first block in this epoch.
-    fn start_block(&self) -> u64 {
-        self.prev_leaf.height() + 1
+    fn start_block(&self, epoch_height: u64) -> u64 {
+        (self.number - 1) * epoch_height + 1
     }
 
     /// The epoch number.
@@ -570,7 +565,7 @@ pub trait EspressoClient: Clone {
 
 #[cfg(test)]
 mod test {
-    use crate::input::espresso::testing::MockEspressoClient;
+    use crate::input::espresso::testing::{MockEspressoClient, fake_drb_result};
 
     use super::*;
 
@@ -718,8 +713,6 @@ mod test {
             let (leaf, signers) = espresso.push_leaf(0, [false, false, false]).await;
             leaves.push((leaf.clone(), signers.clone()));
         }
-        let (prev_leaf, _) = espresso.last_leaf();
-        let prev_leaf = prev_leaf.clone();
 
         // Add the first leaf of the next epoch.
         let (leaf, signers) = espresso.push_leaf(0, [true, true, true]).await;
@@ -763,7 +756,7 @@ mod test {
         );
         assert_eq!(
             state.epoch.committee.drb_result(),
-            prev_leaf.next_drb_result.unwrap()
+            fake_drb_result(state.epoch.number())
         );
 
         // Only events from the new epoch are retained.
@@ -965,11 +958,12 @@ mod test {
     }
 
     #[test_log::test(tokio::test(flavor = "multi_thread"))]
-    async fn test_handle_leaf_failure_fetch_prev_leaf() {
+    async fn test_handle_leaf_failure_fetch_transition_leaf() {
         test_handle_leaf_failure_helper(|state| {
-            state
-                .espresso
-                .delete_leaf(state.espresso.last_leaf().0.height() - 1)
+            state.espresso.delete_leaf(transition_block_for_epoch(
+                state.epoch.number - 1,
+                state.epoch_height,
+            ))
         })
         .await;
     }

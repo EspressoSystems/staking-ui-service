@@ -19,12 +19,13 @@ use espresso_types::{
 use futures::{Stream, StreamExt, stream};
 use hotshot_types::{
     data::{EpochNumber, QuorumProposal2, QuorumProposalWrapper, ViewNumber},
+    drb::DrbResult,
     simple_certificate::QuorumCertificate2,
     traits::{
         node_implementation::ConsensusTime,
         signature_key::{SignatureKey, StateSignatureKey},
     },
-    utils::{epoch_from_block_number, is_last_block},
+    utils::{epoch_from_block_number, is_transition_block, transition_block_for_epoch},
 };
 use jf_signature::schnorr::VerKey;
 use rand::{RngCore, SeedableRng, rngs::StdRng};
@@ -143,13 +144,15 @@ impl MockEspressoClient {
             unavailable_stake_tables: Default::default(),
         };
 
-        // At minimum we need the last block of the previous epoch.
-        espresso.leaves.push((
-            espresso
-                .make_leaf(epoch_height * (current_epoch - 1), ViewNumber::genesis())
-                .await,
-            std::iter::repeat_n(true, num_nodes).collect(),
-        ));
+        // At minimum we need the end of the previous epoch, starting from the transition block.
+        let transition_block = transition_block_for_epoch(current_epoch - 1, epoch_height);
+        let last_block = epoch_height * (current_epoch - 1);
+        for height in transition_block..=last_block {
+            espresso.leaves.push((
+                espresso.make_leaf(height, ViewNumber::new(height)).await,
+                std::iter::repeat_n(true, num_nodes).collect(),
+            ));
+        }
 
         espresso
     }
@@ -200,8 +203,6 @@ impl MockEspressoClient {
             .clone();
         *block_header.height_mut() = height;
         let epoch = epoch_from_block_number(height, self.epoch_height);
-        let mut drb_result = [0; 32];
-        drb_result[0..8].copy_from_slice(&epoch.to_le_bytes());
         let proposal: QuorumProposalWrapper<SeqTypes> = QuorumProposal2 {
             block_header,
             view_number,
@@ -211,7 +212,8 @@ impl MockEspressoClient {
             next_epoch_justify_qc: None,
             upgrade_certificate: None,
             view_change_evidence: None,
-            next_drb_result: is_last_block(height, self.epoch_height).then_some(drb_result),
+            next_drb_result: is_transition_block(height, self.epoch_height)
+                .then_some(fake_drb_result(epoch + 1)),
             state_cert: None,
         }
         .into();
@@ -242,6 +244,12 @@ impl MockEspressoClient {
     pub fn epoch_height(&self) -> u64 {
         self.epoch_height
     }
+}
+
+pub fn fake_drb_result(epoch: u64) -> DrbResult {
+    let mut drb_result = [0; 32];
+    drb_result[0..8].copy_from_slice(&epoch.to_le_bytes());
+    drb_result
 }
 
 /// Easy-setup storage that just uses memory.
