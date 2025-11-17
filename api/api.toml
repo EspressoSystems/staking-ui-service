@@ -252,6 +252,42 @@ This is the active node set that is in use right now, during the current epoch, 
 Espresso. It contains participation metrics for each active node dating back to the start of the
 current epoch.
 
+### Caching Behavior
+
+This endpoint may be cached, so that it sometimes returns stale data. In this case, clients can
+simply replay recent updates from `/nodes/active/updates` in order to bring their state up to date.
+The indexed version of this endpoint, `/nodes/active/:block`, can be used to access more recent
+snapshots. However, unlike that endpoint, this one will never fail with `404 Not Found` or
+`410 Gone`.
+
+### Returns
+
+```json
+{
+    "espresso_block": EpochAndBlock,
+    "nodes": [
+        {
+            "address": Hex,
+            "voter_participation": float,
+            "leader_participation": float
+        }
+    ]
+}
+```
+"""
+
+[route.active_node_set_snapshot_indexed]
+PATH = ["/nodes/active/:block"]
+":block" = "Integer"
+DOC = """
+Get the set of active nodes, with statistics, as of the requested Espresso block number.
+
+This information is always available for the latest Espresso block. Depending on cache behavior, it
+may also be available for older blocks, but requests for block numbers that are too old will fail 
+with `410 Gone`.
+
+Requests for block numbers in the future will fail with `410 Not Found`.
+
 ### Returns
 
 ```json

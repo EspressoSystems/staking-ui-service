@@ -135,6 +135,14 @@ impl<S: EspressoPersistence, C: EspressoClient> State<S, C> {
         })
     }
 
+    /// The latest Espresso block number ingested.
+    ///
+    /// This is the same block which the latest [`active_node_set`](Self::active_node_set) snapshot
+    /// corresponds to.
+    pub fn latest_espresso_block(&self) -> u64 {
+        self.latest_espresso_block
+    }
+
     /// Get the active node set as of the latest Espresso block.
     pub async fn active_node_set(&self) -> Result<ActiveNodeSetSnapshot> {
         let active_nodes = self
@@ -625,7 +633,7 @@ mod test {
         {
             // Check preloaded state.
             let state = state.read().await;
-            assert_eq!(state.latest_espresso_block, leaf.height() - 1);
+            assert_eq!(state.latest_espresso_block(), leaf.height() - 1);
             assert_eq!(state.latest_espresso_view, leaf.view_number() - 2);
             assert_eq!(state.epoch.number(), epoch);
         }
@@ -641,6 +649,7 @@ mod test {
         let snapshot = state.active_node_set().await.unwrap();
         assert_eq!(snapshot.espresso_block.block, leaf.height());
         assert_eq!(snapshot.nodes.len(), 3);
+        assert_eq!(state.latest_espresso_block(), leaf.height());
 
         tracing::info!(
             leader = state.epoch.leader(leaf.view_number()),
@@ -742,6 +751,7 @@ mod test {
 
         let state = state.read().await;
         let snapshot = state.active_node_set().await.unwrap();
+        assert_eq!(state.latest_espresso_block(), last_leaf.height());
         assert_eq!(snapshot.espresso_block.block, last_leaf.height());
         assert_eq!(snapshot.espresso_block.epoch, 3);
         assert_eq!(

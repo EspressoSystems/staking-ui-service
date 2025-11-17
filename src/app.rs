@@ -8,7 +8,7 @@ use tide_disco::{Api, App, api::ApiError};
 use vbs::version::{StaticVersion, StaticVersionType};
 
 use crate::{
-    error::{Error, Result, ResultExt},
+    error::{Error, Result, ResultExt, ensure},
     input::{
         espresso::{self, EspressoClient, EspressoPersistence},
         l1::{self, L1Persistence},
@@ -133,6 +133,36 @@ where
     })?
     .at("active_node_set_snapshot", |_, state| {
         async move { state.espresso.read().await.active_node_set().await }.boxed()
+    })?
+    .at("active_node_set_snapshot_indexed", |req, state| {
+        async move {
+            let block: u64 = req.integer_param("block")?;
+            let espresso = state.espresso.read().await;
+            let latest = espresso.latest_espresso_block();
+            if block < latest {
+                return Err(Error::gone().context(format!(
+                    "request block {block} is too old (earliest available is {latest})"
+                )));
+            } else if block > latest {
+                return Err(Error::not_found().context(format!(
+                    "request block {block} is not yet available (latest available is {latest})"
+                )));
+            }
+
+            let snapshot = espresso.active_node_set().await?;
+            // Sanity check that we got the right snapshot (since we hold a read lock on the
+            // Espresso state between checking the block number and getting the snapshot, this
+            // should always be true).
+            ensure!(
+                snapshot.espresso_block.block == block,
+                Error::internal().context(format!(
+                    "internal inconsistency: snapshot returned for block {} is not for latest block {block}",
+                    snapshot.espresso_block.block
+                ))
+            );
+            Ok(snapshot)
+        }
+        .boxed()
     })?
     .at("active_node_set_update", |req, state| {
         async move {
@@ -573,6 +603,28 @@ mod test {
         assert!(snapshot.nodes[1].leader_participation > 0f32.into());
         assert!(snapshot.nodes[1].leader_participation < 1f32.into());
         assert_eq!(snapshot.nodes[1].voter_participation, 0f32.into());
+
+        // Check indexed snapshot endpoint.
+        let indexed_snapshot = client
+            .get::<ActiveNodeSetSnapshot>(&format!("nodes/active/{}", last_leaf.height()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(indexed_snapshot, snapshot);
+
+        // Check old and future indexded snapshots.
+        let err = client
+            .get::<ActiveNodeSetSnapshot>(&format!("nodes/active/{}", last_leaf.height() - 1))
+            .send()
+            .await
+            .unwrap_err();
+        assert_eq!(err.status(), StatusCode::GONE);
+        let err = client
+            .get::<ActiveNodeSetSnapshot>(&format!("nodes/active/{}", last_leaf.height() + 1))
+            .send()
+            .await
+            .unwrap_err();
+        assert_eq!(err.status(), StatusCode::NOT_FOUND);
 
         // We can get the updates for blocks in this epoch.
         for i in 1..=10 {
