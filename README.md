@@ -55,7 +55,8 @@ The following environment variables are _required_ for the service to run:
 | `ESPRESSO_STAKING_SERVICE_L1_HTTP`                 | One or more (comma-separated) HTTP RPC endpoints for reading from Ethereum (or a different layer 1) |
 | `ESPRESSO_STAKING_SERVICE_STAKE_TABLE_ADDRESS`     | Address of stake table contract on layer 1                                                          |
 | `ESPRESSO_STAKING_SERVICE_REWARD_CONTRACT_ADDRESS` | Address of the reward claim contract on layer 1                                                     |
-| `ESPRESSO_STAKING_SERVICE_STORAGE`                 | Path to local storage (a SQLite database will be created or opened here)                            |
+| `ESPRESSO_STAKING_SERVICE_ESPRESSO_URL`            | URL for an Espresso query service                                                                   |
+| `ESPRESSO_STAKING_SERVICE_DB_PATH`                 | Path to local storage (a SQLite database will be created or opened here)                            |
 
 In additional, the following _optional_ variables are available for customization:
 
@@ -69,7 +70,10 @@ In additional, the following _optional_ variables are available for customizatio
 | `ESPRESSO_STAKING_SERVICE_L1_CONSECUTIVE_FAILURE_TOLERANCE` | Fail over to another provider if the current provider fails many times in a row (default: `10`)                                                               |
 | `ESPRESSO_STAKING_SERVICE_L1_FAILOVER_REVERT`               | Revert back to the first provider this duration after failing over (default: `30m`)                                                                           |
 | `ESPRESSO_STAKING_SERVICE_L1_RATE_LIMIT_DELAY`              | Amount of time to wait after receiving a 429 response before making more L1 RPC requests (default: same as L1 retry delay)                                    |
+| `ESPRESSO_STAKING_SERVICE_L1_EVENTS_MAX_BLOCK_RANGE`        | Maximum number of blocks allowed in a ranged `eth_getLogs` query (default: `10000`)                                                                           |
+| `ESPRESSO_STAKING_SERVICE_STREAM_TIMEOUT`                   | Time after which an idle Espresso block stream is considered dead and restarted (default: `1m`)                                                               |
 | `ESPRESSO_STAKING_SERVICE_PORT`                             | Port for the HTTP server to run on. (default: `8080`)                                                                                                         |
+| `ESPRESSO_STAKING_SERVICE_DB_MAX_CONNECTIONS`               | Maximum number of simultaneous open SQL connections (default: `5`)                                                                                            |
 | `RUST_LOG`                                                  | Log level (e.g. `debug`, `info`, `warn`)                                                                                                                      |
 | `RUST_LOG_FORMAT`                                           | Log formatting (`full`, `compact`, or `json`)                                                                                                                 |
 
