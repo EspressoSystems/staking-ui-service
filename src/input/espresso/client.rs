@@ -192,9 +192,12 @@ impl EspressoClient for QueryServiceClient {
 mod test {
     use std::sync::Arc;
 
-    use crate::input::{
-        espresso::{State, testing::MemoryStorage},
-        l1::testing::ContractDeployment,
+    use crate::{
+        Error,
+        input::{
+            espresso::{State, testing::MemoryStorage},
+            l1::testing::ContractDeployment,
+        },
     };
 
     use super::*;
@@ -228,7 +231,7 @@ mod test {
         DEV_MNEMONIC,
         demo::{DelegationConfig, StakingTransactions},
     };
-    use surf_disco::{Error, StatusCode};
+    use surf_disco::{Error as _, StatusCode};
     use tokio::task::spawn;
 
     type V = SequencerVersions<MaxSupportedVersion, MaxSupportedVersion>;
@@ -618,6 +621,32 @@ mod test {
 
             if !stake_table.is_empty() {
                 tracing::info!(?epoch, "reached dynamic stake table");
+
+                // Wait for API to catch up with internal state.
+                let client = surf_disco::Client::<Error, FormatVersion>::new(
+                    format!("http://localhost:{port}").parse().unwrap(),
+                );
+                loop {
+                    let block_height = client.get::<u64>("node/block-height").send().await.unwrap();
+                    if block_height > leaf.height() {
+                        tracing::info!(
+                            ?epoch,
+                            block_height,
+                            leaf.height = leaf.height(),
+                            "API caught up to leaf with epochs"
+                        );
+                        break;
+                    }
+
+                    tracing::info!(
+                        ?epoch,
+                        block_height,
+                        leaf.height = leaf.height(),
+                        "waiting for API to catch up to leaf with epochs"
+                    );
+                    sleep(Duration::from_secs(1)).await;
+                }
+
                 break;
             }
 
