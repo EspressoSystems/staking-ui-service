@@ -124,7 +124,7 @@ The current demo has some known limitations:
 ### Testing the UI
 
 The primary purpose of this service is to be a backend for the staking UI. You can test the latest
-version of the UI against the backend service using the [online demo](https://bookish-doodle-kq5le1n.pages.github.io/?path=/story/sites-delegation-ui-page--local-dev-net&args=stakeTableContractAddress:0xefdc2a236dba7a8f60726b49abc79ee6b22ed445;espTokenContractAddress:0x80f43505d8d1a739504eb4237eb15b2e0048da8d&globals=backgrounds.grid:!true;outline:!true)
+version of the UI against the backend service using the [online demo](https://bookish-doodle-kq5le1n.pages.github.io/?path=/story/sites-delegation-ui-page--default)
 of the UI. This allows you to test the UI against various deployments of the staking service.
 
 Due to browser restrictions, if you want to test the UI against the [local demo](#demo) of the
@@ -136,7 +136,4 @@ staking service, you will also need to run the UI demo locally:
 
 Once the UI is running, you should also start (in a separate shell) the local demo of the staking UI
 service, using either `just demo::up` or `just run-local`. Then you can open the UI using
-[your browser](http://localhost:6006/?path=/story/sites-delegation-ui-page--local-dev-net&args=stakeTableContractAddress:0xefdc2a236dba7a8f60726b49abc79ee6b22ed445;espTokenContractAddress:0x80f43505d8d1a739504eb4237eb15b2e0048da8d&globals=backgrounds.grid:!true;outline:!true).
-
-At the bottom of the page, you will need to set the value of the `l1ValidatorServiceURL` control to
-`http://localhost:8080/v0/`.
+[your browser](http://localhost:6006/?path=/story/sites-delegation-ui-page--local-dev-net).
