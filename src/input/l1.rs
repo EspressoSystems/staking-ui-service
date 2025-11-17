@@ -1110,7 +1110,18 @@ impl Wallet {
                     .insert(pending.node, *pending)
                     .is_some()
                 {
-                    panic!("attempted to add duplicate pending undelegation for node {node}");
+                    // ONLY ON DECAF this is ok. The legacy withdrawal event does not contain
+                    // enough information to accurately correlate every withdrawal to the correct
+                    // pending withdrawal. Thus, it is possible that a previous withdrawal that was
+                    // meant to clear a pending undelegation from this node got misinterpeted as
+                    // clearing a different undelegation, leaving a stale undelegation to this node
+                    // in the wallet state. Now, having overwritten this stale undelegation with a
+                    // fresh one, our state should once again match the contract state.
+                    //
+                    // This should never happen on mainnet.
+                    tracing::error!(
+                        "attempted to add duplicate pending undelegation for node {node}"
+                    );
                 }
             }
             WalletDiff::NodeExited(pending) => {

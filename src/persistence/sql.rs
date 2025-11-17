@@ -451,10 +451,23 @@ impl Persistence {
                 }
 
                 // Insert pending undelegation
-                // we expect this to fail if there's already a pending undelegation
+                // ON DECAF ONLY conflicts are OK and treated as an upsert. The legacy withdrawal
+                // event does not contain enough information to accurately correlate every
+                // withdrawal to the correct pending withdrawal. Thus, it is possible that a
+                // previous withdrawal that was meant to clear a pending withdrawal from this node
+                // got misinterpeted as clearing a different pending withdrawal, leaving a stale
+                // withdrawal to this node in our database. Now, having overwritten this stale
+                // withdrawal with a fresh one, our state should once again match the contract
+                // state.
+                //
+                // This should never happen on mainnet, where conflicts in this statement should
+                // instead be treated as errors.
                 sqlx::query(
                     "INSERT INTO pending_withdrawals (delegator, node, withdrawal_type, amount, unlocks_at)
-                     VALUES ($1, $2, $3, $4, $5)",
+                     VALUES ($1, $2, $3, $4, $5)
+                     ON CONFLICT (delegator, node, withdrawal_type) DO UPDATE SET
+                        amount = excluded.amount,
+                        unlocks_at = excluded.unlocks_at",
                 )
                 .bind(withdrawal.delegator.to_string())
                 .bind(withdrawal.node.to_string())
