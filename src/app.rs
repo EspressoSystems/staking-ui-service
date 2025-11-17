@@ -511,7 +511,9 @@ mod test {
     #[test_log::test(tokio::test(flavor = "multi_thread"))]
     async fn test_active_node_endpoints() {
         let port = pick_unused_port().unwrap();
-        let url = format!("http://localhost:{port}").parse().unwrap();
+        let url = format!("http://localhost:{port}/v0/staking/")
+            .parse()
+            .unwrap();
 
         let mut espresso = MockEspressoClient::new(2).await;
         for _ in 0..10 {

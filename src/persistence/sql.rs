@@ -1,20 +1,29 @@
 //! SQL-based persistent storage
 use crate::{
     Result,
-    input::l1::{L1BlockSnapshot, L1Persistence, NodeSet, Snapshot, Wallet, Wallets},
+    input::{
+        espresso::{ActiveNode, ActiveNodeSet, EspressoPersistence},
+        l1::{L1BlockSnapshot, L1Persistence, NodeSet, Snapshot, Wallet, Wallets},
+    },
     types::{
-        common::{Address, Delegation, L1BlockId, NodeSetEntry, PendingWithdrawal, Ratio},
-        global::FullNodeSetDiff,
+        common::{
+            Address, Delegation, ESPTokenAmount, EpochAndBlock, L1BlockId, NodeSetEntry,
+            PendingWithdrawal, Ratio,
+        },
+        global::{ActiveNodeSetDiff, ActiveNodeSetUpdate, FullNodeSetDiff},
         wallet::WalletDiff,
     },
 };
 use alloy::primitives::U256;
 use anyhow::Context;
 use clap::Parser;
-use futures::future::try_join_all;
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
-use std::{path::PathBuf, str::FromStr};
-use tracing::instrument;
+use futures::{TryStreamExt, future::try_join_all};
+use sqlx::{
+    ConnectOptions, QueryBuilder,
+    sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions},
+};
+use std::{collections::HashMap, path::PathBuf, str::FromStr};
+use tracing::{instrument, log::LevelFilter};
 
 /// Options for persistence.
 #[derive(Parser, Clone, Debug)]
@@ -49,7 +58,8 @@ impl Persistence {
                 .to_str()
                 .ok_or_else(|| anyhow::anyhow!("invalid path"))?,
         )?
-        .create_if_missing(true);
+        .create_if_missing(true)
+        .log_statements(LevelFilter::Debug);
 
         // Create connection pool
         let pool = SqlitePoolOptions::new()
@@ -622,6 +632,236 @@ impl L1Persistence for Persistence {
     }
 }
 
+impl EspressoPersistence for Persistence {
+    async fn active_node_set(&self) -> Result<Option<ActiveNodeSet>> {
+        let mut tx = self.pool.begin().await.context("acquiring connection")?;
+
+        // Load saved Espresso block.
+        let espresso_block = sqlx::query_as(
+            "SELECT number, epoch, timestamp FROM espresso_block
+              WHERE always_one = 1 LIMIT 1",
+        )
+        .fetch_optional(tx.as_mut())
+        .await
+        .context("loading last Espresso block")?;
+        let Some((block, epoch, timestamp)) = espresso_block else {
+            return Ok(None);
+        };
+        let espresso_block = EpochAndBlock {
+            block,
+            epoch,
+            timestamp,
+        };
+
+        // Load active nodes.
+        let nodes = sqlx::query_as::<_, (String, u64, u64, u64)>(
+            "SELECT address, votes, proposals, slots FROM active_node ORDER BY idx",
+        )
+        .fetch_all(tx.as_mut())
+        .await
+        .context("loading active node set")?;
+        let nodes = nodes
+            .into_iter()
+            .map(|(address, votes, proposals, slots)| {
+                let address = address.parse().context("invalid address")?;
+                let proposals = proposals.try_into().context("proposal count overflow")?;
+                let slots = slots.try_into().context("slot count overflow")?;
+                let votes = votes.try_into().context("vote count overflow")?;
+                anyhow::Ok(ActiveNode {
+                    address,
+                    proposals,
+                    slots,
+                    votes,
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
+        Ok(Some(ActiveNodeSet {
+            espresso_block,
+            nodes,
+        }))
+    }
+
+    async fn lifetime_rewards(&self, account: Address) -> Result<ESPTokenAmount> {
+        let mut tx = self.pool.begin().await.context("acquiring connection")?;
+        let amount_opt = sqlx::query_as::<_, (String,)>(
+            "SELECT amount FROM lifetime_rewards WHERE address = $1",
+        )
+        .bind(account.to_string())
+        .fetch_optional(tx.as_mut())
+        .await
+        .context(format!("fetching lifetime reward amount for {account}"))?;
+        match amount_opt {
+            Some((amount_str,)) => Ok(amount_str.parse().context("invalid amount string")?),
+            None => {
+                // All accounts start at 0, if we don't have another value for this account it has
+                // never accrued any rewards.
+                Ok(ESPTokenAmount::ZERO)
+            }
+        }
+    }
+
+    async fn apply_update(
+        &self,
+        update: ActiveNodeSetUpdate,
+        rewards: Vec<(Address, ESPTokenAmount)>,
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await.context("acquiring connection")?;
+
+        // Update Espresso block information.
+        sqlx::query(
+            "INSERT INTO espresso_block (always_one, number, epoch, timestamp) 
+                VALUES (1, $1, $2, $3)
+                ON CONFLICT (always_one) DO UPDATE SET
+                    number    = excluded.number,
+                    epoch     = excluded.epoch,
+                    timestamp = excluded.timestamp",
+        )
+        .bind(i64::try_from(update.espresso_block.block).context("Espresso block overflow")?)
+        .bind(i64::try_from(update.espresso_block.epoch).context("Espresso epoch overflow")?)
+        .bind(
+            i64::try_from(update.espresso_block.timestamp)
+                .context("Espresso timestamp overflow")?,
+        )
+        .execute(tx.as_mut())
+        .await
+        .context("updating Espresso block")?;
+
+        // Apply changes to active node set.
+        for diff in update.diff {
+            match diff {
+                ActiveNodeSetDiff::NewEpoch(nodes) => {
+                    let nodes = nodes
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, addr)| {
+                            let i = i64::try_from(i).context("node index overflow")?;
+                            Ok((i, addr.to_string()))
+                        })
+                        .collect::<anyhow::Result<Vec<_>>>()?;
+
+                    QueryBuilder::new(
+                        "INSERT INTO active_node (idx, address, votes, proposals, slots) ",
+                    )
+                    .push_values(nodes, |mut q, (i, address)| {
+                        q.push_bind(i)
+                            .push_bind(address)
+                            .push("0")
+                            .push("0")
+                            .push("0");
+                    })
+                    .push(
+                        "ON CONFLICT (idx) DO UPDATE SET
+                            address   = excluded.address,
+                            votes     = excluded.votes,
+                            proposals = excluded.proposals,
+                            slots     = excluded.slots",
+                    )
+                    .build()
+                    .execute(tx.as_mut())
+                    .await
+                    .context("inserting new active node set")?;
+                }
+                ActiveNodeSetDiff::NewBlock {
+                    leader,
+                    failed_leaders,
+                    voters,
+                } => {
+                    let leader = i32::try_from(leader).context("leader index overflow")?;
+                    let voters = voters
+                        .iter_ones()
+                        .map(|i| i32::try_from(i).context("voter index overflow"))
+                        .collect::<anyhow::Result<Vec<_>>>()?;
+
+                    // Increment leader's slot and proposal counts.
+                    sqlx::query(
+                        "UPDATE active_node SET proposals = proposals + 1, slots = slots + 1
+                            WHERE idx = $1",
+                    )
+                    .bind(leader)
+                    .execute(tx.as_mut())
+                    .await
+                    .context("updating leader stats")?;
+
+                    // Update slot counts for leaders who missed a proposal.
+                    if !failed_leaders.is_empty() {
+                        // Count the number of times each node index appears in `failed_leaders`.
+                        let mut increments: HashMap<i32, i32> = HashMap::new();
+                        for index in failed_leaders {
+                            let index =
+                                i32::try_from(index).context("failed leader index overflow")?;
+                            *increments.entry(index).or_default() += 1i32;
+                        }
+                        // Increment the slots count each node that appears in `failed_leaders` by
+                        // the number of times it appears.
+                        QueryBuilder::new(
+                            "UPDATE active_node AS n
+                                SET slots = n.slots + increments.count
+                                FROM (SELECT column1 AS idx, column2 AS count FROM (",
+                        )
+                        .push_values(increments, |mut q, (index, count)| {
+                            q.push_bind(index).push_bind(count);
+                        })
+                        .push(")) AS increments WHERE n.idx = increments.idx")
+                        .build()
+                        .execute(tx.as_mut())
+                        .await
+                        .context("updating failed leader stats")?;
+                    }
+
+                    // Update vote counts for everyone who signed the QC.
+                    if !voters.is_empty() {
+                        QueryBuilder::new("UPDATE active_node SET votes = votes + 1 WHERE idx IN ")
+                            .push_tuples(voters, |mut q, i| {
+                                q.push_bind(i);
+                            })
+                            .build()
+                            .execute(tx.as_mut())
+                            .await
+                            .context("updating voter stats")?;
+                    }
+                }
+            }
+        }
+
+        // Dole out rewards.
+        if !rewards.is_empty() {
+            let current_amounts =
+                QueryBuilder::new("SELECT address, amount FROM lifetime_rewards WHERE address IN ")
+                    .push_tuples(&rewards, |mut q, (addr, _)| {
+                        q.push_bind(addr.to_string());
+                    })
+                    .build_query_as::<(String, String)>()
+                    .fetch(tx.as_mut())
+                    .map_err(anyhow::Error::new)
+                    .and_then(|(addr, amount)| async move {
+                        let addr: Address = addr.parse().context("invalid address")?;
+                        let amount: ESPTokenAmount = amount.parse().context("invalid amount")?;
+                        Ok((addr, amount))
+                    })
+                    .try_collect::<HashMap<Address, ESPTokenAmount>>()
+                    .await
+                    .context("fetching current reward amounts")?;
+            let new_amounts = rewards.into_iter().map(|(addr, amount)| {
+                let new_amount = amount + current_amounts.get(&addr).copied().unwrap_or_default();
+                (addr.to_string(), new_amount.to_string())
+            });
+            QueryBuilder::new("INSERT INTO lifetime_rewards (address, amount) ")
+                .push_values(new_amounts, |mut q, (addr, amount)| {
+                    q.push_bind(addr);
+                    q.push_bind(amount);
+                })
+                .push("ON CONFLICT (address) DO UPDATE SET amount = excluded.amount")
+                .build()
+                .execute(tx.as_mut())
+                .await
+                .context("storing new reward amounts")?;
+        }
+
+        Ok(tx.commit().await?)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1113,5 +1353,270 @@ mod tests {
         assert_eq!(wallet3.pending_undelegations.len(), 0);
         // NodeExitWithdrawal completed, so no more pending_exits
         assert_eq!(wallet3.pending_exits.len(), 0);
+    }
+
+    #[test_log::test(tokio::test(flavor = "multi_thread"))]
+    async fn test_active_node_set_new_epoch() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        let options = PersistenceOptions {
+            path: db_path,
+            max_connections: 5,
+        };
+        let persistence = Persistence::new(&options).await.unwrap();
+
+        // Prior to the first update being processed, we have no snapshot.
+        assert_eq!(persistence.active_node_set().await.unwrap(), None);
+
+        // Store an update with an Espresso block and a list of nodes.
+        let espresso_block = EpochAndBlock {
+            block: 100,
+            epoch: 200,
+            timestamp: 300,
+        };
+        let nodes = vec![Address::random(), Address::random()];
+        persistence
+            .apply_update(
+                ActiveNodeSetUpdate {
+                    espresso_block,
+                    diff: vec![ActiveNodeSetDiff::NewEpoch(nodes.clone())],
+                },
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        let snapshot = persistence.active_node_set().await.unwrap().unwrap();
+        assert_eq!(snapshot.espresso_block, espresso_block);
+        assert_eq!(
+            snapshot.nodes,
+            [ActiveNode::new(nodes[0]), ActiveNode::new(nodes[1])]
+        );
+    }
+
+    #[test_log::test(tokio::test(flavor = "multi_thread"))]
+    async fn test_active_node_set_new_block_stats() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        let options = PersistenceOptions {
+            path: db_path,
+            max_connections: 5,
+        };
+        let persistence = Persistence::new(&options).await.unwrap();
+
+        let nodes = vec![
+            Address::random(),
+            Address::random(),
+            Address::random(),
+            Address::random(),
+        ];
+        let leader = 0;
+        let failed_leaders = vec![1, 2];
+        let voters = [false, false, true, true].into_iter().collect();
+
+        let update = ActiveNodeSetUpdate {
+            espresso_block: EpochAndBlock {
+                epoch: 0,
+                block: 0,
+                timestamp: 0,
+            },
+            diff: vec![
+                ActiveNodeSetDiff::NewEpoch(nodes.clone()),
+                ActiveNodeSetDiff::NewBlock {
+                    leader,
+                    failed_leaders,
+                    voters,
+                },
+            ],
+        };
+        persistence
+            .apply_update(update, Default::default())
+            .await
+            .unwrap();
+        let node_set = persistence.active_node_set().await.unwrap().unwrap();
+        assert_eq!(
+            node_set.nodes,
+            [
+                ActiveNode {
+                    address: nodes[0],
+                    votes: 0,
+                    proposals: 1,
+                    slots: 1,
+                },
+                ActiveNode {
+                    address: nodes[1],
+                    votes: 0,
+                    proposals: 0,
+                    slots: 1,
+                },
+                ActiveNode {
+                    address: nodes[2],
+                    votes: 1,
+                    proposals: 0,
+                    slots: 1,
+                },
+                ActiveNode {
+                    address: nodes[3],
+                    votes: 1,
+                    proposals: 0,
+                    slots: 0,
+                }
+            ]
+        );
+    }
+
+    #[test_log::test(tokio::test(flavor = "multi_thread"))]
+    async fn test_active_node_set_new_block_no_failed_leaders() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        let options = PersistenceOptions {
+            path: db_path,
+            max_connections: 5,
+        };
+        let persistence = Persistence::new(&options).await.unwrap();
+
+        let nodes = vec![Address::random(), Address::random()];
+        let leader = 0;
+        let voters = [false, true].into_iter().collect();
+
+        let update = ActiveNodeSetUpdate {
+            espresso_block: EpochAndBlock {
+                epoch: 0,
+                block: 0,
+                timestamp: 0,
+            },
+            diff: vec![
+                ActiveNodeSetDiff::NewEpoch(nodes.clone()),
+                ActiveNodeSetDiff::NewBlock {
+                    leader,
+                    failed_leaders: vec![],
+                    voters,
+                },
+            ],
+        };
+        persistence
+            .apply_update(update, Default::default())
+            .await
+            .unwrap();
+        let node_set = persistence.active_node_set().await.unwrap().unwrap();
+        assert_eq!(
+            node_set.nodes,
+            [
+                ActiveNode {
+                    address: nodes[0],
+                    votes: 0,
+                    proposals: 1,
+                    slots: 1,
+                },
+                ActiveNode {
+                    address: nodes[1],
+                    votes: 1,
+                    proposals: 0,
+                    slots: 0,
+                },
+            ]
+        );
+    }
+
+    #[test_log::test(tokio::test(flavor = "multi_thread"))]
+    async fn test_active_node_set_new_block_duplicate_failed_leaders() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        let options = PersistenceOptions {
+            path: db_path,
+            max_connections: 5,
+        };
+        let persistence = Persistence::new(&options).await.unwrap();
+
+        let nodes = vec![Address::random(), Address::random()];
+        let leader = 0;
+        let failed_leaders = vec![0, 1, 1];
+        let voters = [true, true].into_iter().collect();
+
+        let update = ActiveNodeSetUpdate {
+            espresso_block: EpochAndBlock {
+                epoch: 0,
+                block: 0,
+                timestamp: 0,
+            },
+            diff: vec![
+                ActiveNodeSetDiff::NewEpoch(nodes.clone()),
+                ActiveNodeSetDiff::NewBlock {
+                    leader,
+                    failed_leaders,
+                    voters,
+                },
+            ],
+        };
+        persistence
+            .apply_update(update, Default::default())
+            .await
+            .unwrap();
+        let node_set = persistence.active_node_set().await.unwrap().unwrap();
+        assert_eq!(
+            node_set.nodes,
+            [
+                ActiveNode {
+                    address: nodes[0],
+                    votes: 1,
+                    proposals: 1,
+                    slots: 2,
+                },
+                ActiveNode {
+                    address: nodes[1],
+                    votes: 1,
+                    proposals: 0,
+                    slots: 2,
+                },
+            ]
+        );
+    }
+
+    #[test_log::test(tokio::test(flavor = "multi_thread"))]
+    async fn test_active_node_set_rewards() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        let options = PersistenceOptions {
+            path: db_path,
+            max_connections: 5,
+        };
+        let persistence = Persistence::new(&options).await.unwrap();
+
+        // Query for unknown account.
+        assert_eq!(
+            persistence
+                .lifetime_rewards(Address::random())
+                .await
+                .unwrap(),
+            ESPTokenAmount::from(0)
+        );
+
+        // Apply two updates: one with a fresh account, and then one with both a fresh account and
+        // an existing account.
+        let accounts = [Address::random(), Address::random()];
+        let reward_updates = [
+            vec![(accounts[0], ESPTokenAmount::from(1))],
+            vec![
+                (accounts[0], ESPTokenAmount::from(2)),
+                (accounts[1], ESPTokenAmount::from(5)),
+            ],
+        ];
+        let update = ActiveNodeSetUpdate {
+            espresso_block: EpochAndBlock {
+                epoch: 0,
+                block: 0,
+                timestamp: 0,
+            },
+            diff: vec![],
+        };
+        persistence
+            .apply_update(update.clone(), reward_updates[0].clone())
+            .await
+            .unwrap();
+        persistence
+            .apply_update(update, reward_updates[1].clone())
+            .await
+            .unwrap();
+        assert_eq!(persistence.lifetime_rewards(accounts[0]).await.unwrap(), 3);
+        assert_eq!(persistence.lifetime_rewards(accounts[1]).await.unwrap(), 5);
     }
 }

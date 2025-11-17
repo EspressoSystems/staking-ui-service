@@ -314,9 +314,9 @@ impl MemoryStorage {
 }
 
 impl EspressoPersistence for MemoryStorage {
-    async fn active_node_set(&self) -> Result<ActiveNodeSet> {
+    async fn active_node_set(&self) -> Result<Option<ActiveNodeSet>> {
         self.mock_errors()?;
-        self.db.read().await.0.clone().ok_or_else(Error::not_found)
+        Ok(self.db.read().await.0.clone())
     }
 
     async fn lifetime_rewards(&self, account: Address) -> Result<ESPTokenAmount> {

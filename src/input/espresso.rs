@@ -89,8 +89,8 @@ impl<S: EspressoPersistence, C: EspressoClient> State<S, C> {
         // Initialize active node storage to the most recent of:
         // * saved active node set
         // * start of current epoch
-        let (latest_espresso_block, latest_espresso_view) = match storage.active_node_set().await {
-            Ok(snapshot) if snapshot.espresso_block.epoch == current_epoch => {
+        let (latest_espresso_block, latest_espresso_view) = match storage.active_node_set().await? {
+            Some(snapshot) if snapshot.espresso_block.epoch == current_epoch => {
                 tracing::info!(
                     ?snapshot,
                     current_epoch,
@@ -108,10 +108,11 @@ impl<S: EspressoPersistence, C: EspressoClient> State<S, C> {
                     })?;
                 (snapshot.espresso_block.block, leaf.view_number())
             }
-            _ => {
+            snapshot => {
                 tracing::info!(
                     current_epoch,
-                    "missing recent snapshot, will start from beginning of epoch"
+                    ?snapshot,
+                    "stored snapshot is missing or out of date, will start from beginning of epoch"
                 );
 
                 // Set our state to the last block of the previous epoch, so that when we start up,
@@ -136,7 +137,11 @@ impl<S: EspressoPersistence, C: EspressoClient> State<S, C> {
 
     /// Get the active node set as of the latest Espresso block.
     pub async fn active_node_set(&self) -> Result<ActiveNodeSetSnapshot> {
-        let active_nodes = self.storage.active_node_set().await?;
+        let active_nodes = self
+            .storage
+            .active_node_set()
+            .await?
+            .ok_or_else(Error::not_found)?;
         Ok(active_nodes.into_snapshot(self.epoch.start_block(self.epoch_height)))
     }
 
@@ -462,7 +467,7 @@ impl EpochState {
 /// Persistent storage for data derived from Espresso.
 pub trait EspressoPersistence {
     /// Get the latest persisted active node set.
-    fn active_node_set(&self) -> impl Send + Future<Output = Result<ActiveNodeSet>>;
+    fn active_node_set(&self) -> impl Send + Future<Output = Result<Option<ActiveNodeSet>>>;
 
     /// Get the lifetime rewards earned by the requested account.
     fn lifetime_rewards(

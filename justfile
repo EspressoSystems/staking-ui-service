@@ -16,7 +16,7 @@ lint *args:
     cargo clippy --all-targets {{args}} -- -D warnings
 
 build profile="dev" *args:
-    cargo build --profile  {{profile}} --features testing {{args}}
+    cargo build --profile {{profile}} {{args}}
 
 run-profile profile *args:
     #!/usr/bin/env bash
@@ -27,7 +27,7 @@ run-profile profile *args:
         rm -r "$storage"
     }
     trap cleanup EXIT
-    cargo run --profile {{profile}} --features testing -- --path "${storage}" {{args}}
+    cargo run --profile {{profile}} -- --path "${storage}" {{args}}
 
 run-decaf:
     just run \

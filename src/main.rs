@@ -10,7 +10,6 @@ use staking_ui_service::{
         espresso::{
             self,
             client::{QueryServiceClient, QueryServiceOptions},
-            testing::MemoryStorage,
         },
         l1::{self, RpcCatchup, RpcStream, Snapshot, options::L1ClientOptions},
     },
@@ -70,6 +69,10 @@ impl Options {
     async fn run(self) -> Result<()> {
         self.init_logging();
 
+        let storage = sql::Persistence::new(&self.persistence)
+            .await
+            .map_err(|err| err.context("opening storage"))?;
+
         // Get genesis state.
         let l1_provider = self
             .l1_options
@@ -103,25 +106,20 @@ impl Options {
         let l1_input = RpcStream::new(self.l1_options)
             .await
             .map_err(|err| err.context("opening L1 RPC stream"))?;
-        let l1_storage = sql::Persistence::new(&self.persistence)
-            .await
-            .map_err(|err| err.context("opening L1 storage"))?;
 
         // Connect to Espresso.
         let espresso_input = QueryServiceClient::new(self.espresso_options)
             .await
             .map_err(|err| err.context("connecting to Espresso query service"))?;
-        // TODO use real persistence.
-        let espresso_storage = MemoryStorage::default();
 
         // Create server state.
         let l1 = Arc::new(RwLock::new(
-            l1::State::new(l1_storage, genesis, &l1_catchup)
+            l1::State::new(storage.clone(), genesis, &l1_catchup)
                 .await
                 .map_err(|err| err.context("initializing L1 state"))?,
         ));
         let espresso = Arc::new(RwLock::new(
-            espresso::State::new(espresso_storage, espresso_input)
+            espresso::State::new(storage, espresso_input)
                 .await
                 .map_err(|err| err.context("initializing Espresso state"))?,
         ));
@@ -190,6 +188,7 @@ mod test {
     use portpicker::pick_unused_port;
     use staking_ui_service::input::espresso::testing::start_pos_network;
     use staking_ui_service::types::common::L1BlockId;
+    use staking_ui_service::types::global::ActiveNodeSetSnapshot;
     use staking_ui_service::{Error, input::l1::testing::ContractDeployment};
     use surf_disco::Client;
     use tempfile::tempdir;
@@ -232,30 +231,53 @@ mod test {
             opt.run().await.unwrap();
         });
 
-        let client: Client<Error, StaticVersion<0, 1>> =
-            Client::new(format!("http://localhost:{port}").parse().unwrap());
+        let client: Client<Error, StaticVersion<0, 1>> = Client::new(
+            format!("http://localhost:{port}/v0/staking/")
+                .parse()
+                .unwrap(),
+        );
         sleep(Duration::from_secs(1)).await;
         client.connect(None).await;
 
-        // Check that L1 blocks are increasing.
-        let initial_l1_block: L1BlockId = client
-            .get("v0/staking/l1/block/latest")
-            .send()
-            .await
-            .unwrap();
-        tracing::info!(?initial_l1_block, "client connected");
+        // Check that L1 blocks and Espresso blocks are increasing.
+        let initial_l1_block: L1BlockId = client.get("l1/block/latest").send().await.unwrap();
+        let active_node_set: ActiveNodeSetSnapshot =
+            client.get("nodes/active").send().await.unwrap();
+        assert_eq!(active_node_set.nodes.len(), network.peers.len() + 1);
+        let initial_espresso_block = active_node_set.espresso_block;
+        tracing::info!(
+            ?initial_l1_block,
+            ?initial_espresso_block,
+            "client connected"
+        );
+        // Wait for L1 block to increase.
         loop {
             sleep(Duration::from_secs(1)).await;
-            let l1_block: L1BlockId = client
-                .get("v0/staking/l1/block/latest")
-                .send()
-                .await
-                .unwrap();
+            let l1_block: L1BlockId = client.get("l1/block/latest").send().await.unwrap();
             if l1_block.number > initial_l1_block.number {
                 tracing::info!(?initial_l1_block, ?l1_block, "L1 block increased");
                 break;
             }
             tracing::info!("waiting for L1 block to increase");
+        }
+        // Wait for Espresso block to increase.
+        loop {
+            sleep(Duration::from_secs(1)).await;
+            let espresso_block = client
+                .get::<ActiveNodeSetSnapshot>("nodes/active")
+                .send()
+                .await
+                .unwrap()
+                .espresso_block;
+            if espresso_block.block > initial_espresso_block.block {
+                tracing::info!(
+                    ?initial_espresso_block,
+                    ?espresso_block,
+                    "Espresso block increased"
+                );
+                break;
+            }
+            tracing::info!("waiting for Espresso block to increase");
         }
 
         task.abort();
