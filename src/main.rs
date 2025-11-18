@@ -244,10 +244,25 @@ mod test {
 
         // Check that L1 blocks and Espresso blocks are increasing.
         let initial_l1_block: L1BlockId = client.get("l1/block/latest").send().await.unwrap();
-        let active_node_set: ActiveNodeSetSnapshot =
-            client.get("nodes/active").send().await.unwrap();
-        assert_eq!(active_node_set.nodes.len(), network.peers.len() + 1);
-        let initial_espresso_block = active_node_set.espresso_block;
+        // Espresso API may take a moment to become available.
+        let initial_espresso_block = loop {
+            let active_node_set: ActiveNodeSetSnapshot =
+                match client.get("nodes/active").send().await {
+                    Ok(set) => set,
+                    Err(err) => {
+                        assert_eq!(
+                            err.status(),
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "unexpected error from Espresso API: {err:#}"
+                        );
+                        tracing::info!("waiting for Espresso API to become available");
+                        sleep(Duration::from_secs(1)).await;
+                        continue;
+                    }
+                };
+            assert_eq!(active_node_set.nodes.len(), network.peers.len() + 1);
+            break active_node_set.espresso_block;
+        };
         tracing::info!(
             ?initial_l1_block,
             ?initial_espresso_block,
