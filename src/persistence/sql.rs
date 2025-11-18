@@ -740,6 +740,12 @@ impl EspressoPersistence for Persistence {
                         })
                         .collect::<anyhow::Result<Vec<_>>>()?;
 
+                    // Remove nodes from previous epoch before inserting new nodes.
+                    sqlx::query("DELETE FROM active_node")
+                        .execute(tx.as_mut())
+                        .await
+                        .context("deleting old active node set")?;
+
                     QueryBuilder::new(
                         "INSERT INTO active_node (idx, address, votes, proposals, slots) ",
                     )
@@ -750,13 +756,6 @@ impl EspressoPersistence for Persistence {
                             .push("0")
                             .push("0");
                     })
-                    .push(
-                        "ON CONFLICT (idx) DO UPDATE SET
-                            address   = excluded.address,
-                            votes     = excluded.votes,
-                            proposals = excluded.proposals,
-                            slots     = excluded.slots",
-                    )
                     .build()
                     .execute(tx.as_mut())
                     .await
@@ -1356,7 +1355,7 @@ mod tests {
     }
 
     #[test_log::test(tokio::test(flavor = "multi_thread"))]
-    async fn test_active_node_set_new_epoch() {
+    async fn test_active_node_set_new_epoch_from_genesis() {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("test.db");
         let options = PersistenceOptions {
@@ -1390,6 +1389,146 @@ mod tests {
         assert_eq!(
             snapshot.nodes,
             [ActiveNode::new(nodes[0]), ActiveNode::new(nodes[1])]
+        );
+    }
+
+    #[test_log::test(tokio::test(flavor = "multi_thread"))]
+    async fn test_active_node_set_new_epoch_nodes_added() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        let options = PersistenceOptions {
+            path: db_path,
+            max_connections: 5,
+        };
+        let persistence = Persistence::new(&options).await.unwrap();
+
+        // Prior to the first update being processed, we have no snapshot.
+        assert_eq!(persistence.active_node_set().await.unwrap(), None);
+
+        // Store an update with an Espresso block and a list of nodes.
+        let espresso_block = EpochAndBlock {
+            block: 100,
+            epoch: 200,
+            timestamp: 300,
+        };
+        let nodes = vec![Address::random(), Address::random()];
+        persistence
+            .apply_update(
+                ActiveNodeSetUpdate {
+                    espresso_block,
+                    diff: vec![
+                        ActiveNodeSetDiff::NewEpoch(nodes.clone()),
+                        // Populate some statistics. These will become stale in the next epoch and
+                        // we can check that they get cleared.
+                        ActiveNodeSetDiff::NewBlock {
+                            leader: 0,
+                            failed_leaders: vec![],
+                            voters: [true, true].into_iter().collect(),
+                        },
+                    ],
+                },
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        let snapshot = persistence.active_node_set().await.unwrap().unwrap();
+        assert_eq!(snapshot.espresso_block, espresso_block);
+        assert_eq!(snapshot.nodes.len(), nodes.len());
+        for (node, addr) in snapshot.nodes.into_iter().zip(&nodes) {
+            assert_eq!(node.address, *addr);
+            assert_ne!(node.votes, 0);
+        }
+
+        // Start a new epoch, expanding and reordering the list of nodes.
+        let new_nodes = vec![Address::random(), Address::random(), nodes[0], nodes[1]];
+        persistence
+            .apply_update(
+                ActiveNodeSetUpdate {
+                    espresso_block,
+                    diff: vec![ActiveNodeSetDiff::NewEpoch(new_nodes.clone())],
+                },
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        let snapshot = persistence.active_node_set().await.unwrap().unwrap();
+        assert_eq!(
+            snapshot.nodes,
+            new_nodes
+                .iter()
+                .copied()
+                .map(ActiveNode::new)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test_log::test(tokio::test(flavor = "multi_thread"))]
+    async fn test_active_node_set_new_epoch_nodes_removed() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        let options = PersistenceOptions {
+            path: db_path,
+            max_connections: 5,
+        };
+        let persistence = Persistence::new(&options).await.unwrap();
+
+        // Prior to the first update being processed, we have no snapshot.
+        assert_eq!(persistence.active_node_set().await.unwrap(), None);
+
+        // Store an update with an Espresso block and a list of nodes.
+        let espresso_block = EpochAndBlock {
+            block: 100,
+            epoch: 200,
+            timestamp: 300,
+        };
+        let nodes = vec![Address::random(), Address::random()];
+        persistence
+            .apply_update(
+                ActiveNodeSetUpdate {
+                    espresso_block,
+                    diff: vec![
+                        ActiveNodeSetDiff::NewEpoch(nodes.clone()),
+                        // Populate some statistics. These will become stale in the next epoch and
+                        // we can check that they get cleared.
+                        ActiveNodeSetDiff::NewBlock {
+                            leader: 0,
+                            failed_leaders: vec![],
+                            voters: [true, true].into_iter().collect(),
+                        },
+                    ],
+                },
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        let snapshot = persistence.active_node_set().await.unwrap().unwrap();
+        assert_eq!(snapshot.espresso_block, espresso_block);
+        assert_eq!(snapshot.nodes.len(), nodes.len());
+        for (node, addr) in snapshot.nodes.into_iter().zip(&nodes) {
+            assert_eq!(node.address, *addr);
+            assert_ne!(node.votes, 0);
+        }
+
+        // Start a new epoch, removing the first node.
+        let new_nodes = vec![nodes[1]];
+        persistence
+            .apply_update(
+                ActiveNodeSetUpdate {
+                    espresso_block,
+                    diff: vec![ActiveNodeSetDiff::NewEpoch(new_nodes.clone())],
+                },
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        let snapshot = persistence.active_node_set().await.unwrap().unwrap();
+        assert_eq!(
+            snapshot.nodes,
+            new_nodes
+                .iter()
+                .copied()
+                .map(ActiveNode::new)
+                .collect::<Vec<_>>()
         );
     }
 
