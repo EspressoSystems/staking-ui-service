@@ -107,8 +107,7 @@ impl<S: EspressoPersistence, C: EspressoClient> State<S, C> {
         // max 5 concurrent requests
         let semaphore = Arc::new(Semaphore::new(5));
 
-        let reward_futures = addresses.iter().map(|addr| {
-            let addr = *addr;
+        let reward_futures = addresses.into_iter().map(|addr| {
             let semaphore = Arc::clone(&semaphore);
             async move {
                 let _permit = semaphore.acquire().await.unwrap();
@@ -386,7 +385,7 @@ impl<S: EspressoPersistence, C: EspressoClient> State<S, C> {
 
             state
                 .storage
-                .populate_missing_reward_accounts(&reward_addresses, height - 1, &espresso)
+                .fetch_and_insert_missing_reward_accounts(&espresso, &reward_addresses, height - 1)
                 .await
                 .map_err(|err| err.context("ensuring reward accounts exist"))?;
         }
@@ -646,11 +645,11 @@ pub trait EspressoPersistence {
     ///
     /// For accounts that don't exist, fetches their balances from the Espresso API and inserts them.
     /// This should be called before applying incremental rewards to ensure data consistency.
-    fn populate_missing_reward_accounts<C: EspressoClient + Sync>(
+    fn fetch_and_insert_missing_reward_accounts<C: EspressoClient + Sync>(
         &mut self,
+        espresso: &C,
         accounts: &HashSet<Address>,
         block: u64,
-        espresso: &C,
     ) -> impl Send + Future<Output = Result<()>>;
 
     /// Initialize lifetime rewards

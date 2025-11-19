@@ -26,7 +26,9 @@ use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
     str::FromStr,
+    sync::Arc,
 };
+use tokio::sync::Semaphore;
 use tracing::{instrument, log::LevelFilter};
 
 /// Options for persistence.
@@ -724,11 +726,11 @@ impl EspressoPersistence for Persistence {
         Ok(addresses?)
     }
 
-    async fn populate_missing_reward_accounts<C: EspressoClient + Sync>(
+    async fn fetch_and_insert_missing_reward_accounts<C: EspressoClient + Sync>(
         &mut self,
+        espresso: &C,
         accounts: &HashSet<Address>,
         block: u64,
-        espresso: &C,
     ) -> Result<()> {
         if accounts.is_empty() {
             return Ok(());
@@ -740,9 +742,14 @@ impl EspressoPersistence for Persistence {
         }
 
         // Fetch balances from the API for missing accounts and insert them
-        let futs = missing_accounts.iter().map(|addr| {
-            let addr = *addr;
+        // max 5 concurrent requests
+        let semaphore = Arc::new(Semaphore::new(5));
+
+        let futs = missing_accounts.into_iter().map(|addr| {
+            let semaphore = Arc::clone(&semaphore);
             async move {
+                let _permit = semaphore.acquire().await.unwrap();
+
                 let balance = espresso.reward_balance(block, addr).await.map_err(|e| {
                     Error::internal().context(format!(
                         "Failed to fetch balance for new account {addr} from API at block {block}: {e}",

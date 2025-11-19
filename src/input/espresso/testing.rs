@@ -350,11 +350,11 @@ impl EspressoPersistence for MemoryStorage {
             .collect())
     }
 
-    async fn populate_missing_reward_accounts<C: EspressoClient + Sync>(
+    async fn fetch_and_insert_missing_reward_accounts<C: EspressoClient + Sync>(
         &mut self,
+        espresso: &C,
         accounts: &HashSet<Address>,
         block: u64,
-        espresso: &C,
     ) -> Result<()> {
         self.mock_errors()?;
 
