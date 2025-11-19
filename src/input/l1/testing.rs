@@ -569,6 +569,7 @@ pub fn validator_registered_event(mut rng: impl RngCore + CryptoRng) -> Validato
         commission,
         blsSig: G1PointSol::from(bls_sig).into(),
         schnorrSig: StateSignatureSol::from(schnorr_sig).into(),
+        metadataUri: String::new(),
     }
 }
 

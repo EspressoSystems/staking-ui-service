@@ -170,6 +170,17 @@ where
             state.espresso.read().await.active_node_set_update(block)
         }
         .boxed()
+    })?
+    .at("wallet_rewards", |req, state| {
+        async move {
+            let address = req
+                .string_param("address")?
+                .parse()
+                .context(Error::bad_request)?;
+            let block: u64 = req.integer_param("block")?;
+            state.espresso.read().await.lifetime_rewards(address, block).await
+        }
+        .boxed()
     })?;
 
     Ok(())
@@ -536,6 +547,107 @@ mod test {
 
         task.abort();
         let _ = task.await;
+    }
+
+    #[test_log::test(tokio::test(flavor = "multi_thread"))]
+    async fn test_wallet_rewards() {
+        let port = pick_unused_port().unwrap();
+        let url = format!("http://localhost:{port}/v0/staking/")
+            .parse()
+            .unwrap();
+
+        let mut espresso = MockEspressoClient::new(2).await;
+
+        espresso.push_leaf(0, [true, true]).await;
+        espresso.push_leaf(0, [true, true]).await;
+        espresso.push_leaf(0, [true, true]).await;
+
+        let last_leaf = espresso.last_leaf().0.clone();
+        let epoch = espresso.current_epoch();
+        let nodes = espresso.stake_table_for_epoch(epoch).await.unwrap();
+        let node_0_address = nodes[0].account;
+        let node_1_address = nodes[1].account;
+
+        let espresso_state = espresso::State::new(EspressoStorage::default(), espresso)
+            .await
+            .unwrap();
+        let espresso = Arc::new(RwLock::new(espresso_state));
+        let espresso_update_task = espresso::State::update_task(espresso.clone());
+
+        let l1 = empty_l1_state().await;
+
+        let state = State::new(Arc::new(RwLock::new(l1)), espresso.clone());
+        let server_task = spawn(state.serve(port));
+        let update_task = spawn(espresso_update_task);
+
+        let client = Client::<Error, Version>::new(url);
+        client.connect(None).await;
+
+        // Query rewards for node 0
+        let rewards_0: U256 = client
+            .get(&format!(
+                "wallet/{node_0_address}/rewards/{}",
+                last_leaf.height()
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        tracing::info!(?rewards_0, "node 0 rewards");
+
+        // Query rewards for node 1
+        let rewards_1: U256 = client
+            .get(&format!(
+                "wallet/{node_1_address}/rewards/{}",
+                last_leaf.height()
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        tracing::info!(?rewards_1, "node 1 rewards");
+
+        // Each validator should have earned some rewards (non-zero)
+        assert!(rewards_0 > U256::ZERO, "node 0 should have earned rewards");
+        assert!(rewards_1 > U256::ZERO, "node 1 should have earned rewards");
+
+        // With 3 blocks produced and 1 ESP per block, total rewards distributed should be 3 ESP
+        let total_rewards = rewards_0 + rewards_1;
+        let expected_total = U256::from(3_000_000_000_000_000_000u128);
+        assert_eq!(
+            total_rewards, expected_total,
+            "total rewards should equal 3 ESP for 3 blocks"
+        );
+
+        let unknown_address = Address::random();
+        let unknown_rewards: U256 = client
+            .get(&format!(
+                "wallet/{unknown_address}/rewards/{}",
+                last_leaf.height()
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            unknown_rewards,
+            U256::ZERO,
+            "unknown address should have zero rewards"
+        );
+
+        let err = client
+            .get::<U256>(&format!(
+                "wallet/{node_0_address}/rewards/{}",
+                last_leaf.height() + 100
+            ))
+            .send()
+            .await
+            .unwrap_err();
+        assert_eq!(err.status(), StatusCode::NOT_FOUND);
+
+        server_task.abort();
+        update_task.abort();
+        let _ = server_task.await;
+        let _ = update_task.await;
     }
 
     #[test_log::test(tokio::test(flavor = "multi_thread"))]

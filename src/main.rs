@@ -207,7 +207,7 @@ mod test {
         let deployment = ContractDeployment::deploy(l1_http.clone()).await.unwrap();
 
         let espresso_port = pick_unused_port().unwrap();
-        let (mut network, _storage) = start_pos_network(espresso_port).await;
+        let (mut network, _storage, _deployment) = start_pos_network(espresso_port).await;
         let espresso_url = format!("http://localhost:{espresso_port}").parse().unwrap();
 
         let opt = Options {
