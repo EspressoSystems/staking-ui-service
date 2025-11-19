@@ -1301,7 +1301,7 @@ mod test {
             None
         };
 
-        let espresso_url = format!("http://localhost:{}", espresso_port);
+        let espresso_url = format!("http://localhost:{espresso_port}");
         let espresso_client =
             QueryServiceClient::new(QueryServiceOptions::new(espresso_url.parse().unwrap()))
                 .await
