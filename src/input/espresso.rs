@@ -485,7 +485,7 @@ pub trait EspressoPersistence {
 
     /// Apply changes to persistent storage after the given Espresso block.
     fn apply_update(
-        &self,
+        &mut self,
         update: ActiveNodeSetUpdate,
         rewards: Vec<(Address, ESPTokenAmount)>,
     ) -> impl Send + Future<Output = Result<()>>;

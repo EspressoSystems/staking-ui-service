@@ -327,7 +327,7 @@ impl EspressoPersistence for MemoryStorage {
     }
 
     async fn apply_update(
-        &self,
+        &mut self,
         update: ActiveNodeSetUpdate,
         new_rewards: Vec<(Address, ESPTokenAmount)>,
     ) -> Result<()> {
