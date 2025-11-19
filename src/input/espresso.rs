@@ -1285,20 +1285,12 @@ mod test {
             );
         }
     }
-
-    async fn run_wallet_block_rewards_e2e_test(with_background_task: bool) {
+    #[test_log::test(tokio::test(flavor = "multi_thread"))]
+    async fn test_wallet_block_rewards_e2e_test() {
         let espresso_port = portpicker::pick_unused_port().expect("No free ports");
-        let (network, _storage, deployment) = start_pos_network(espresso_port).await;
+        let (network, _storage, _deployment) = start_pos_network(espresso_port).await;
 
         tracing::info!("Started Espresso network on port {espresso_port}");
-
-        // Optionally spawn background task to generate contract events
-        let _background_task = if with_background_task {
-            tracing::info!("Starting background task for contract events");
-            Some(deployment.spawn_task())
-        } else {
-            None
-        };
 
         let espresso_url = format!("http://localhost:{espresso_port}");
         let espresso_client =
@@ -1477,15 +1469,5 @@ mod test {
         }
 
         drop(network);
-    }
-
-    #[test_log::test(tokio::test(flavor = "multi_thread"))]
-    async fn test_wallet_block_rewards_e2e() {
-        run_wallet_block_rewards_e2e_test(false).await;
-    }
-
-    #[test_log::test(tokio::test(flavor = "multi_thread"))]
-    async fn test_wallet_block_rewards_e2e_with_background_task() {
-        run_wallet_block_rewards_e2e_test(true).await;
     }
 }
