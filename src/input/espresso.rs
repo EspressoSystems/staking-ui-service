@@ -1,17 +1,14 @@
 //! Input data from Espresso network.
 
-use std::{
-    collections::{BTreeMap, HashMap},
-    sync::Arc,
-    time::Duration,
-};
-
-use alloy::primitives::U256;
 use async_lock::{RwLock, RwLockUpgradableReadGuard};
 use bitvec::vec::BitVec;
 use derivative::Derivative;
-use espresso_types::{Leaf2, PubKey, ValidatorMap};
-use futures::{Stream, StreamExt};
+use espresso_types::{
+    DrbAndHeaderUpgradeVersion, Leaf2, PubKey, ValidatorMap,
+    v0::RewardDistributor,
+    v0_3::{RewardAmount, Validator},
+};
+use futures::{Stream, StreamExt, future};
 use hotshot_types::{
     data::ViewNumber,
     drb::{
@@ -22,8 +19,14 @@ use hotshot_types::{
     traits::{block_contents::BlockHeader, node_implementation::ConsensusTime},
     utils::{epoch_from_block_number, transition_block_for_epoch},
 };
-use tokio::time::sleep;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::Duration,
+};
+use tokio::{sync::Semaphore, time::sleep};
 use tracing::instrument;
+use vbs::version::StaticVersionType;
 
 use crate::{
     Error, Result,
@@ -77,7 +80,67 @@ pub struct State<S, C> {
 }
 
 impl<S: EspressoPersistence, C: EspressoClient> State<S, C> {
-    pub async fn new(storage: S, espresso: C) -> Result<Self> {
+    /// Synchronize lifetime rewards from Espresso API for all known accounts.
+    ///
+    /// This fetches balances for:
+    /// - All existing accounts in the database
+    /// - All validators and delegators in the current epoch's stake table
+    async fn sync_lifetime_rewards(
+        storage: &mut S,
+        espresso: &C,
+        epoch: &EpochState,
+        block_height: u64,
+    ) -> Result<()> {
+        tracing::info!("Synchronizing lifetime rewards from Espresso API at block {block_height}");
+
+        let mut addresses = HashSet::new();
+
+        let existing_accts = storage.all_reward_accounts().await?;
+        addresses.extend(existing_accts);
+
+        for validator in &epoch.validators {
+            addresses.insert(validator.account);
+            addresses.extend(validator.delegators.keys().copied());
+        }
+
+        // Query reward balances from Espresso API
+        // max 5 concurrent requests
+        let semaphore = Arc::new(Semaphore::new(5));
+
+        let reward_futures = addresses.iter().map(|addr| {
+            let addr = *addr;
+            let semaphore = Arc::clone(&semaphore);
+            async move {
+                let _permit = semaphore.acquire().await.unwrap();
+
+                match espresso.reward_balance(block_height, addr).await {
+                    Ok(balance) => Ok((addr, balance)),
+                    Err(e) => {
+                        tracing::error!("Failed to fetch reward balance for {addr}: {e}");
+                        Err(Error::internal()
+                            .context(format!("Failed to fetch reward balance for {addr}: {e}")))
+                    }
+                }
+            }
+        });
+
+        let reward_balances: Vec<_> = future::try_join_all(reward_futures).await?;
+
+        if !reward_balances.is_empty() {
+            storage
+                .initialize_lifetime_rewards(reward_balances)
+                .await
+                .map_err(|e| {
+                    Error::internal().context(format!(
+                        "synchronizing lifetime rewards from Espresso API: {e}",
+                    ))
+                })?;
+        }
+
+        Ok(())
+    }
+
+    pub async fn new(mut storage: S, espresso: C) -> Result<Self> {
         let current_epoch = espresso.wait_for_epochs().await;
 
         // Fetch the current epoch state.
@@ -118,8 +181,10 @@ impl<S: EspressoPersistence, C: EspressoClient> State<S, C> {
                 // Set our state to the last block of the previous epoch, so that when we start up,
                 // the first block we process is the first block of this epoch.
                 let leaf = espresso.leaf(epoch.start_block(epoch_height) - 1).await?;
-                // TODO fetch the reward balance of every account as of the start of this epoch, so
-                // we can initialize our lifetime rewards storage.
+
+                // Synchronize lifetime rewards from the Espresso API
+                Self::sync_lifetime_rewards(&mut storage, &espresso, &epoch, leaf.height()).await?;
+
                 (leaf.height(), leaf.view_number())
             }
         };
@@ -184,12 +249,21 @@ impl<S: EspressoPersistence, C: EspressoClient> State<S, C> {
     /// block.
     pub async fn lifetime_rewards(&self, account: Address, block: u64) -> Result<ESPTokenAmount> {
         ensure!(
-            block == self.latest_espresso_block,
+            block <= self.latest_espresso_block,
             Error::not_found().context(format!(
-                "lifetime rewards are only available for the latest Espresso block {}",
+                "Espresso block {block} is not available; latest available block is {}",
                 self.latest_espresso_block
             ))
         );
+
+        ensure!(
+            block == self.latest_espresso_block,
+            Error::gone().context(format!(
+                "Espresso block {block} is not available; rewards are only available for the latest block {}",
+                self.latest_espresso_block
+            ))
+        );
+
         self.storage.lifetime_rewards(account).await
     }
 
@@ -260,6 +334,17 @@ impl<S: EspressoPersistence, C: EspressoClient> State<S, C> {
             ))
         );
 
+        // Assert that block reward is present for V4+ leaves
+        if leaf.block_header().version() >= DrbAndHeaderUpgradeVersion::version() {
+            ensure!(
+                epoch.block_reward.is_some(),
+                Error::internal().context(format!(
+                    "block reward must be present for V4+ leaves, but missing for epoch {} at leaf {height}",
+                    epoch.number(),
+                ))
+            );
+        }
+
         // Update leader and voter statistics.
         let leader = epoch.leader(leaf.view_number());
         // Find the leaders of any views between the previous block and this one, which must have
@@ -285,11 +370,29 @@ impl<S: EspressoPersistence, C: EspressoClient> State<S, C> {
         };
 
         // Compute reward distribution for this block.
-        let rewards = epoch.reward_distribution(leader);
+        let rewards = epoch
+            .reward_distribution(leader, &state.espresso)
+            .await
+            .map_err(|err| err.context("computing reward distribution"))?;
 
         // Update state with the results of this block.
         let mut state = RwLockUpgradableReadGuard::upgrade(state).await;
-        // Update storage first. This will succeed for fail atomically. We can then update the
+
+        // Ensure all accounts receiving rewards exist in the database with their correct historical balances
+        // This must be done BEFORE applying incremental rewards to maintain data consistency
+        if !rewards.is_empty() && height > 0 {
+            let reward_addresses: HashSet<_> = rewards.iter().map(|(addr, _)| *addr).collect();
+            let espresso = state.espresso.clone();
+
+            state
+                .storage
+                .populate_missing_reward_accounts(&reward_addresses, height - 1, &espresso)
+                .await
+                .map_err(|err| err.context("ensuring reward accounts exist"))?;
+        }
+
+        // Now apply the incremental rewards
+        // Update storage first. This will succeed or fail atomically. We can then update the
         // in-memory state to match; since we hold an exclusive lock on the state, no one will see
         // the in-memory state before the update has been completed.
         state
@@ -297,6 +400,7 @@ impl<S: EspressoPersistence, C: EspressoClient> State<S, C> {
             .apply_update(update.clone(), rewards)
             .await
             .map_err(|err| err.context("updating storage"))?;
+
         // At this point, we have already updated storage and now are updating the in-memory state
         // object in place. We must not fail after this point, or we may drop the write lock while
         // the state is in a partially modified state. All the validation performed up to this point
@@ -331,6 +435,9 @@ struct EpochState {
     /// The number of this epoch.
     number: u64,
 
+    /// The block reward amount for this epoch
+    block_reward: Option<ESPTokenAmount>,
+
     /// The post-processed stake table, used for the leader election function.
     // It is safe to ignore this field in comparisons
     #[derivative(PartialEq(compare_with = "Self::committee_eq"))]
@@ -347,9 +454,8 @@ struct EpochState {
     /// Reverse lookup, from public keys to indices within the `active_nodes` list.
     node_index: HashMap<PubKey, usize>,
 
-    /// The delegators to each active node.
-    #[allow(dead_code)]
-    delegators: BTreeMap<Address, Vec<(Address, U256)>>,
+    /// The full validator information for each active node
+    validators: Vec<Validator<PubKey>>,
 }
 
 impl EpochState {
@@ -357,6 +463,8 @@ impl EpochState {
     fn new(number: u64, nodes: ValidatorMap, drb_result: DrbResult) -> Self {
         // Get active node addresses.
         let active_nodes = nodes.keys().copied().collect::<Vec<_>>();
+        let validators: Vec<_> = nodes.values().cloned().collect();
+
         // Index active nodes by staking key.
         let node_index = nodes
             .values()
@@ -374,18 +482,13 @@ impl EpochState {
             .collect();
         let committee = generate_stake_cdf(entries, drb_result);
 
-        // Index delegator lists by address.
-        let delegators = nodes
-            .into_values()
-            .map(|node| (node.account, node.delegators.into_iter().collect()))
-            .collect();
-
         Self {
             number,
+            block_reward: None,
             committee,
             active_nodes,
             node_index,
-            delegators,
+            validators,
         }
     }
 
@@ -430,7 +533,11 @@ impl EpochState {
             ))
         })?;
 
-        Ok(Self::new(epoch, stake_table, drb_result))
+        let mut state = Self::new(epoch, stake_table, drb_result);
+        let block_reward = espresso.block_reward(epoch).await?;
+        state.block_reward = Some(block_reward);
+
+        Ok(state)
     }
 
     /// The index of the leader for `view`.
@@ -442,9 +549,52 @@ impl EpochState {
     }
 
     /// Compute rewards to distribute to each account for a given block.
-    fn reward_distribution(&self, _leader: usize) -> Vec<(Address, ESPTokenAmount)> {
-        // TODO: actually compute rewards
-        vec![]
+    async fn reward_distribution<C: EspressoClient>(
+        &self,
+        leader: usize,
+        _client: &C,
+    ) -> Result<Vec<(Address, ESPTokenAmount)>> {
+        let block_reward_amount = match self.block_reward {
+            Some(reward) => reward,
+            None => {
+                tracing::warn!(
+                    "Block reward not found for epoch={}, skipping reward distribution",
+                    self.number
+                );
+                return Ok(vec![]);
+            }
+        };
+
+        if block_reward_amount.is_zero() {
+            return Ok(vec![]);
+        }
+
+        let validator = self
+            .validators
+            .get(leader)
+            .ok_or_else(|| {
+                Error::internal().context(format!(
+                    "leader index {leader} out of bounds (validators len: {})",
+                    self.validators.len()
+                ))
+            })?
+            .clone();
+
+        let distributor = RewardDistributor::new(
+            validator,
+            RewardAmount(block_reward_amount),
+            RewardAmount::from(0u64), // total_distributed not needed for compute_rewards
+        );
+
+        let computed_rewards = distributor.compute_rewards().map_err(|err| {
+            Error::internal().context(format!("failed to compute rewards: {err}"))
+        })?;
+
+        Ok(computed_rewards
+            .all_rewards()
+            .into_iter()
+            .map(|(addr, reward)| (addr, reward.0))
+            .collect())
     }
 
     /// The addresses of nodes in this epoch, in a consistent order.
@@ -483,6 +633,35 @@ pub trait EspressoPersistence {
         account: Address,
     ) -> impl Send + Future<Output = Result<ESPTokenAmount>>;
 
+    /// Get all accounts that have lifetime rewards in storage.
+    fn all_reward_accounts(&self) -> impl Send + Future<Output = Result<Vec<Address>>>;
+
+    /// Check which accounts from the given set don't exist in the lifetime_rewards table.
+    fn missing_reward_accounts(
+        &self,
+        accounts: &HashSet<Address>,
+    ) -> impl Send + Future<Output = Result<Vec<Address>>>;
+
+    /// Ensure accounts exist in the lifetime_rewards table
+    ///
+    /// For accounts that don't exist, fetches their balances from the Espresso API and inserts them.
+    /// This should be called before applying incremental rewards to ensure data consistency.
+    fn populate_missing_reward_accounts<C: EspressoClient + Sync>(
+        &mut self,
+        accounts: &HashSet<Address>,
+        block: u64,
+        espresso: &C,
+    ) -> impl Send + Future<Output = Result<()>>;
+
+    /// Initialize lifetime rewards
+    ///
+    /// This is used at startup to populate the lifetime_rewards table with balances
+    /// from the Espresso API.
+    fn initialize_lifetime_rewards(
+        &mut self,
+        rewards: Vec<(Address, ESPTokenAmount)>,
+    ) -> impl Send + Future<Output = Result<()>>;
+
     /// Apply changes to persistent storage after the given Espresso block.
     fn apply_update(
         &mut self,
@@ -509,16 +688,24 @@ pub struct ActiveNodeSet {
 impl ActiveNodeSet {
     /// Convert this node set into the public API representation of an active node set.
     pub fn into_snapshot(self, epoch_start_block: u64) -> ActiveNodeSetSnapshot {
+        let blocks_in_epoch = self
+            .espresso_block
+            .block
+            .checked_sub(epoch_start_block)
+            .unwrap_or_else(|| {
+                panic!(
+                    "Block {} (epoch {}) < epoch_start_block {epoch_start_block}",
+                    self.espresso_block.block, self.espresso_block.epoch
+                )
+            }) as usize
+            + 1;
+
         ActiveNodeSetSnapshot {
             espresso_block: self.espresso_block,
             nodes: self
                 .nodes
                 .into_iter()
-                .map(|node| {
-                    node.into_node_set_entry(
-                        (self.espresso_block.block - epoch_start_block) as usize + 1,
-                    )
-                })
+                .map(|node| node.into_node_set_entry(blocks_in_epoch))
                 .collect(),
         }
     }
@@ -555,7 +742,7 @@ impl ActiveNode {
 }
 
 /// Interface for querying data from Espresso.
-pub trait EspressoClient: Clone {
+pub trait EspressoClient: Clone + Sync {
     /// Wait until epochs begin, in case the service is started before the POS upgrade.
     ///
     /// Eventually resolves with the current epoch number.
@@ -573,6 +760,16 @@ pub trait EspressoClient: Clone {
     /// Fetch a leaf.
     fn leaf(&self, height: u64) -> impl Send + Future<Output = Result<Leaf2>>;
 
+    /// Get the block reward amount for a given epoch.
+    fn block_reward(&self, epoch: u64) -> impl Send + Future<Output = Result<ESPTokenAmount>>;
+
+    /// Query the reward balance for an account at a specific block from the API.
+    fn reward_balance(
+        &self,
+        block: u64,
+        account: Address,
+    ) -> impl Send + Future<Output = Result<ESPTokenAmount>>;
+
     /// Subscribe to leaves starting from the requested height.
     ///
     /// Each leaf is paired with the set of voters who signed it.
@@ -584,6 +781,14 @@ mod test {
     use crate::input::espresso::testing::{MockEspressoClient, fake_drb_result};
 
     use super::*;
+
+    use crate::input::espresso::client::{QueryServiceClient, QueryServiceOptions};
+    use crate::persistence::sql::{Persistence, PersistenceOptions};
+    use alloy::primitives::U256;
+    use surf_disco::Client as HttpClient;
+    use tempfile::NamedTempFile;
+    use testing::start_pos_network;
+    use vbs::version::StaticVersion;
 
     use alloy::transports::http::reqwest::StatusCode;
     use testing::MemoryStorage;
@@ -984,5 +1189,304 @@ mod test {
             ))
         })
         .await;
+    }
+
+    async fn wait_for_state_and_rewards(
+        state_lock: &Arc<RwLock<State<Persistence, QueryServiceClient>>>,
+        http_client: &HttpClient<crate::Error, StaticVersion<0, 1>>,
+        target_epoch: u64,
+        epoch_height: u64,
+    ) -> u64 {
+        let min_blocks_to_wait = target_epoch * epoch_height;
+        tracing::info!(
+            "Waiting for blocks up to epoch {target_epoch} (block {min_blocks_to_wait})"
+        );
+
+        loop {
+            sleep(Duration::from_secs(1)).await;
+            let state = state_lock.read().await;
+            let latest_block = state.latest_espresso_block();
+            tracing::info!("Latest Espresso block processed: {latest_block}");
+
+            if latest_block >= min_blocks_to_wait {
+                break;
+            }
+        }
+
+        let final_state = state_lock.read().await;
+        let active_node_snapshot = final_state
+            .active_node_set()
+            .await
+            .expect("Failed to get active node set");
+        let latest_espresso_block = active_node_snapshot.espresso_block.block;
+
+        loop {
+            sleep(Duration::from_secs(1)).await;
+
+            match http_client
+                .get::<u64>("reward-state-v2/block-height")
+                .send()
+                .await
+            {
+                Ok(block) if block >= latest_espresso_block => {
+                    tracing::info!("Reward-state is at block {block}");
+                    break latest_espresso_block;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!("Failed to get reward-state block height, will retry: {e}");
+                }
+            }
+        }
+    }
+
+    async fn assert_reward_balances(
+        state_lock: &Arc<RwLock<State<Persistence, QueryServiceClient>>>,
+        http_client: &HttpClient<crate::Error, StaticVersion<0, 1>>,
+        latest_espresso_block: u64,
+    ) {
+        let state = state_lock.read().await;
+
+        let active_node_snapshot = state
+            .active_node_set()
+            .await
+            .expect("Failed to get active node set");
+
+        assert!(
+            !active_node_snapshot.nodes.is_empty(),
+            "Should have active nodes"
+        );
+
+        for (idx, node) in active_node_snapshot.nodes.iter().enumerate() {
+            let stored_rewards = state
+                .storage
+                .lifetime_rewards(node.address)
+                .await
+                .unwrap_or_default();
+
+            let espresso_reward_balance: U256 = http_client
+                .get::<Option<RewardAmount>>(&format!(
+                    "reward-state-v2/reward-balance/{}/{}",
+                    latest_espresso_block, node.address
+                ))
+                .send()
+                .await
+                .expect("Failed to get reward balance")
+                .map(|amount| amount.0)
+                .unwrap_or(U256::from(0));
+
+            tracing::info!(
+                "Node {idx}: stored_rewards={stored_rewards} WEI, espresso_api={espresso_reward_balance} WEI at block {latest_espresso_block}"
+            );
+
+            assert_eq!(
+                U256::from(stored_rewards),
+                espresso_reward_balance,
+                "Node {idx} reward balance mismatch: stored={stored_rewards}, espresso_api={espresso_reward_balance}"
+            );
+        }
+    }
+
+    async fn run_wallet_block_rewards_e2e_test(with_background_task: bool) {
+        let espresso_port = portpicker::pick_unused_port().expect("No free ports");
+        let (network, _storage, deployment) = start_pos_network(espresso_port).await;
+
+        tracing::info!("Started Espresso network on port {espresso_port}");
+
+        // Optionally spawn background task to generate contract events
+        let _background_task = if with_background_task {
+            tracing::info!("Starting background task for contract events");
+            Some(deployment.spawn_task())
+        } else {
+            None
+        };
+
+        let espresso_url = format!("http://localhost:{}", espresso_port);
+        let espresso_client =
+            QueryServiceClient::new(QueryServiceOptions::new(espresso_url.parse().unwrap()))
+                .await
+                .expect("Failed to create Espresso client");
+
+        let current_epoch = espresso_client.wait_for_epochs().await;
+        tracing::info!("Epochs started, current epoch: {current_epoch}");
+
+        let http_client: HttpClient<crate::Error, StaticVersion<0, 1>> =
+            HttpClient::new(espresso_url.parse().unwrap());
+        http_client.connect(None).await;
+
+        let temp_db = NamedTempFile::new().expect("Failed to create temp file");
+        let temp_db_path = temp_db.path().to_path_buf();
+
+        let epoch_height = {
+            let espresso_storage = Persistence::new(&PersistenceOptions {
+                path: temp_db_path.clone(),
+                max_connections: 5,
+            })
+            .await
+            .expect("Failed to create SQL persistence");
+            let espresso_state = State::new(espresso_storage.clone(), espresso_client.clone())
+                .await
+                .expect("Failed to initialize Espresso state");
+            espresso_state.epoch_height
+        };
+
+        // Test at current_epoch
+        {
+            tracing::info!("Testing at epoch {}", current_epoch);
+            let espresso_storage = Persistence::new(&PersistenceOptions {
+                path: temp_db_path.clone(),
+                max_connections: 5,
+            })
+            .await
+            .expect("Failed to create SQL persistence");
+            let espresso_state = State::new(espresso_storage.clone(), espresso_client.clone())
+                .await
+                .expect("Failed to initialize Espresso state");
+
+            let state_lock = Arc::new(RwLock::new(espresso_state));
+            let update_task = spawn(State::update_task(state_lock.clone()));
+
+            let latest_block =
+                wait_for_state_and_rewards(&state_lock, &http_client, current_epoch, epoch_height)
+                    .await;
+
+            tracing::info!("Reached latest block {latest_block}");
+            update_task.abort();
+
+            assert_reward_balances(&state_lock, &http_client, latest_block).await;
+        }
+
+        // Test at current_epoch + 3
+        {
+            tracing::info!("Testing at epoch {}", current_epoch + 3);
+            let espresso_storage = Persistence::new(&PersistenceOptions {
+                path: temp_db_path.clone(),
+                max_connections: 5,
+            })
+            .await
+            .expect("Failed to create SQL persistence");
+            let espresso_state = State::new(espresso_storage.clone(), espresso_client.clone())
+                .await
+                .expect("Failed to initialize Espresso state");
+
+            let state_lock = Arc::new(RwLock::new(espresso_state));
+            let update_task = spawn(State::update_task(state_lock.clone()));
+
+            let latest_block = wait_for_state_and_rewards(
+                &state_lock,
+                &http_client,
+                current_epoch + 3,
+                epoch_height,
+            )
+            .await;
+
+            tracing::info!("Reached latest block {latest_block}");
+            update_task.abort();
+
+            assert_reward_balances(&state_lock, &http_client, latest_block).await;
+        }
+
+        // Test at current_epoch + 3 again
+        {
+            tracing::info!("Testing at epoch {} (repeat)", current_epoch + 3);
+            let espresso_storage = Persistence::new(&PersistenceOptions {
+                path: temp_db_path.clone(),
+                max_connections: 5,
+            })
+            .await
+            .expect("Failed to create SQL persistence");
+            let espresso_state = State::new(espresso_storage.clone(), espresso_client.clone())
+                .await
+                .expect("Failed to initialize Espresso state");
+
+            let state_lock = Arc::new(RwLock::new(espresso_state));
+            let update_task = spawn(State::update_task(state_lock.clone()));
+
+            let latest_block = wait_for_state_and_rewards(
+                &state_lock,
+                &http_client,
+                current_epoch + 3,
+                epoch_height,
+            )
+            .await;
+
+            tracing::info!("Reached latest block {latest_block}");
+            update_task.abort();
+
+            assert_reward_balances(&state_lock, &http_client, latest_block).await;
+        }
+
+        // Test at current_epoch + 4
+        {
+            tracing::info!("Testing at epoch {}", current_epoch + 4);
+            let espresso_storage = Persistence::new(&PersistenceOptions {
+                path: temp_db_path.clone(),
+                max_connections: 5,
+            })
+            .await
+            .expect("Failed to create SQL persistence");
+            let espresso_state = State::new(espresso_storage.clone(), espresso_client.clone())
+                .await
+                .expect("Failed to initialize Espresso state");
+
+            let state_lock = Arc::new(RwLock::new(espresso_state));
+            let update_task = spawn(State::update_task(state_lock.clone()));
+
+            let latest_block = wait_for_state_and_rewards(
+                &state_lock,
+                &http_client,
+                current_epoch + 4,
+                epoch_height,
+            )
+            .await;
+
+            tracing::info!("Reached latest block {latest_block}");
+            update_task.abort();
+
+            assert_reward_balances(&state_lock, &http_client, latest_block).await;
+        }
+
+        // Test at current_epoch + 4 with new storage
+        {
+            tracing::info!("Testing at epoch {} (with new storage)", current_epoch + 4);
+            let temp_db2 = NamedTempFile::new().expect("Failed to create temp file");
+            let espresso_storage = Persistence::new(&PersistenceOptions {
+                path: temp_db2.path().to_path_buf(),
+                max_connections: 5,
+            })
+            .await
+            .expect("Failed to create SQL persistence");
+            let espresso_state = State::new(espresso_storage.clone(), espresso_client.clone())
+                .await
+                .expect("Failed to initialize Espresso state");
+
+            let state_lock = Arc::new(RwLock::new(espresso_state));
+            let update_task = spawn(State::update_task(state_lock.clone()));
+
+            let latest_block = wait_for_state_and_rewards(
+                &state_lock,
+                &http_client,
+                current_epoch + 4,
+                epoch_height,
+            )
+            .await;
+
+            tracing::info!("Reached latest block {latest_block}");
+            update_task.abort();
+
+            assert_reward_balances(&state_lock, &http_client, latest_block).await;
+        }
+
+        drop(network);
+    }
+
+    #[test_log::test(tokio::test(flavor = "multi_thread"))]
+    async fn test_wallet_block_rewards_e2e() {
+        run_wallet_block_rewards_e2e_test(false).await;
+    }
+
+    #[test_log::test(tokio::test(flavor = "multi_thread"))]
+    async fn test_wallet_block_rewards_e2e_with_background_task() {
+        run_wallet_block_rewards_e2e_test(true).await;
     }
 }

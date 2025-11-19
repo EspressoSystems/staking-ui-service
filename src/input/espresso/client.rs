@@ -2,7 +2,9 @@ use std::time::Duration;
 
 use bitvec::vec::BitVec;
 use clap::Parser;
-use espresso_types::{Leaf2, SeqTypes, ValidatorMap, config::PublicNetworkConfig, parse_duration};
+use espresso_types::{
+    Leaf2, SeqTypes, ValidatorMap, config::PublicNetworkConfig, parse_duration, v0_3::RewardAmount,
+};
 use futures::{Stream, StreamExt, TryFutureExt, TryStreamExt, stream};
 use hotshot_query_service::{availability::LeafQueryData, types::HeightIndexed};
 use hotshot_types::utils::epoch_from_block_number;
@@ -11,7 +13,12 @@ use tokio::time::{sleep, timeout};
 use tracing::instrument;
 use vbs::version::StaticVersion;
 
-use crate::{Error, Result, error::ensure, input::espresso::EspressoClient};
+use crate::{
+    Error, Result,
+    error::ensure,
+    input::espresso::EspressoClient,
+    types::common::{Address, ESPTokenAmount},
+};
 
 /// The version used for serialized messages from the query service.
 type FormatVersion = StaticVersion<0, 1>;
@@ -195,6 +202,30 @@ impl EspressoClient for QueryServiceClient {
         Ok(nodes)
     }
 
+    async fn block_reward(&self, epoch: u64) -> Result<ESPTokenAmount> {
+        let reward: Option<RewardAmount> = self
+            .inner
+            .get(&format!("node/block-reward/epoch/{epoch}"))
+            .send()
+            .await?;
+
+        reward.map(|r| r.0).ok_or_else(|| {
+            Error::not_found().context(format!("block reward not found for epoch {epoch}"))
+        })
+    }
+
+    async fn reward_balance(&self, block: u64, account: Address) -> Result<ESPTokenAmount> {
+        let reward: Option<RewardAmount> = self
+            .inner
+            .get(&format!(
+                "reward-state-v2/reward-balance/{}/{}",
+                block, account
+            ))
+            .send()
+            .await?;
+        Ok(reward.map(|r| r.0).unwrap_or_default())
+    }
+
     fn leaves(&self, from: u64) -> impl Send + Unpin + Stream<Item = (Leaf2, BitVec)> {
         let fallible_stream = self.fallible_leaves(from);
         stream::unfold(
@@ -266,7 +297,7 @@ mod test {
     #[test_log::test(tokio::test(flavor = "multi_thread"))]
     async fn test_epochs() {
         let port = pick_unused_port().expect("No ports free");
-        let (mut network, _storage) = start_pos_network(port).await;
+        let (mut network, _storage, _deployment) = start_pos_network(port).await;
 
         let opt = QueryServiceOptions::new(format!("http://localhost:{port}").parse().unwrap());
         let client = QueryServiceClient::new(opt).await.unwrap();
@@ -440,7 +471,7 @@ mod test {
     #[test_log::test(tokio::test(flavor = "multi_thread"))]
     async fn test_with_state() {
         let port = pick_unused_port().expect("No ports free");
-        let (mut network, _storage) = start_pos_network(port).await;
+        let (mut network, _storage, _deployment) = start_pos_network(port).await;
         let first_epoch = *network
             .server
             .decided_leaf()

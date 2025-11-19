@@ -1,7 +1,7 @@
 #![cfg(any(test, feature = "testing"))]
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fmt::Debug,
     sync::{
         Arc,
@@ -10,9 +10,7 @@ use std::{
 };
 
 use alloy::{
-    network::EthereumWallet,
-    node_bindings::Anvil,
-    primitives::{FixedBytes, map::HashSet},
+    network::EthereumWallet, node_bindings::Anvil, primitives::FixedBytes,
     providers::ProviderBuilder,
 };
 use async_lock::RwLock;
@@ -127,6 +125,16 @@ impl EspressoClient for MockEspressoClient {
 
         let offset = self.leaf_offset(height).ok_or_else(Error::not_found)?;
         Ok(self.leaves[offset].0.clone())
+    }
+
+    async fn block_reward(&self, _epoch: u64) -> Result<ESPTokenAmount> {
+        // 1 ESP token
+        Ok(ESPTokenAmount::from(1_000_000_000_000_000_000u128))
+    }
+
+    async fn reward_balance(&self, _block: u64, _account: Address) -> Result<ESPTokenAmount> {
+        // For testing return 0
+        Ok(ESPTokenAmount::ZERO)
     }
 
     fn leaves(&self, from: u64) -> impl Send + Unpin + Stream<Item = (Leaf2, BitVec)> {
@@ -326,6 +334,63 @@ impl EspressoPersistence for MemoryStorage {
         Ok(rewards.get(&account).copied().unwrap_or_default())
     }
 
+    async fn all_reward_accounts(&self) -> Result<Vec<Address>> {
+        self.mock_errors()?;
+        let rewards = &self.db.read().await.1;
+        Ok(rewards.keys().copied().collect())
+    }
+
+    async fn missing_reward_accounts(&self, accounts: &HashSet<Address>) -> Result<Vec<Address>> {
+        self.mock_errors()?;
+        let rewards = &self.db.read().await.1;
+        Ok(accounts
+            .iter()
+            .filter(|&&addr| !rewards.contains_key(&addr))
+            .copied()
+            .collect())
+    }
+
+    async fn populate_missing_reward_accounts<C: EspressoClient + Sync>(
+        &mut self,
+        accounts: &HashSet<Address>,
+        block: u64,
+        espresso: &C,
+    ) -> Result<()> {
+        self.mock_errors()?;
+
+        let missing_accounts = self.missing_reward_accounts(accounts).await?;
+
+        if missing_accounts.is_empty() {
+            return Ok(());
+        }
+
+        let mut balances = Vec::new();
+        for addr in &missing_accounts {
+            let balance = espresso.reward_balance(block, *addr).await?;
+            balances.push((*addr, balance));
+        }
+
+        self.initialize_lifetime_rewards(balances).await?;
+
+        Ok(())
+    }
+
+    async fn initialize_lifetime_rewards(
+        &mut self,
+        initial_rewards: Vec<(Address, ESPTokenAmount)>,
+    ) -> Result<()> {
+        self.mock_errors()?;
+
+        let (_active_nodes, rewards) = &mut *self.db.write().await;
+        rewards.clear();
+
+        for (account, amount) in initial_rewards {
+            rewards.insert(account, amount);
+        }
+
+        Ok(())
+    }
+
     async fn apply_update(
         &mut self,
         update: ActiveNodeSetUpdate,
@@ -381,7 +446,13 @@ impl EspressoPersistence for MemoryStorage {
 
 pub const EPOCH_HEIGHT: u64 = 20;
 
-pub async fn start_pos_network(port: u16) -> (TestNetwork<impl PersistenceOptions, 1, V>, TmpDb) {
+pub async fn start_pos_network(
+    port: u16,
+) -> (
+    TestNetwork<impl PersistenceOptions, 1, V>,
+    TmpDb,
+    ContractDeployment,
+) {
     // Deploy PoS contracts.
     let anvil = Anvil::new().args(["--slots-in-an-epoch", "0"]).spawn();
     let rpc_url = anvil.endpoint_url();
@@ -436,5 +507,5 @@ pub async fn start_pos_network(port: u16) -> (TestNetwork<impl PersistenceOption
         .build();
     let network = TestNetwork::new(config, V::new()).await;
 
-    (network, storage)
+    (network, storage, deployment)
 }
