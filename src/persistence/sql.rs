@@ -740,7 +740,7 @@ impl EspressoPersistence for Persistence {
         }
 
         // Fetch balances from the API for missing accounts and insert them
-        let balance_futures = missing_accounts.iter().map(|addr| {
+        let futs = missing_accounts.iter().map(|addr| {
             let addr = *addr;
             async move {
                 let balance = espresso.reward_balance(block, addr).await.map_err(|e| {
@@ -752,19 +752,25 @@ impl EspressoPersistence for Persistence {
             }
         });
 
-        let balances_to_insert = try_join_all(balance_futures).await?;
+        let rewards = try_join_all(futs).await?;
 
-        if !balances_to_insert.is_empty() {
+        if !rewards.is_empty() {
             let mut tx = self.pool.begin().await.context("acquiring connection")?;
 
-            for (addr, amount) in balances_to_insert {
-                sqlx::query("INSERT INTO lifetime_rewards (address, amount) VALUES ($1, $2)")
-                    .bind(addr.to_string())
-                    .bind(amount.to_string())
-                    .execute(tx.as_mut())
-                    .await
-                    .context("inserting new reward account")?;
-            }
+            QueryBuilder::new("INSERT INTO lifetime_rewards (address, amount) ")
+                .push_values(
+                    rewards
+                        .into_iter()
+                        .map(|(addr, amount)| (addr.to_string(), amount.to_string())),
+                    |mut q, (addr, amount)| {
+                        q.push_bind(addr);
+                        q.push_bind(amount);
+                    },
+                )
+                .build()
+                .execute(tx.as_mut())
+                .await
+                .context("inserting new reward account")?;
 
             tx.commit().await.context("committing transaction")?;
         }
@@ -812,10 +818,18 @@ impl EspressoPersistence for Persistence {
             .await
             .context("clearing existing lifetime rewards")?;
 
-        for (addr, amount) in rewards {
-            sqlx::query("INSERT INTO lifetime_rewards (address, amount) VALUES ($1, $2)")
-                .bind(addr.to_string())
-                .bind(amount.to_string())
+        if !rewards.is_empty() {
+            QueryBuilder::new("INSERT INTO lifetime_rewards (address, amount) ")
+                .push_values(
+                    rewards
+                        .into_iter()
+                        .map(|(addr, amount)| (addr.to_string(), amount.to_string())),
+                    |mut q, (addr, amount)| {
+                        q.push_bind(addr);
+                        q.push_bind(amount);
+                    },
+                )
+                .build()
                 .execute(tx.as_mut())
                 .await
                 .context("initializing lifetime rewards")?;
