@@ -244,12 +244,24 @@ mod test {
                         ) => {
                             assert_eq!(l, r);
                         }
+                        (
+                            StakeTableV2Events::ValidatorExitV2(l),
+                            StakeTableV2Events::ValidatorExitV2(r),
+                        ) => {
+                            assert_eq!(l, r);
+                        }
                         (StakeTableV2Events::Delegated(l), StakeTableV2Events::Delegated(r)) => {
                             assert_eq!(l, r);
                         }
                         (
                             StakeTableV2Events::Undelegated(l),
                             StakeTableV2Events::Undelegated(r),
+                        ) => {
+                            assert_eq!(l, r);
+                        }
+                        (
+                            StakeTableV2Events::UndelegatedV2(l),
+                            StakeTableV2Events::UndelegatedV2(r),
                         ) => {
                             assert_eq!(l, r);
                         }
@@ -333,6 +345,18 @@ mod test {
                             assert_eq!(l, r);
                         }
                         (StakeTableV2Events::Withdrawal(l), StakeTableV2Events::Withdrawal(r)) => {
+                            assert_eq!(l, r);
+                        }
+                        (
+                            StakeTableV2Events::WithdrawalClaimed(l),
+                            StakeTableV2Events::WithdrawalClaimed(r),
+                        ) => {
+                            assert_eq!(l, r);
+                        }
+                        (
+                            StakeTableV2Events::ValidatorExitClaimed(l),
+                            StakeTableV2Events::ValidatorExitClaimed(r),
+                        ) => {
                             assert_eq!(l, r);
                         }
                         (l, r) => {
