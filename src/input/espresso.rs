@@ -454,27 +454,18 @@ impl<S: EspressoPersistence, C: EspressoClient> State<S, C> {
 
         // Ensure all accounts receiving rewards exist in the database with their correct historical balances
         // This must be done BEFORE applying incremental rewards to maintain data consistency
-        if !rewards.is_empty() {
+        if !rewards.is_empty() && block.number > 1 {
             let reward_addresses: HashSet<_> = rewards.iter().map(|(addr, _)| *addr).collect();
-            let espresso = self.espresso.clone();
 
-            if let Some(backfill_block) = block.number.checked_sub(1).filter(|b| *b > 0) {
-                self.storage
-                    .fetch_and_insert_missing_reward_accounts(
-                        &espresso,
-                        &reward_addresses,
-                        backfill_block,
-                    )
-                    .await
-                    .map_err(|err| err.context("ensuring reward accounts exist"))?;
-            } else {
-                tracing::warn!(
-                    block = block.number,
-                    "Skipping missing-account backfill because prior block height is invalid"
-                );
-            }
+            self.storage
+                .fetch_and_insert_missing_reward_accounts(
+                    &self.espresso,
+                    &reward_addresses,
+                    block.number - 1,
+                )
+                .await
+                .map_err(|err| err.context("failed to catchup for missing accounts"))?;
         }
-
         // Update storage first. This will succeed or fail atomically. We can then update the
         // in-memory state to match; since we hold an exclusive lock on the state, no one will see
         // the in-memory state before the update has been completed.
