@@ -77,26 +77,19 @@ pub struct State<S, C> {
 impl<S: EspressoPersistence, C: EspressoClient> State<S, C> {
     /// Synchronize lifetime rewards from Espresso API for all known accounts.
     ///
-    /// This fetches balances for:
-    /// - All existing accounts in the database
-    /// - All validators and delegators in the current epoch's stake table
-    async fn sync_lifetime_rewards(
-        storage: &mut S,
-        espresso: &C,
-        epoch: &EpochState,
-        block_height: u64,
-    ) -> Result<()> {
+    /// We refetch rewards for every account already in storage to refresh stale state from a
+    /// previous run. We deliberately avoid clearing the table, because those accounts would be
+    /// fetched again anyway (unless the stake table completely changed)
+    ///  Instead, we refresh the existing set once here and rely on the incremental fetching for new accounts
+    /// (`fetch_and_insert_missing_reward_accounts`)
+    async fn sync_lifetime_rewards(state: &RwLock<Self>, block_height: u64) -> Result<()> {
         tracing::info!("Synchronizing lifetime rewards from Espresso API at block {block_height}");
 
-        let mut addresses = HashSet::new();
-
-        let existing_accts = storage.all_reward_accounts().await?;
-        addresses.extend(existing_accts);
-
-        for validator in &epoch.validators {
-            addresses.insert(validator.account);
-            addresses.extend(validator.delegators.keys().copied());
-        }
+        let state_read = state.read().await;
+        let addresses = state_read.storage.all_reward_accounts().await?;
+        let espresso = state_read.espresso.clone();
+        drop(state_read);
+        let addresses = addresses.into_iter().collect::<HashSet<_>>();
 
         // Query reward balances from Espresso API
         // max 5 concurrent requests
@@ -104,6 +97,7 @@ impl<S: EspressoPersistence, C: EspressoClient> State<S, C> {
 
         let reward_futures = addresses.into_iter().map(|addr| {
             let semaphore = Arc::clone(&semaphore);
+            let espresso = espresso.clone();
             async move {
                 let _permit = semaphore.acquire().await.unwrap();
 
@@ -121,7 +115,9 @@ impl<S: EspressoPersistence, C: EspressoClient> State<S, C> {
         let reward_balances: Vec<_> = future::try_join_all(reward_futures).await?;
 
         if !reward_balances.is_empty() {
-            storage
+            let mut state = state.write().await;
+            state
+                .storage
                 .initialize_lifetime_rewards(reward_balances)
                 .await
                 .map_err(|e| {
@@ -303,18 +299,9 @@ impl<S: EspressoPersistence, C: EspressoClient> State<S, C> {
                 let epoch_start = epoch_start_block(current_epoch, epoch_height);
                 let sync_block = epoch_start - 1;
 
-                // Download epoch state to get validator and delegator addresses
-                let epoch = EpochState::download(&espresso, epoch_height, current_epoch)
-                    .await
-                    .map_err(|err| {
-                        err.context(format!("fetching current epoch {current_epoch}"))
-                    })?;
-
-                // Get mutable access to storage to sync rewards
-                let mut state_mut = state.write().await;
-                Self::sync_lifetime_rewards(&mut state_mut.storage, &espresso, &epoch, sync_block)
-                    .await?;
-                drop(state_mut);
+                // Refresh only the accounts already in storage; new accounts found while streaming
+                // blocks are fetched incrementally.
+                Self::sync_lifetime_rewards(state, sync_block).await?;
 
                 // Set our state to the first block of this epoch.
                 epoch_start
