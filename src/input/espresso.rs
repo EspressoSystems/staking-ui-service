@@ -297,11 +297,22 @@ impl<S: EspressoPersistence, C: EspressoClient> State<S, C> {
                 // Fetch the reward balance of every account as of the start of this epoch, so
                 // we can initialize our lifetime rewards storage.
                 let epoch_start = epoch_start_block(current_epoch, epoch_height);
-                // Refresh only the accounts already in storage; new accounts found while streaming
-                // blocks are fetched incrementally.
-                if epoch_start > 1 {
+
+                if epoch_start <= 1 {
+                    tracing::info!(
+                        epoch_start,
+                        current_epoch,
+                        "Skipping lifetime reward refresh; no previous block exists"
+                    );
+                } else {
                     let sync_block = epoch_start - 1;
-                    Self::sync_lifetime_rewards(state, sync_block).await?;
+                    let already_synced = snapshot
+                        .as_ref()
+                        .map_or(false, |s| s.espresso_block.block == sync_block);
+
+                    if !already_synced {
+                        Self::sync_lifetime_rewards(state, sync_block).await?;
+                    }
                 }
 
                 // Set our state to the first block of this epoch.
