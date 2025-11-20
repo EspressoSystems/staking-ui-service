@@ -2,7 +2,9 @@
 use crate::{
     Error, Result,
     input::{
-        espresso::{ActiveNode, ActiveNodeSet, EspressoClient, EspressoPersistence},
+        espresso::{
+            ActiveNode, ActiveNodeSet, EspressoClient, EspressoPersistence, RewardDistribution,
+        },
         l1::{L1BlockSnapshot, L1Persistence, NodeSet, Snapshot, Update, Wallet, Wallets},
     },
     types::{
@@ -891,7 +893,7 @@ impl EspressoPersistence for Persistence {
     async fn apply_update(
         &mut self,
         update: ActiveNodeSetUpdate,
-        rewards: Vec<(Address, ESPTokenAmount)>,
+        rewards: RewardDistribution,
     ) -> Result<()> {
         let mut tx = self.pool.begin().await.context("acquiring connection")?;
 

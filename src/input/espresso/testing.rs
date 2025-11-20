@@ -52,7 +52,9 @@ use crate::{
     Error, Result,
     error::ensure,
     input::{
-        espresso::{ActiveNode, ActiveNodeSet, EspressoClient, EspressoPersistence},
+        espresso::{
+            ActiveNode, ActiveNodeSet, EspressoClient, EspressoPersistence, RewardDistribution,
+        },
         l1::testing::ContractDeployment,
     },
     types::{
@@ -394,7 +396,7 @@ impl EspressoPersistence for MemoryStorage {
     async fn apply_update(
         &mut self,
         update: ActiveNodeSetUpdate,
-        new_rewards: Vec<(Address, ESPTokenAmount)>,
+        new_rewards: RewardDistribution,
     ) -> Result<()> {
         self.mock_errors()?;
 
@@ -450,11 +452,14 @@ pub async fn start_pos_network(
     port: u16,
 ) -> (
     TestNetwork<impl PersistenceOptions, 1, V>,
-    TmpDb,
     ContractDeployment,
+    TmpDb,
 ) {
     // Deploy PoS contracts.
-    let anvil = Anvil::new().args(["--slots-in-an-epoch", "0"]).spawn();
+    let anvil = Anvil::new()
+        .block_time(1)
+        .args(["--slots-in-an-epoch", "0"])
+        .spawn();
     let rpc_url = anvil.endpoint_url();
     let deployment = ContractDeployment::deploy(rpc_url.clone())
         .await
@@ -507,5 +512,5 @@ pub async fn start_pos_network(
         .build();
     let network = TestNetwork::new(config, V::new()).await;
 
-    (network, storage, deployment)
+    (network, deployment, storage)
 }
