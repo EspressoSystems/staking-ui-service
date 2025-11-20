@@ -134,42 +134,8 @@ impl<S: EspressoPersistence, C: EspressoClient> State<S, C> {
         Ok(())
     }
 
-    pub async fn new(mut storage: S, espresso: C) -> Result<Self> {
-        let current_epoch = espresso.wait_for_epochs().await;
-
-        // Fetch the current epoch state.
+    pub async fn new(storage: S, espresso: C) -> Result<Self> {
         let epoch_height = espresso.epoch_height().await?;
-        let epoch = EpochState::download(&espresso, epoch_height, current_epoch)
-            .await
-            .map_err(|err| err.context(format!("fetching current epoch {current_epoch}")))?;
-
-        // Initialize active node storage to the most recent of:
-        // * saved active node set
-        // * start of current epoch
-        match storage.active_node_set().await? {
-            Some(snapshot) if snapshot.espresso_block.epoch == current_epoch => {
-                tracing::info!(
-                    ?snapshot,
-                    current_epoch,
-                    "saved snapshot is from latest epoch, restoring state"
-                );
-            }
-            snapshot => {
-                tracing::info!(
-                    current_epoch,
-                    ?snapshot,
-                    "stored snapshot is missing or out of date, will start from beginning of epoch"
-                );
-
-                // Set our state to the last block of the previous epoch, so that when we start up,
-                // the first block we process is the first block of this epoch.
-                let leaf = espresso.leaf(epoch.start_block(epoch_height) - 1).await?;
-
-                // Synchronize lifetime rewards from the Espresso API
-                Self::sync_lifetime_rewards(&mut storage, &espresso, &epoch, leaf.height()).await?;
-            }
-        };
-
         Ok(Self {
             last_block: None,
             updates: vec![],
@@ -332,11 +298,26 @@ impl<S: EspressoPersistence, C: EspressoClient> State<S, C> {
                     "stored snapshot is missing or out of date, will start from beginning of epoch"
                 );
 
-                // TODO fetch the reward balance of every account as of the start of this epoch, so
+                // Fetch the reward balance of every account as of the start of this epoch, so
                 // we can initialize our lifetime rewards storage.
+                let epoch_start = epoch_start_block(current_epoch, epoch_height);
+                let sync_block = epoch_start - 1;
+
+                // Download epoch state to get validator and delegator addresses
+                let epoch = EpochState::download(&espresso, epoch_height, current_epoch)
+                    .await
+                    .map_err(|err| {
+                        err.context(format!("fetching current epoch {current_epoch}"))
+                    })?;
+
+                // Get mutable access to storage to sync rewards
+                let mut state_mut = state.write().await;
+                Self::sync_lifetime_rewards(&mut state_mut.storage, &espresso, &epoch, sync_block)
+                    .await?;
+                drop(state_mut);
 
                 // Set our state to the first block of this epoch.
-                epoch_start_block(current_epoch, epoch_height)
+                epoch_start
             }
         };
 
