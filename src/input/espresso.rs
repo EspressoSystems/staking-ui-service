@@ -297,11 +297,12 @@ impl<S: EspressoPersistence, C: EspressoClient> State<S, C> {
                 // Fetch the reward balance of every account as of the start of this epoch, so
                 // we can initialize our lifetime rewards storage.
                 let epoch_start = epoch_start_block(current_epoch, epoch_height);
-                let sync_block = epoch_start - 1;
-
                 // Refresh only the accounts already in storage; new accounts found while streaming
                 // blocks are fetched incrementally.
-                Self::sync_lifetime_rewards(state, sync_block).await?;
+                if epoch_start > 1 {
+                    let sync_block = epoch_start - 1;
+                    Self::sync_lifetime_rewards(state, sync_block).await?;
+                }
 
                 // Set our state to the first block of this epoch.
                 epoch_start
@@ -442,18 +443,25 @@ impl<S: EspressoPersistence, C: EspressoClient> State<S, C> {
 
         // Ensure all accounts receiving rewards exist in the database with their correct historical balances
         // This must be done BEFORE applying incremental rewards to maintain data consistency
-        if !rewards.is_empty() && block.number > 0 {
+        if !rewards.is_empty() {
             let reward_addresses: HashSet<_> = rewards.iter().map(|(addr, _)| *addr).collect();
             let espresso = self.espresso.clone();
 
-            self.storage
-                .fetch_and_insert_missing_reward_accounts(
-                    &espresso,
-                    &reward_addresses,
-                    block.number - 1,
-                )
-                .await
-                .map_err(|err| err.context("ensuring reward accounts exist"))?;
+            if let Some(backfill_block) = block.number.checked_sub(1).filter(|b| *b > 0) {
+                self.storage
+                    .fetch_and_insert_missing_reward_accounts(
+                        &espresso,
+                        &reward_addresses,
+                        backfill_block,
+                    )
+                    .await
+                    .map_err(|err| err.context("ensuring reward accounts exist"))?;
+            } else {
+                tracing::warn!(
+                    block = block.number,
+                    "Skipping missing-account backfill because prior block height is invalid"
+                );
+            }
         }
 
         // Update storage first. This will succeed or fail atomically. We can then update the
