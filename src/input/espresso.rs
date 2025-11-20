@@ -308,7 +308,7 @@ impl<S: EspressoPersistence, C: EspressoClient> State<S, C> {
                     let sync_block = epoch_start - 1;
                     let already_synced = snapshot
                         .as_ref()
-                        .map_or(false, |s| s.espresso_block.block == sync_block);
+                        .is_some_and(|s| s.espresso_block.block == sync_block);
 
                     if !already_synced {
                         Self::sync_lifetime_rewards(state, sync_block).await?;
