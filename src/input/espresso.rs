@@ -88,30 +88,11 @@ impl<S: EspressoPersistence, C: EspressoClient> State<S, C> {
         let addresses = state_read.storage.all_reward_accounts().await?;
         let espresso = state_read.espresso.clone();
         drop(state_read);
-        let addresses = addresses.into_iter().collect::<HashSet<_>>();
 
         // Query reward balances from Espresso API
-        // max 5 concurrent requests
-        let semaphore = Arc::new(Semaphore::new(5));
-
-        let reward_futures = addresses.into_iter().map(|addr| {
-            let semaphore = Arc::clone(&semaphore);
-            let espresso = espresso.clone();
-            async move {
-                let _permit = semaphore.acquire().await.unwrap();
-
-                match espresso.reward_balance(block_height, addr).await {
-                    Ok(balance) => Ok((addr, balance)),
-                    Err(e) => {
-                        tracing::error!("Failed to fetch reward balance for {addr}: {e}");
-                        Err(Error::internal()
-                            .context(format!("Failed to fetch reward balance for {addr}: {e}")))
-                    }
-                }
-            }
-        });
-
-        let reward_balances: Vec<_> = future::try_join_all(reward_futures).await?;
+        let reward_balances = espresso
+            .fetch_reward_balances(addresses, block_height)
+            .await?;
 
         if !reward_balances.is_empty() {
             let mut state = state.write().await;
