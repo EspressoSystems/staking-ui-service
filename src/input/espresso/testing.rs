@@ -372,7 +372,11 @@ impl EspressoPersistence for MemoryStorage {
             balances.push((*addr, balance));
         }
 
-        self.initialize_lifetime_rewards(balances).await?;
+        let (_active_nodes, rewards) = &mut *self.db.write().await;
+
+        for (account, amount) in balances {
+            rewards.insert(account, amount);
+        }
 
         Ok(())
     }

@@ -580,6 +580,8 @@ mod test {
         let server_task = spawn(state.serve(port));
         let update_task = spawn(espresso_update_task);
 
+        sleep(Duration::from_secs(2)).await;
+
         let client = Client::<Error, Version>::new(url);
         client.connect(None).await;
 
@@ -607,7 +609,7 @@ mod test {
 
         tracing::info!(?rewards_1, "node 1 rewards");
 
-        // Each validator should have earned some rewards (non-zero)
+        // Each validator should have earned some rewards
         assert!(rewards_0 > U256::ZERO, "node 0 should have earned rewards");
         assert!(rewards_1 > U256::ZERO, "node 1 should have earned rewards");
 
