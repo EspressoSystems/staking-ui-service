@@ -577,7 +577,7 @@ pub fn validator_registered_event_with_account(
         commission,
         blsSig: G1PointSol::from(bls_sig).into(),
         schnorrSig: StateSignatureSol::from(schnorr_sig).into(),
-        metadataUri: String::new(),
+        metadataUri: "https://example.com/validator-metadata.json".to_string(),
     }
 }
 
