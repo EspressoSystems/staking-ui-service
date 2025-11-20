@@ -338,21 +338,10 @@ impl EspressoPersistence for MemoryStorage {
 
     async fn all_reward_accounts(&self) -> Result<Vec<Address>> {
         self.mock_errors()?;
-        let rewards = &self.db.read().await.1;
-        Ok(rewards.keys().copied().collect())
+        Ok(self.db.read().await.1.keys().copied().collect())
     }
 
-    async fn missing_reward_accounts(&self, accounts: &HashSet<Address>) -> Result<Vec<Address>> {
-        self.mock_errors()?;
-        let rewards = &self.db.read().await.1;
-        Ok(accounts
-            .iter()
-            .filter(|&&addr| !rewards.contains_key(&addr))
-            .copied()
-            .collect())
-    }
-
-    async fn fetch_and_insert_missing_reward_accounts<C: EspressoClient + Sync>(
+    async fn fetch_and_insert_missing_reward_accounts<C: EspressoClient>(
         &mut self,
         espresso: &C,
         accounts: &HashSet<Address>,
@@ -360,7 +349,14 @@ impl EspressoPersistence for MemoryStorage {
     ) -> Result<()> {
         self.mock_errors()?;
 
-        let missing_accounts = self.missing_reward_accounts(accounts).await?;
+        let missing_accounts: Vec<Address> = {
+            let rewards = &self.db.read().await.1;
+            accounts
+                .iter()
+                .filter(|&&addr| !rewards.contains_key(&addr))
+                .copied()
+                .collect()
+        };
 
         if missing_accounts.is_empty() {
             return Ok(());

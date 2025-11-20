@@ -37,7 +37,7 @@ impl<LS, ES, EC> AppState<LS, ES, EC>
 where
     LS: L1Persistence + Sync + 'static,
     ES: EspressoPersistence + Send + Sync + 'static,
-    EC: EspressoClient + Send + Sync + 'static,
+    EC: EspressoClient + 'static,
 {
     /// Run the app.
     ///
@@ -69,7 +69,7 @@ fn bind_handlers<LS, ES, EC>(
 where
     LS: L1Persistence + Sync + 'static,
     ES: EspressoPersistence + Send + Sync + 'static,
-    EC: EspressoClient + Send + Sync + 'static,
+    EC: EspressoClient + 'static,
 {
     api.at("l1_block_latest", |_, state| {
         async move { Ok(state.l1.read().await.latest_l1_block()) }.boxed()
