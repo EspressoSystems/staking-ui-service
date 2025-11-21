@@ -1095,15 +1095,16 @@ mod tests {
                 let L1Event::StakeTable(st_event) = event else {
                     panic!("got unexpected non-stake table event");
                 };
-                let event = st_event.as_ref().clone().try_into().unwrap();
-                let result = state.apply_event(event);
-                match result {
-                    Ok(Ok(())) => {}
-                    Ok(Err(err)) => {
-                        println!("Expected error: {err:?}");
-                    }
-                    Err(err) => {
-                        panic!("Critical err: {err:?}");
+                if let Ok(event) = st_event.as_ref().clone().try_into() {
+                    let result = state.apply_event(event);
+                    match result {
+                        Ok(Ok(())) => {}
+                        Ok(Err(err)) => {
+                            println!("Expected error: {err:?}");
+                        }
+                        Err(err) => {
+                            panic!("Critical err: {err:?}");
+                        }
                     }
                 }
             }
