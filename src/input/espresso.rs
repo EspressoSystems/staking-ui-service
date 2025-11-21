@@ -853,7 +853,7 @@ pub trait EspressoClient: Clone + Send + Sync {
                                     )));
                                 }
 
-                                tracing::info!(
+                                tracing::warn!(
                                     "Failed to fetch balance for {addr} (attempt {attempt}/{MAX_RETRIES}): {e}. Retrying in 1s",
                                 );
                                 sleep(Duration::from_secs(1)).await;
