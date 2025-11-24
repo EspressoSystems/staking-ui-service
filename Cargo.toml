@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2024"
 license = "mit"
 
+[[bin]]
+name = "client-swarm"
+test = false
+required-features = ["rand"]
+
 [features]
 default = []
 testing = [
