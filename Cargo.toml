@@ -3,6 +3,7 @@ name = "staking-ui-service"
 version = "0.1.0"
 edition = "2024"
 license = "mit"
+default-run = "staking-ui-service"
 
 [[bin]]
 name = "client-swarm"
