@@ -215,18 +215,6 @@ impl EspressoClient for QueryServiceClient {
         })
     }
 
-    async fn reward_balance(&self, block: u64, account: Address) -> Result<ESPTokenAmount> {
-        let reward: Option<RewardAmount> = self
-            .inner
-            .get(&format!(
-                "reward-state-v2/reward-balance/{}/{}",
-                block, account
-            ))
-            .send()
-            .await?;
-        Ok(reward.map(|r| r.0).unwrap_or_default())
-    }
-
     #[instrument(skip(self))]
     async fn fetch_all_reward_accounts(
         &self,

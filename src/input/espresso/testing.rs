@@ -134,11 +134,6 @@ impl EspressoClient for MockEspressoClient {
         Ok(ESPTokenAmount::from(1_000_000_000_000_000_000u128))
     }
 
-    async fn reward_balance(&self, _block: u64, _account: Address) -> Result<ESPTokenAmount> {
-        // For testing return 0
-        Ok(ESPTokenAmount::ZERO)
-    }
-
     async fn fetch_all_reward_accounts(
         &self,
         _block: u64,
@@ -341,42 +336,6 @@ impl EspressoPersistence for MemoryStorage {
         let rewards = &self.db.read().await.1;
         // If a reward account is not in the database, it has 0 balance by default.
         Ok(rewards.get(&account).copied().unwrap_or_default())
-    }
-
-    async fn fetch_and_insert_missing_reward_accounts<C: EspressoClient>(
-        &mut self,
-        espresso: &C,
-        accounts: &HashSet<Address>,
-        block: u64,
-    ) -> Result<()> {
-        self.mock_errors()?;
-
-        let missing_accounts: Vec<Address> = {
-            let rewards = &self.db.read().await.1;
-            accounts
-                .iter()
-                .filter(|&&addr| !rewards.contains_key(&addr))
-                .copied()
-                .collect()
-        };
-
-        if missing_accounts.is_empty() {
-            return Ok(());
-        }
-
-        let mut balances = Vec::new();
-        for addr in &missing_accounts {
-            let balance = espresso.reward_balance(block, *addr).await?;
-            balances.push((*addr, balance));
-        }
-
-        let (_active_nodes, rewards) = &mut *self.db.write().await;
-
-        for (account, amount) in balances {
-            rewards.insert(account, amount);
-        }
-
-        Ok(())
     }
 
     async fn initialize_lifetime_rewards(

@@ -1,10 +1,6 @@
 //! Input data from Espresso network.
 
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use async_lock::{RwLock, RwLockUpgradableReadGuard, RwLockWriteGuard};
 use bitvec::vec::BitVec;
@@ -14,7 +10,7 @@ use espresso_types::{
     v0::RewardDistributor,
     v0_3::{RewardAmount, Validator},
 };
-use futures::{Stream, StreamExt, future};
+use futures::{Stream, StreamExt};
 use hotshot_types::{
     data::ViewNumber,
     drb::{
@@ -25,7 +21,7 @@ use hotshot_types::{
     traits::{block_contents::BlockHeader, node_implementation::ConsensusTime},
     utils::{epoch_from_block_number, transition_block_for_epoch},
 };
-use tokio::{sync::Semaphore, time::sleep};
+use tokio::time::sleep;
 use tracing::instrument;
 
 use crate::{
@@ -404,20 +400,6 @@ impl<S: EspressoPersistence, C: EspressoClient> State<S, C> {
             _ => false,
         };
 
-        // Ensure all accounts receiving rewards exist in the database with their correct historical balances
-        // This must be done BEFORE applying incremental rewards to maintain data consistency
-        if !rewards.is_empty() {
-            let reward_addresses: HashSet<_> = rewards.iter().map(|(addr, _)| *addr).collect();
-
-            self.storage
-                .fetch_and_insert_missing_reward_accounts(
-                    &self.espresso,
-                    &reward_addresses,
-                    block.number - 1,
-                )
-                .await
-                .map_err(|err| err.context("failed to catchup for missing accounts"))?;
-        }
         // Update storage first. This will succeed or fail atomically. We can then update the
         // in-memory state to match; since we hold an exclusive lock on the state, no one will see
         // the in-memory state before the update has been completed.
@@ -681,17 +663,6 @@ pub trait EspressoPersistence {
         account: Address,
     ) -> impl Send + Future<Output = Result<ESPTokenAmount>>;
 
-    /// Ensure accounts exist in the lifetime_rewards table
-    ///
-    /// For accounts that don't exist, fetches their balances from the Espresso API and inserts them.
-    /// This should be called before applying incremental rewards to ensure data consistency.
-    fn fetch_and_insert_missing_reward_accounts<C: EspressoClient>(
-        &mut self,
-        espresso: &C,
-        accounts: &HashSet<Address>,
-        block: u64,
-    ) -> impl Send + Future<Output = Result<()>>;
-
     /// Initialize lifetime rewards
     ///
     /// This is used at startup to populate the lifetime_rewards table with balances
@@ -802,13 +773,6 @@ pub trait EspressoClient: Clone + Send + Sync {
     /// Get the block reward amount for a given epoch.
     fn block_reward(&self, epoch: u64) -> impl Send + Future<Output = Result<ESPTokenAmount>>;
 
-    /// Query the reward balance for an account at a specific block from the API.
-    fn reward_balance(
-        &self,
-        block: u64,
-        account: Address,
-    ) -> impl Send + Future<Output = Result<ESPTokenAmount>>;
-
     /// Subscribe to leaves starting from the requested height.
     ///
     /// Each leaf is paired with the set of voters who signed it.
@@ -822,49 +786,6 @@ pub trait EspressoClient: Clone + Send + Sync {
         &self,
         block: u64,
     ) -> impl Send + Future<Output = Result<Vec<(Address, ESPTokenAmount)>>>;
-
-    /// Fetch reward balances for multiple addresses in parallel.
-    /// Uses a semaphore to limit parallel API requests to 5.
-    /// Retries individual failed requests up to 3 times with 1 second delay between attempts.
-    fn fetch_reward_balances(
-        &self,
-        addresses: impl IntoIterator<Item = Address> + Send,
-        block: u64,
-    ) -> impl Send + Future<Output = Result<Vec<(Address, ESPTokenAmount)>>> {
-        async move {
-            const MAX_RETRIES: u32 = 3;
-            let semaphore = Arc::new(Semaphore::new(5));
-            let futs = addresses.into_iter().map(|addr| {
-                let semaphore = Arc::clone(&semaphore);
-                let client = self.clone();
-                async move {
-                    let _permit = semaphore.acquire().await.unwrap();
-
-                    for attempt in 1..=MAX_RETRIES {
-                        match client.reward_balance(block, addr).await {
-                            Ok(balance) => return Ok((addr, balance)),
-                            Err(e) => {
-                                if attempt >= MAX_RETRIES {
-                                    return Err(Error::internal().context(format!(
-                                        "Failed to fetch balance for account {addr} from API at block {block}. {e}",
-                                    )));
-                                }
-
-                                tracing::warn!(
-                                    "Failed to fetch balance for {addr} (attempt {attempt}/{MAX_RETRIES}): {e}. Retrying in 1s",
-                                );
-                                sleep(Duration::from_secs(1)).await;
-                            }
-                        }
-                    }
-
-                    unreachable!()
-                }
-            });
-
-            future::try_join_all(futs).await
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1735,10 +1656,6 @@ mod test {
 
         async fn block_reward(&self, epoch: u64) -> Result<ESPTokenAmount> {
             self.inner.block_reward(epoch).await
-        }
-
-        async fn reward_balance(&self, block: u64, account: Address) -> Result<ESPTokenAmount> {
-            self.inner.reward_balance(block, account).await
         }
 
         async fn fetch_all_reward_accounts(

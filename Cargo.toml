@@ -33,11 +33,11 @@ committable = { git = "https://github.com/EspressoSystems/commit.git", features 
 ] }
 derivative = "2"
 derive_more = "2.0"
-espresso-types = { git = "https://github.com/EspressoSystems/espresso-network.git", branch = "ab/all-accts-endpiint" }
+espresso-types = { git = "https://github.com/EspressoSystems/espresso-network.git" }
 futures = "0.3"
-hotshot-contract-adapter = { git = "https://github.com/EspressoSystems/espresso-network.git", branch = "ab/all-accts-endpiint" }
-hotshot-query-service = { git = "https://github.com/EspressoSystems/espresso-network.git", branch = "ab/all-accts-endpiint" }
-hotshot-types = { git = "https://github.com/EspressoSystems/espresso-network.git", branch = "ab/all-accts-endpiint" }
+hotshot-contract-adapter = { git = "https://github.com/EspressoSystems/espresso-network.git" }
+hotshot-query-service = { git = "https://github.com/EspressoSystems/espresso-network.git" }
+hotshot-types = { git = "https://github.com/EspressoSystems/espresso-network.git" }
 im = { version = "15", features = ["serde"] }
 log-panics = { version = "2.0", features = ["with-backtrace"] }
 parking_lot = "0.12"
@@ -55,18 +55,18 @@ tracing-subscriber = "0.3"
 vbs = "0.1"
 
 # Testing dependencies
-espresso-contract-deployer = { git = "https://github.com/EspressoSystems/espresso-network.git", branch = "ab/all-accts-endpiint", optional = true }
-hotshot-state-prover = { git = "https://github.com/EspressoSystems/espresso-network.git", branch = "ab/all-accts-endpiint", optional = true }
+espresso-contract-deployer = { git = "https://github.com/EspressoSystems/espresso-network.git", optional = true }
+hotshot-state-prover = { git = "https://github.com/EspressoSystems/espresso-network.git", optional = true }
 jf-signature = { git = "https://github.com/EspressoSystems/jellyfish", tag = "jf-signature-v0.4.0", features = [
     "std",
 ], optional = true }
 pretty_assertions = { version = "1", optional = true }
 rand = { version = "0.8", optional = true }
-sequencer = { git = "https://github.com/EspressoSystems/espresso-network.git", branch = "ab/all-accts-endpiint", features = [
+sequencer = { git = "https://github.com/EspressoSystems/espresso-network.git", features = [
     "embedded-db",
     "testing",
 ], optional = true }
-staking-cli = { git = "https://github.com/EspressoSystems/espresso-network.git", branch = "ab/all-accts-endpiint", optional = true }
+staking-cli = { git = "https://github.com/EspressoSystems/espresso-network.git", optional = true }
 
 [dev-dependencies]
 # Enable our own `testing` feature when building tests.

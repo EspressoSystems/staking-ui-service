@@ -2,9 +2,7 @@
 use crate::{
     Error, Result,
     input::{
-        espresso::{
-            ActiveNode, ActiveNodeSet, EspressoClient, EspressoPersistence, RewardDistribution,
-        },
+        espresso::{ActiveNode, ActiveNodeSet, EspressoPersistence, RewardDistribution},
         l1::{L1BlockSnapshot, L1Persistence, NodeSet, Snapshot, Update, Wallet, Wallets},
     },
     types::{
@@ -24,11 +22,7 @@ use sqlx::{
     ConnectOptions, QueryBuilder,
     sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions},
 };
-use std::{
-    collections::{HashMap, HashSet},
-    path::PathBuf,
-    str::FromStr,
-};
+use std::{collections::HashMap, path::PathBuf, str::FromStr};
 use tracing::{instrument, log::LevelFilter};
 
 /// Options for persistence.
@@ -748,68 +742,6 @@ impl EspressoPersistence for Persistence {
         }
     }
 
-    async fn fetch_and_insert_missing_reward_accounts<C: EspressoClient>(
-        &mut self,
-        espresso: &C,
-        accounts: &HashSet<Address>,
-        block: u64,
-    ) -> Result<()> {
-        if accounts.is_empty() {
-            return Ok(());
-        }
-
-        // Check which accounts don't exist in the lifetime_rewards table
-        let mut tx = self.pool.begin().await.context("acquiring connection")?;
-
-        let missing: Vec<(String,)> = QueryBuilder::new("SELECT column1 AS address FROM (")
-            .push_values(accounts, |mut q, account| {
-                q.push_bind(account.to_string());
-            })
-            .push(") WHERE address NOT IN (SELECT address FROM lifetime_rewards)")
-            .build_query_as()
-            .fetch_all(tx.as_mut())
-            .await
-            .context("fetching missing reward accounts")?;
-
-        let missing_accounts: Vec<Address> = missing
-            .into_iter()
-            .filter_map(|(addr,)| addr.parse::<Address>().ok())
-            .collect();
-
-        drop(tx);
-
-        if missing_accounts.is_empty() {
-            return Ok(());
-        }
-
-        let rewards = espresso
-            .fetch_reward_balances(missing_accounts, block)
-            .await?;
-
-        if !rewards.is_empty() {
-            let mut tx = self.pool.begin().await.context("acquiring connection")?;
-
-            QueryBuilder::new("INSERT INTO lifetime_rewards (address, amount) ")
-                .push_values(
-                    rewards
-                        .into_iter()
-                        .map(|(addr, amount)| (addr.to_string(), amount.to_string())),
-                    |mut q, (addr, amount)| {
-                        q.push_bind(addr);
-                        q.push_bind(amount);
-                    },
-                )
-                .build()
-                .execute(tx.as_mut())
-                .await
-                .context("inserting new reward account")?;
-
-            tx.commit().await.context("committing transaction")?;
-        }
-
-        Ok(())
-    }
-
     async fn initialize_lifetime_rewards(
         &mut self,
         rewards: Vec<(Address, ESPTokenAmount)>,
@@ -1088,12 +1020,11 @@ impl EspressoPersistence for Persistence {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::input::espresso::testing::MockEspressoClient;
     use crate::input::l1::testing::{block_snapshot, make_node};
     use crate::types::common::{Address, ESPTokenAmount, NodeExit, PendingWithdrawal, Withdrawal};
     use crate::types::global::FullNodeSetDiff;
     use im::ordmap;
-    use std::collections::HashSet;
+
     use tempfile::TempDir;
     /// Tests the complete persistence lifecycle
     #[test_log::test(tokio::test)]
@@ -2192,48 +2123,6 @@ mod tests {
                 nodes[0].address => delegation,
                 new_node.address => new_delegation
             }
-        );
-    }
-
-    #[test_log::test(tokio::test(flavor = "multi_thread"))]
-    async fn test_fetch_and_insert_missing_reward_accounts() {
-        let temp_dir = TempDir::new().unwrap();
-        let db_path = temp_dir.path().join("test.db");
-        let options = PersistenceOptions {
-            path: db_path,
-            max_connections: 5,
-        };
-        let mut persistence = Persistence::new(&options).await.unwrap();
-
-        let espresso = MockEspressoClient::new(3).await;
-
-        let account1 = Address::random();
-        let account2 = Address::random();
-
-        let accounts: HashSet<Address> = [account1, account2].into_iter().collect();
-        let block = 100u64;
-
-        assert_eq!(
-            persistence.lifetime_rewards(account1).await.unwrap(),
-            ESPTokenAmount::ZERO
-        );
-        assert_eq!(
-            persistence.lifetime_rewards(account2).await.unwrap(),
-            ESPTokenAmount::ZERO
-        );
-
-        persistence
-            .fetch_and_insert_missing_reward_accounts(&espresso, &accounts, block)
-            .await
-            .unwrap();
-
-        assert_eq!(
-            persistence.lifetime_rewards(account1).await.unwrap(),
-            ESPTokenAmount::ZERO
-        );
-        assert_eq!(
-            persistence.lifetime_rewards(account2).await.unwrap(),
-            ESPTokenAmount::ZERO
         );
     }
 }
