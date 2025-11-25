@@ -16,6 +16,7 @@ use hotshot_contract_adapter::sol_types::{
     StakeTableV2::{StakeTableV2Events, ValidatorRegistered, ValidatorRegisteredV2},
 };
 use hotshot_types::light_client::StateVerKey;
+use tide_disco::Url;
 use tokio::time::sleep;
 use tracing::instrument;
 
@@ -579,11 +580,17 @@ impl Snapshot {
                         tracing::warn!("got invalid ValidatorRegisteredV2 event: {err:#}");
                         return Default::default();
                     }
-                    (vec![FullNodeSetDiff::NodeUpdate(ev.into())], vec![])
+                    (
+                        vec![FullNodeSetDiff::NodeUpdate(Arc::new(ev.into()))],
+                        vec![],
+                    )
                 }
                 StakeTableV2Events::ValidatorRegistered(ev) => {
                     tracing::warn!("received legacy ValidatorRegistered event");
-                    (vec![FullNodeSetDiff::NodeUpdate(ev.into())], vec![])
+                    (
+                        vec![FullNodeSetDiff::NodeUpdate(Arc::new(ev.into()))],
+                        vec![],
+                    )
                 }
                 StakeTableV2Events::ExitEscrowPeriodUpdated(ev) => {
                     // This should be quite rare, we can be a little loud about it.
@@ -652,13 +659,11 @@ impl Snapshot {
                         )
                     });
 
-                    let diff = FullNodeSetDiff::NodeUpdate(NodeSetEntry {
-                        address: ev.account,
+                    let diff = FullNodeSetDiff::NodeUpdate(Arc::new(NodeSetEntry {
                         staking_key: PubKey::from(ev.blsVK).into(),
                         state_key: StateVerKey::from(ev.schnorrVK).into(),
-                        stake: node.stake,
-                        commission: node.commission,
-                    });
+                        ..node.clone()
+                    }));
                     (vec![diff], vec![])
                 }
                 StakeTableV2Events::ConsensusKeysUpdatedV2(ev) => {
@@ -674,13 +679,11 @@ impl Snapshot {
                         )
                     });
 
-                    let diff = FullNodeSetDiff::NodeUpdate(NodeSetEntry {
-                        address: ev.account,
+                    let diff = FullNodeSetDiff::NodeUpdate(Arc::new(NodeSetEntry {
                         staking_key: PubKey::from(ev.blsVK).into(),
                         state_key: StateVerKey::from(ev.schnorrVK).into(),
-                        stake: node.stake,
-                        commission: node.commission,
-                    });
+                        ..node.clone()
+                    }));
                     (vec![diff], vec![])
                 }
                 StakeTableV2Events::CommissionUpdated(ev) => {
@@ -691,16 +694,26 @@ impl Snapshot {
                         )
                     });
 
-                    let diff = FullNodeSetDiff::NodeUpdate(NodeSetEntry {
-                        address: ev.validator,
-                        staking_key: node.staking_key.clone(),
-                        state_key: node.state_key.clone(),
-                        stake: node.stake,
+                    let diff = FullNodeSetDiff::NodeUpdate(Arc::new(NodeSetEntry {
                         commission: Ratio::new(
                             ev.newCommission.into(),
                             COMMISSION_BASIS_POINTS.into(),
                         ),
+                        ..node.clone()
+                    }));
+                    (vec![diff], vec![])
+                }
+                StakeTableV2Events::MetadataUriUpdated(ev) => {
+                    let node = self.node_set.get(&ev.validator).unwrap_or_else(|| {
+                        panic!(
+                            "got MetadataUriUpdated event for non existent validator: {}",
+                            ev.validator
+                        )
                     });
+                    let diff = FullNodeSetDiff::NodeUpdate(Arc::new(NodeSetEntry {
+                        metadata_uri: parse_metadata_uri(&ev.metadataUri),
+                        ..node.clone()
+                    }));
                     (vec![diff], vec![])
                 }
                 StakeTableV2Events::Delegated(ev) => {
@@ -711,13 +724,10 @@ impl Snapshot {
                         )
                     });
 
-                    let node_diff = FullNodeSetDiff::NodeUpdate(NodeSetEntry {
-                        address: ev.validator,
-                        staking_key: node.staking_key.clone(),
-                        state_key: node.state_key.clone(),
-                        commission: node.commission,
+                    let node_diff = FullNodeSetDiff::NodeUpdate(Arc::new(NodeSetEntry {
                         stake: node.stake + ev.amount,
-                    });
+                        ..node.clone()
+                    }));
 
                     let delegation = Delegation {
                         delegator: ev.delegator,
@@ -747,13 +757,10 @@ impl Snapshot {
                         panic!("got Undelegated event for non existent validator: {validator}",)
                     });
 
-                    let node_diff = FullNodeSetDiff::NodeUpdate(NodeSetEntry {
-                        address: validator,
-                        staking_key: node.staking_key.clone(),
-                        state_key: node.state_key.clone(),
-                        commission: node.commission,
+                    let node_diff = FullNodeSetDiff::NodeUpdate(Arc::new(NodeSetEntry {
                         stake: node.stake - amount,
-                    });
+                        ..node.clone()
+                    }));
 
                     let pending_withdrawal = PendingWithdrawal {
                         delegator,
@@ -839,8 +846,7 @@ impl Snapshot {
                 | StakeTableV2Events::RoleAdminChanged(_)
                 | StakeTableV2Events::RoleGranted(_)
                 | StakeTableV2Events::RoleRevoked(_)
-                | StakeTableV2Events::Upgraded(_)
-                | StakeTableV2Events::MetadataUriUpdated(_) => {
+                | StakeTableV2Events::Upgraded(_) => {
                     tracing::debug!("skipping irrelevant event");
                     (vec![], vec![])
                 }
@@ -1023,7 +1029,7 @@ impl NodeSet {
     pub fn apply(&mut self, diff: &FullNodeSetDiff) {
         match diff {
             FullNodeSetDiff::NodeUpdate(node) => {
-                self.insert(node.address, node.clone());
+                self.insert(node.address, node.as_ref().clone());
             }
             FullNodeSetDiff::NodeExit(node) => {
                 self.remove(&node.address);
@@ -1079,13 +1085,16 @@ impl From<&ValidatorRegisteredV2> for NodeSetEntry {
     fn from(e: &ValidatorRegisteredV2) -> Self {
         // Downgrade the event: apart from authentication, the V2 event contains the same
         // information as the V1 event, and can be converted to a node the same way.
-        let e = ValidatorRegistered {
+        let legacy = ValidatorRegistered {
             account: e.account,
             blsVk: e.blsVK,
             commission: e.commission,
             schnorrVk: e.schnorrVK,
         };
-        (&e).into()
+        NodeSetEntry {
+            metadata_uri: parse_metadata_uri(&e.metadataUri),
+            ..(&legacy).into()
+        }
     }
 }
 
@@ -1099,6 +1108,26 @@ impl From<&ValidatorRegistered> for NodeSetEntry {
             // All nodes start with 0 stake, a separate delegation event will be generated when
             // someone delegates non-zero stake to a node.
             stake: ESPTokenAmount::ZERO,
+            metadata_uri: None,
+        }
+    }
+}
+
+/// Interpret a string as a [`Url`] from a contract event.
+///
+/// Empty and invalid URIs are treated as missing.
+fn parse_metadata_uri(uri: &str) -> Option<Url> {
+    if uri.is_empty() {
+        return None;
+    }
+    match uri.parse() {
+        Ok(uri) => Some(uri),
+        Err(err) => {
+            // The contract does not validate URIs; nodes can post whatever they want. If
+            // what they posted is not a well-formed URI, we will warn but then just ignore
+            // it, as if they had opted out of registering one at all.
+            tracing::warn!("node registered invalid metadata URI {uri}: {err:#}");
+            None
         }
     }
 }
@@ -1174,8 +1203,8 @@ mod test {
     use alloy::primitives::U256;
     use espresso_types::{StakeTableState, v0_3::StakeTableEvent};
     use hotshot_contract_adapter::sol_types::StakeTableV2::{
-        Delegated, ExitEscrowPeriodUpdated, Undelegated, ValidatorExit, ValidatorExitClaimed,
-        WithdrawalClaimed,
+        Delegated, ExitEscrowPeriodUpdated, MetadataUriUpdated, Undelegated, ValidatorExit,
+        ValidatorExitClaimed, WithdrawalClaimed,
     };
     use pretty_assertions::assert_eq;
     use tide_disco::{Error as _, StatusCode};
@@ -1273,7 +1302,7 @@ mod test {
         let mut block = BlockData::empty(1);
         let node = make_node(0);
         block.state.node_set.push(node.clone());
-        block.node_set_update = Some(vec![FullNodeSetDiff::NodeUpdate(node)]);
+        block.node_set_update = Some(vec![FullNodeSetDiff::NodeUpdate(Arc::new(node))]);
 
         let state = from_blocks::<MemoryStorage>([finalized.clone(), block.clone()]);
 
@@ -1759,7 +1788,7 @@ mod test {
         assert_eq!(block.state.node_set[&event.account], expected);
         assert_eq!(
             block.node_set_update.unwrap(),
-            [FullNodeSetDiff::NodeUpdate(expected)]
+            [FullNodeSetDiff::NodeUpdate(Arc::new(expected))]
         );
     }
 
@@ -1822,6 +1851,108 @@ mod test {
     }
 
     #[test_log::test]
+    fn test_event_metadata_uri_updated_valid() {
+        let node = validator_registered_event(rand::thread_rng());
+        let uri = "https://example.com";
+
+        let block = test_events([
+            // Use legacy registration without metadata.
+            StakeTableV2Events::ValidatorRegistered(ValidatorRegistered {
+                account: node.account,
+                blsVk: node.blsVK,
+                schnorrVk: node.schnorrVK,
+                commission: node.commission,
+            }),
+            // Add metadata later.
+            StakeTableV2Events::MetadataUriUpdated(MetadataUriUpdated {
+                validator: node.account,
+                metadataUri: uri.into(),
+            }),
+        ]);
+
+        assert_eq!(
+            block.state.node_set[&node.account].metadata_uri,
+            Some(uri.parse().unwrap())
+        );
+    }
+
+    #[test_log::test]
+    fn test_event_metadata_uri_updated_invalid() {
+        let node = validator_registered_event(rand::thread_rng());
+        let uri = "notarealuri";
+
+        let block = test_events([
+            // Use legacy registration without metadata.
+            StakeTableV2Events::ValidatorRegistered(ValidatorRegistered {
+                account: node.account,
+                blsVk: node.blsVK,
+                schnorrVk: node.schnorrVK,
+                commission: node.commission,
+            }),
+            // Add metadata later.
+            StakeTableV2Events::MetadataUriUpdated(MetadataUriUpdated {
+                validator: node.account,
+                metadataUri: uri.into(),
+            }),
+        ]);
+
+        assert_eq!(block.state.node_set[&node.account].metadata_uri, None);
+    }
+
+    #[test_log::test]
+    fn test_event_metadata_uri_updated_empty() {
+        let node = validator_registered_event(rand::thread_rng());
+        let uri = "";
+
+        let block = test_events([
+            // Use legacy registration without metadata.
+            StakeTableV2Events::ValidatorRegistered(ValidatorRegistered {
+                account: node.account,
+                blsVk: node.blsVK,
+                schnorrVk: node.schnorrVK,
+                commission: node.commission,
+            }),
+            // Add metadata later.
+            StakeTableV2Events::MetadataUriUpdated(MetadataUriUpdated {
+                validator: node.account,
+                metadataUri: uri.into(),
+            }),
+        ]);
+
+        assert_eq!(block.state.node_set[&node.account].metadata_uri, None);
+    }
+
+    #[test_log::test]
+    fn test_event_metadata_uri_registered_valid() {
+        let mut node = validator_registered_event(rand::thread_rng());
+        node.metadataUri = "https://example.com".into();
+
+        let block = test_events([StakeTableV2Events::ValidatorRegisteredV2(node.clone())]);
+        assert_eq!(
+            block.state.node_set[&node.account].metadata_uri,
+            Some(node.metadataUri.parse().unwrap())
+        );
+    }
+
+    #[test_log::test]
+    fn test_event_metadata_uri_registered_invalid() {
+        let mut node = validator_registered_event(rand::thread_rng());
+        node.metadataUri = "notarealuri".into();
+
+        let block = test_events([StakeTableV2Events::ValidatorRegisteredV2(node.clone())]);
+        assert_eq!(block.state.node_set[&node.account].metadata_uri, None);
+    }
+
+    #[test_log::test]
+    fn test_event_metadata_uri_registered_empty() {
+        let mut node = validator_registered_event(rand::thread_rng());
+        node.metadataUri = "".into();
+
+        let block = test_events([StakeTableV2Events::ValidatorRegisteredV2(node.clone())]);
+        assert_eq!(block.state.node_set[&node.account].metadata_uri, None);
+    }
+
+    #[test_log::test]
     fn test_exit_escrow_period_updated_and_validator_exit_in_same_block() {
         let genesis = BlockData::empty(0);
         let node = validator_registered_event(rand::thread_rng());
@@ -1845,7 +1976,7 @@ mod test {
         assert_eq!(
             block.node_set_update.as_ref().unwrap(),
             &[
-                FullNodeSetDiff::NodeUpdate(NodeSetEntry::from(&node)),
+                FullNodeSetDiff::NodeUpdate(Arc::new(NodeSetEntry::from(&node))),
                 FullNodeSetDiff::NodeExit(NodeExit {
                     address: node.account,
                     exit_time: block.block().timestamp() + block.block().exit_escrow_period

@@ -373,7 +373,10 @@ mod test {
             .await
             .unwrap();
         assert_eq!(update.l1_block, block_snapshot(2).info());
-        assert_eq!(update.diff, [FullNodeSetDiff::NodeUpdate(node_entry)]);
+        assert_eq!(
+            update.diff,
+            [FullNodeSetDiff::NodeUpdate(Arc::new(node_entry))]
+        );
 
         tracing::info!("queries at unknown block hash should return 404");
         let err = client

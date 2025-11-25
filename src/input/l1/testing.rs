@@ -37,9 +37,9 @@ use hotshot_contract_adapter::{
         G1PointSol,
         RewardClaim::RewardsClaimed,
         StakeTableV2::{
-            self, ConsensusKeysUpdatedV2, Delegated, ExitEscrowPeriodUpdated, Undelegated,
-            ValidatorExit, ValidatorExitClaimed, ValidatorRegistered, ValidatorRegisteredV2,
-            WithdrawalClaimed,
+            self, CommissionUpdated, ConsensusKeysUpdatedV2, Delegated, ExitEscrowPeriodUpdated,
+            MetadataUriUpdated, Undelegated, ValidatorExit, ValidatorExitClaimed,
+            ValidatorRegistered, ValidatorRegisteredV2, WithdrawalClaimed,
         },
     },
     stake_table::{StateSignatureSol, sign_address_bls, sign_address_schnorr},
@@ -281,6 +281,7 @@ pub fn make_node(i: usize) -> NodeSetEntry {
 #[derive(Debug)]
 pub struct EventGenerator {
     nodes: HashSet<Address>,
+    commissions: HashMap<Address, u16>,
     delegations: HashMap<(Address, Address), U256>,
     pending_undelegations: HashMap<(Address, Address), U256>,
     pending_exits: HashMap<(Address, Address), U256>,
@@ -293,6 +294,7 @@ impl Default for EventGenerator {
     fn default() -> Self {
         Self {
             nodes: Default::default(),
+            commissions: Default::default(),
             delegations: Default::default(),
             pending_undelegations: Default::default(),
             pending_exits: Default::default(),
@@ -328,15 +330,16 @@ impl Iterator for EventGenerator {
             const UNDELEGATE: usize = 4;
             const WITHDRAWAL: usize = 5;
             const KEY_UPDATE: usize = 6;
+            const COMMISSION_UPDATE: usize = 7;
 
-            const MAX_STAKE_TABLE_EVENT_TYPE: usize = 7;
+            const MAX_STAKE_TABLE_EVENT_TYPE: usize = 8;
 
             // Other contract events that the UI service cares about but consensus does not.
-            const EXIT_ESCROW_PERIOD_UPDATED: usize = 7;
+            const EXIT_ESCROW_PERIOD_UPDATED: usize = 8;
+            const METADATA_URI_UPDATED: usize = 9;
+            const CLAIM_REWARDS: usize = 10;
 
-            const CLAIM_REWARDS: usize = 8;
-
-            const MAX_EVENT_TYPE: usize = 9;
+            const MAX_EVENT_TYPE: usize = 11;
 
             // Generate the code for a random event type.
             let max = if self.stake_table_only {
@@ -354,6 +357,7 @@ impl Iterator for EventGenerator {
                     // This insert should always return `true` because with a random address, it is
                     // vanishingly unlikely we have generated this same address before.
                     assert!(self.nodes.insert(event.account));
+                    self.commissions.insert(event.account, event.commission);
 
                     if t == REGISTER {
                         StakeTableV2Events::ValidatorRegistered(ValidatorRegistered {
@@ -390,6 +394,7 @@ impl Iterator for EventGenerator {
                     }
 
                     self.nodes.remove(&node);
+                    self.commissions.remove(&node);
                     self.exited_nodes.insert(node);
                     StakeTableV2Events::ValidatorExit(ValidatorExit { validator: node }).into()
                 }
@@ -535,6 +540,22 @@ impl Iterator for EventGenerator {
                     .into()
                 }
 
+                COMMISSION_UPDATE => {
+                    let Some(&node) = self.nodes.iter().choose(&mut self.rng) else {
+                        continue;
+                    };
+                    let new_commission = self.rng.gen_range(0..COMMISSION_BASIS_POINTS);
+                    let old_commission = self.commissions.insert(node, new_commission).unwrap();
+
+                    StakeTableV2Events::CommissionUpdated(CommissionUpdated {
+                        validator: node,
+                        oldCommission: old_commission,
+                        newCommission: new_commission,
+                        timestamp: self.rng.next_u64().try_into().unwrap(),
+                    })
+                    .into()
+                }
+
                 CLAIM_REWARDS => {
                     let delegators: Vec<Address> = self
                         .delegations
@@ -551,6 +572,17 @@ impl Iterator for EventGenerator {
                     let amount = U256::from(self.rng.gen_range(10u64..1000u64));
 
                     RewardClaimEvents::RewardsClaimed(RewardsClaimed { user, amount }).into()
+                }
+
+                METADATA_URI_UPDATED => {
+                    let Some(&node) = self.nodes.iter().choose(&mut self.rng) else {
+                        continue;
+                    };
+                    StakeTableV2Events::MetadataUriUpdated(MetadataUriUpdated {
+                        validator: node,
+                        metadataUri: random_metadata_uri(&mut self.rng),
+                    })
+                    .into()
                 }
 
                 _ => unreachable!(),
@@ -597,7 +629,22 @@ pub fn validator_registered_event_with_account(
         commission,
         blsSig: G1PointSol::from(bls_sig).into(),
         schnorrSig: StateSignatureSol::from(schnorr_sig).into(),
-        metadataUri: "https://example.com/validator-metadata.json".to_string(),
+        metadataUri: random_metadata_uri(&mut rng),
+    }
+}
+
+fn random_metadata_uri(mut rng: impl RngCore + CryptoRng) -> String {
+    // Flip a coin (weighted towards heads) to see if we register with a metadata URI.
+    if rng.gen_ratio(3, 4) {
+        "https://example.com/validator-metadata.json".into()
+    } else {
+        // Flip a coin to see if we register an empty URI or invalid URI. Both are allowed by the
+        // contract and treated the same as a missing URI by the staking service.
+        if rng.gen_ratio(1, 2) {
+            "".into()
+        } else {
+            "notarealuri".into()
+        }
     }
 }
 

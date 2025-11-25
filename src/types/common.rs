@@ -1,6 +1,7 @@
 //! Primitive types.
 
 use serde::{Deserialize, Serialize};
+use surf_disco::Url;
 
 pub use alloy::primitives::{Address, BlockHash, U256};
 pub use tagged_base64::TaggedBase64;
@@ -50,6 +51,9 @@ pub struct NodeSetEntry {
 
     /// How much commission the node charges.
     pub commission: Ratio,
+
+    /// URI where the node can publish metadata like a human-readable name.
+    pub metadata_uri: Option<Url>,
 }
 
 /// Information about an L1 block.
