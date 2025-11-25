@@ -74,25 +74,16 @@ pub struct State<S, C> {
 }
 
 impl<S: EspressoPersistence, C: EspressoClient> State<S, C> {
-    /// Synchronize lifetime rewards from Espresso API for all known accounts.
+    /// Fetches all reward accounts and their balances from the Espresso API at the given
+    /// block height, then saves them to the database.
     ///
-    /// We refetch rewards for every account already in storage to refresh stale state from a
-    /// previous run. We deliberately avoid clearing the table, because those accounts would be
-    /// fetched again anyway (unless the stake table completely changed)
-    ///  Instead, we refresh the existing set once here and rely on the incremental fetching for new accounts
-    /// (`fetch_and_insert_missing_reward_accounts`)
+    /// Called once at startup to populate the initial reward state.
     async fn sync_lifetime_rewards(state: &RwLock<Self>, block_height: u64) -> Result<()> {
         tracing::info!("Synchronizing lifetime rewards from Espresso API at block {block_height}");
 
-        let state_read = state.read().await;
-        let addresses = state_read.storage.all_reward_accounts().await?;
-        let espresso = state_read.espresso.clone();
-        drop(state_read);
+        let espresso = { state.read().await.espresso.clone() };
 
-        // Query reward balances from Espresso API
-        let reward_balances = espresso
-            .fetch_reward_balances(addresses, block_height)
-            .await?;
+        let reward_balances = espresso.fetch_all_reward_accounts(block_height).await?;
 
         if !reward_balances.is_empty() {
             let mut state = state.write().await;
@@ -690,9 +681,6 @@ pub trait EspressoPersistence {
         account: Address,
     ) -> impl Send + Future<Output = Result<ESPTokenAmount>>;
 
-    /// Get all accounts that have lifetime rewards in storage.
-    fn all_reward_accounts(&self) -> impl Send + Future<Output = Result<Vec<Address>>>;
-
     /// Ensure accounts exist in the lifetime_rewards table
     ///
     /// For accounts that don't exist, fetches their balances from the Espresso API and inserts them.
@@ -825,6 +813,15 @@ pub trait EspressoClient: Clone + Send + Sync {
     ///
     /// Each leaf is paired with the set of voters who signed it.
     fn leaves(&self, from: u64) -> impl Send + Unpin + Stream<Item = (Leaf2, BitVec)>;
+
+    /// Fetch all reward accounts and their balances at a specific block height.
+    ///
+    /// This uses the `reward-amounts` endpoint which is more efficient than
+    /// querying individual balances when syncing all accounts.
+    fn fetch_all_reward_accounts(
+        &self,
+        block: u64,
+    ) -> impl Send + Future<Output = Result<Vec<(Address, ESPTokenAmount)>>>;
 
     /// Fetch reward balances for multiple addresses in parallel.
     /// Uses a semaphore to limit parallel API requests to 5.
@@ -1742,6 +1739,13 @@ mod test {
 
         async fn reward_balance(&self, block: u64, account: Address) -> Result<ESPTokenAmount> {
             self.inner.reward_balance(block, account).await
+        }
+
+        async fn fetch_all_reward_accounts(
+            &self,
+            block: u64,
+        ) -> Result<Vec<(Address, ESPTokenAmount)>> {
+            self.inner.fetch_all_reward_accounts(block).await
         }
 
         fn leaves(&self, from: u64) -> impl Send + Unpin + Stream<Item = (Leaf2, BitVec)> {

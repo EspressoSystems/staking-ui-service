@@ -748,23 +748,6 @@ impl EspressoPersistence for Persistence {
         }
     }
 
-    async fn all_reward_accounts(&self) -> Result<Vec<Address>> {
-        let mut tx = self.pool.begin().await.context("acquiring connection")?;
-        let accounts: Vec<(String,)> = sqlx::query_as("SELECT address FROM lifetime_rewards")
-            .fetch_all(tx.as_mut())
-            .await
-            .context("fetching all reward accounts")?;
-
-        accounts
-            .into_iter()
-            .map(|(addr_str,)| {
-                addr_str
-                    .parse::<Address>()
-                    .map_err(|e| Error::internal().context(format!("failed to parse address: {e}")))
-            })
-            .collect()
-    }
-
     async fn fetch_and_insert_missing_reward_accounts<C: EspressoClient>(
         &mut self,
         espresso: &C,

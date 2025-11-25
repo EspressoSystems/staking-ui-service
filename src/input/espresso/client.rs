@@ -4,6 +4,7 @@ use bitvec::vec::BitVec;
 use clap::Parser;
 use espresso_types::{
     Leaf2, SeqTypes, ValidatorMap, config::PublicNetworkConfig, parse_duration, v0_3::RewardAmount,
+    v0_4::RewardAccountV2,
 };
 use futures::{Stream, StreamExt, TryFutureExt, TryStreamExt, stream};
 use hotshot_query_service::{availability::LeafQueryData, types::HeightIndexed};
@@ -224,6 +225,58 @@ impl EspressoClient for QueryServiceClient {
             .send()
             .await?;
         Ok(reward.map(|r| r.0).unwrap_or_default())
+    }
+
+    #[instrument(skip(self))]
+    async fn fetch_all_reward_accounts(
+        &self,
+        block: u64,
+    ) -> Result<Vec<(Address, ESPTokenAmount)>> {
+        let limit = 10_000_u64;
+        let mut all_accounts = Vec::new();
+        let mut offset = 0u64;
+
+        loop {
+            let mut attempt = 0;
+            let accounts: Vec<(RewardAccountV2, RewardAmount)> = loop {
+                attempt += 1;
+                match self
+                    .inner
+                    .get(&format!("catchup/{block}/reward-amounts/{limit}/{offset}"))
+                    .send()
+                    .await
+                {
+                    Ok(accounts) => break accounts,
+                    Err(e) if attempt < 3 => {
+                        tracing::warn!(block, offset, error = %e, "failed to fetch reward accounts, retrying");
+                        sleep(Duration::from_secs(1)).await;
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            };
+
+            let num_fetched = accounts.len() as u64;
+            tracing::debug!(block, offset, num_fetched, "fetched reward accounts batch");
+
+            all_accounts.extend(
+                accounts
+                    .into_iter()
+                    .map(|(account, amount)| (account.into(), amount.0)),
+            );
+
+            if num_fetched < limit {
+                break;
+            }
+
+            offset += num_fetched;
+        }
+
+        tracing::warn!(
+            block,
+            total_accounts = all_accounts.len(),
+            "fetched all reward accounts"
+        );
+        Ok(all_accounts)
     }
 
     fn leaves(&self, from: u64) -> impl Send + Unpin + Stream<Item = (Leaf2, BitVec)> {

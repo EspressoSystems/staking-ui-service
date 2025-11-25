@@ -139,6 +139,13 @@ impl EspressoClient for MockEspressoClient {
         Ok(ESPTokenAmount::ZERO)
     }
 
+    async fn fetch_all_reward_accounts(
+        &self,
+        _block: u64,
+    ) -> Result<Vec<(Address, ESPTokenAmount)>> {
+        Ok(Vec::new())
+    }
+
     fn leaves(&self, from: u64) -> impl Send + Unpin + Stream<Item = (Leaf2, BitVec)> {
         // Yield the leaves we already have in our buffer.
         let leaves = match self.leaf_offset(from) {
@@ -334,11 +341,6 @@ impl EspressoPersistence for MemoryStorage {
         let rewards = &self.db.read().await.1;
         // If a reward account is not in the database, it has 0 balance by default.
         Ok(rewards.get(&account).copied().unwrap_or_default())
-    }
-
-    async fn all_reward_accounts(&self) -> Result<Vec<Address>> {
-        self.mock_errors()?;
-        Ok(self.db.read().await.1.keys().copied().collect())
     }
 
     async fn fetch_and_insert_missing_reward_accounts<C: EspressoClient>(
