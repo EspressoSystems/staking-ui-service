@@ -769,51 +769,14 @@ impl Snapshot {
                 //
                 // The new StakeTableV2 contract emits `WithdrawalClaimed` and
                 // `ValidatorExitClaimed` events which include the validator address.
-                // We still handle this for backward compatibility because
-                // the Decaf testnet has some of these events.
                 //
-                // This event only contains (account, amount) without the
-                // validator address, so we match by amount. This may be incorrect
-                // if the same delegator has multiple pending withdrawals with same
-                // amounts but different validators.
+                // This event should never be emitted on mainnet because
+                // mainnet will have new stake table contract
                 StakeTableV2Events::Withdrawal(ev) => {
-                    let wallet = self.wallets.get(&ev.account).unwrap_or_else(|| {
-                        panic!(
-                            "got Withdrawal event for non existent wallet: {}",
-                            ev.account
-                        )
-                    });
-
-                    if let Some((_, pending)) = wallet
-                        .pending_undelegations
-                        .iter()
-                        .find(|(_, p)| p.delegator == ev.account && p.amount == ev.amount)
-                    {
-                        let withdrawal = Withdrawal {
-                            delegator: ev.account,
-                            node: pending.node,
-                            amount: ev.amount,
-                        };
-                        let wallet_diff = WalletDiff::UndelegationWithdrawal(withdrawal);
-                        return (vec![], vec![(ev.account, wallet_diff)]);
-                    }
-
-                    if let Some((_, pending)) = wallet
-                        .pending_exits
-                        .iter()
-                        .find(|(_, p)| p.delegator == ev.account && p.amount == ev.amount)
-                    {
-                        let withdrawal = Withdrawal {
-                            delegator: ev.account,
-                            node: pending.node,
-                            amount: ev.amount,
-                        };
-                        let wallet_diff = WalletDiff::NodeExitWithdrawal(withdrawal);
-                        return (vec![], vec![(ev.account, wallet_diff)]);
-                    }
-
                     panic!(
-                        "got Withdrawal event but no pending exit/undelegation account {} with amount {}",
+                        "Received legacy Withdrawal event account={}, amount={}. \
+                        This event is from the old StakeTable contract.
+                        The StakeTableV2 contract emits WithdrawalClaimed and ValidatorExitClaimed instead.",
                         ev.account, ev.amount
                     );
                 }
