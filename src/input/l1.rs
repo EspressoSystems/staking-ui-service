@@ -765,6 +765,17 @@ impl Snapshot {
 
                     (vec![node_diff], vec![(delegator, wallet_diff)])
                 }
+                // Legacy withdrawal event from the old StakeTable contract.
+                //
+                // The new StakeTableV2 contract emits `WithdrawalClaimed` and
+                // `ValidatorExitClaimed` events which include the validator address.
+                // We still handle this for backward compatibility because
+                // the Decaf testnet has some of these events.
+                //
+                // This event only contains (account, amount) without the
+                // validator address, so we match by amount. This may be incorrect
+                // if the same delegator has multiple pending withdrawals with same
+                // amounts but different validators.
                 StakeTableV2Events::Withdrawal(ev) => {
                     let wallet = self.wallets.get(&ev.account).unwrap_or_else(|| {
                         panic!(
@@ -773,9 +784,6 @@ impl Snapshot {
                         )
                     });
 
-                    // TODO:
-                    // handle multiple undelegations of same amount
-                    // from different nodes
                     if let Some((_, pending)) = wallet
                         .pending_undelegations
                         .iter()
@@ -1203,7 +1211,8 @@ mod test {
     use alloy::primitives::U256;
     use espresso_types::{StakeTableState, v0_3::StakeTableEvent};
     use hotshot_contract_adapter::sol_types::StakeTableV2::{
-        Delegated, ExitEscrowPeriodUpdated, Undelegated, ValidatorExit, Withdrawal,
+        Delegated, ExitEscrowPeriodUpdated, Undelegated, ValidatorExit, ValidatorExitClaimed,
+        WithdrawalClaimed,
     };
     use pretty_assertions::assert_eq;
     use tide_disco::{Error as _, StatusCode};
@@ -1966,12 +1975,14 @@ mod test {
         ); // Exit for remaining delegation
 
         // Withdraw the undelegation
-        let block4 = block3.next(
-            &BlockInput::empty(4).with_event(StakeTableV2Events::Withdrawal(Withdrawal {
-                account: delegator,
+        let block4 = block3.next(&BlockInput::empty(4).with_event(
+            StakeTableV2Events::WithdrawalClaimed(WithdrawalClaimed {
+                delegator,
+                validator: validator_address,
+                undelegationId: 0,
                 amount: U256::from(400),
-            })),
-        );
+            }),
+        ));
 
         // Verify undelegation withdrawn but exit still pending
         let wallet = block4.state.wallets.get(&delegator).unwrap();
@@ -1984,12 +1995,13 @@ mod test {
         );
 
         // Withdraw the exit
-        let block5 = block4.next(
-            &BlockInput::empty(5).with_event(StakeTableV2Events::Withdrawal(Withdrawal {
-                account: delegator,
+        let block5 = block4.next(&BlockInput::empty(5).with_event(
+            StakeTableV2Events::ValidatorExitClaimed(ValidatorExitClaimed {
+                delegator,
+                validator: validator_address,
                 amount: U256::from(600),
-            })),
-        );
+            }),
+        ));
 
         let wallet = block5.state.wallets.get(&delegator).unwrap();
         assert_eq!(wallet.nodes.len(), 0);
