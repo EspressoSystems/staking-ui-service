@@ -857,18 +857,47 @@ impl Snapshot {
 
                     (vec![node_diff], vec![(delegator, wallet_diff)])
                 }
-                // Legacy withdrawal event from the old StakeTable contract.
-                //
-                // The new StakeTableV2 contract emits `WithdrawalClaimed` and
-                // `ValidatorExitClaimed` events which include the validator address.
-                //
-                // This event should never be emitted on mainnet because
-                // mainnet will have new stake table contract
                 StakeTableV2Events::Withdrawal(ev) => {
+                    let wallet = self.wallets.get(&ev.account).unwrap_or_else(|| {
+                        panic!(
+                            "got Withdrawal event for non existent wallet: {}",
+                            ev.account
+                        )
+                    });
+
+                    // TODO:
+                    // handle multiple undelegations of same amount
+                    // from different nodes
+                    if let Some((_, pending)) = wallet
+                        .pending_undelegations
+                        .iter()
+                        .find(|(_, p)| p.delegator == ev.account && p.amount == ev.amount)
+                    {
+                        let withdrawal = Withdrawal {
+                            delegator: ev.account,
+                            node: pending.node,
+                            amount: ev.amount,
+                        };
+                        let wallet_diff = WalletDiff::UndelegationWithdrawal(withdrawal);
+                        return (vec![], vec![(ev.account, wallet_diff)]);
+                    }
+
+                    if let Some((_, pending)) = wallet
+                        .pending_exits
+                        .iter()
+                        .find(|(_, p)| p.delegator == ev.account && p.amount == ev.amount)
+                    {
+                        let withdrawal = Withdrawal {
+                            delegator: ev.account,
+                            node: pending.node,
+                            amount: ev.amount,
+                        };
+                        let wallet_diff = WalletDiff::NodeExitWithdrawal(withdrawal);
+                        return (vec![], vec![(ev.account, wallet_diff)]);
+                    }
+
                     panic!(
-                        "Received legacy Withdrawal event account={}, amount={}. \
-                        This event is from the old StakeTable contract.
-                        The StakeTableV2 contract emits WithdrawalClaimed and ValidatorExitClaimed instead.",
+                        "got Withdrawal event but no pending exit/undelegation account {} with amount {}",
                         ev.account, ev.amount
                     );
                 }
@@ -1324,7 +1353,7 @@ mod test {
     use espresso_types::{RegisteredValidatorMap, StakeTableState, v0_3::StakeTableEvent};
     use hotshot_contract_adapter::sol_types::StakeTableV2::{
         Delegated, ExitEscrowPeriodUpdated, MetadataUriUpdated, Undelegated, ValidatorExit,
-        ValidatorExitClaimed, ValidatorRegisteredV2, WithdrawalClaimed,
+        ValidatorRegisteredV2, Withdrawal,
     };
     use pretty_assertions::assert_eq;
     use reqwest::Url;
@@ -2284,14 +2313,10 @@ mod test {
         let block4 = block3
             .next(
                 &NoMetadata,
-                &BlockInput::empty(4).with_event(StakeTableV2Events::WithdrawalClaimed(
-                    WithdrawalClaimed {
-                        delegator,
-                        validator: validator_address,
-                        undelegationId: 0,
-                        amount: U256::from(400),
-                    },
-                )),
+                &BlockInput::empty(4).with_event(StakeTableV2Events::Withdrawal(Withdrawal {
+                    account: delegator,
+                    amount: U256::from(400),
+                })),
             )
             .await;
 
@@ -2309,13 +2334,10 @@ mod test {
         let block5 = block4
             .next(
                 &NoMetadata,
-                &BlockInput::empty(5).with_event(StakeTableV2Events::ValidatorExitClaimed(
-                    ValidatorExitClaimed {
-                        delegator,
-                        validator: validator_address,
-                        amount: U256::from(600),
-                    },
-                )),
+                &BlockInput::empty(5).with_event(StakeTableV2Events::Withdrawal(Withdrawal {
+                    account: delegator,
+                    amount: U256::from(600),
+                })),
             )
             .await;
 
