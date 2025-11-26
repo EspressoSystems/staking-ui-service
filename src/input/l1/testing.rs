@@ -39,8 +39,8 @@ use hotshot_contract_adapter::{
         RewardClaim::RewardsClaimed,
         StakeTableV2::{
             self, CommissionUpdated, ConsensusKeysUpdatedV2, Delegated, ExitEscrowPeriodUpdated,
-            MetadataUriUpdated, Undelegated, ValidatorExit, ValidatorExitClaimed,
-            ValidatorRegistered, ValidatorRegisteredV2, WithdrawalClaimed,
+            MetadataUriUpdated, Undelegated, ValidatorExit, ValidatorRegistered,
+            ValidatorRegisteredV2, Withdrawal,
         },
     },
     stake_table::{StateSignatureSol, sign_address_bls, sign_address_schnorr},
@@ -550,29 +550,17 @@ impl Iterator for EventGenerator {
 
                     // Choose a random withdrawal and remove it
                     let idx = self.rng.gen_range(0..total);
-                    if idx < pending_undelegations.len() {
+                    let (account, _node, amount) = if idx < pending_undelegations.len() {
                         let key = pending_undelegations[idx];
                         let amount = self.pending_undelegations.remove(&key).unwrap();
-                        let (delegator, validator) = key;
-                        // undelegationId is not tracked in EventGenerator, use 0 as placeholder
-                        StakeTableV2Events::WithdrawalClaimed(WithdrawalClaimed {
-                            delegator,
-                            validator,
-                            undelegationId: 0,
-                            amount,
-                        })
-                        .into()
+                        (key.0, key.1, amount)
                     } else {
                         let key = pending_exits[idx - pending_undelegations.len()];
                         let amount = self.pending_exits.remove(&key).unwrap();
-                        let (delegator, validator) = key;
-                        StakeTableV2Events::ValidatorExitClaimed(ValidatorExitClaimed {
-                            delegator,
-                            validator,
-                            amount,
-                        })
-                        .into()
-                    }
+                        (key.0, key.1, amount)
+                    };
+
+                    StakeTableV2Events::Withdrawal(Withdrawal { account, amount }).into()
                 }
 
                 KEY_UPDATE => {
