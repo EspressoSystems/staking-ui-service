@@ -11,7 +11,7 @@ use std::{
     time::Duration,
 };
 
-use crate::types::common::NodeSetEntry;
+use crate::{input::l1::metadata::parse_metadata_uri, types::common::NodeSetEntry};
 use alloy::{
     network::EthereumWallet,
     primitives::{Address, FixedBytes, U256, keccak256},
@@ -245,6 +245,30 @@ impl L1Catchup for CatchupFromEvents {
             .into_iter()
             .skip_while(|(id, ..)| id.number <= from)
             .collect())
+    }
+}
+
+/// Dummy [`MetadataFetcher`] that always returns [`None`].
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoMetadata;
+
+impl MetadataFetcher for NoMetadata {
+    async fn fetch_infallible(&self, _uri: &str) -> Option<NodeMetadata> {
+        None
+    }
+}
+
+/// Dummy [`MetadataFetcher`] that returns a given object whenever the URI is valid.
+#[derive(Clone, Debug, Default)]
+pub struct ConstMetadata(pub NodeMetadata);
+
+impl MetadataFetcher for ConstMetadata {
+    async fn fetch_infallible(&self, uri: &str) -> Option<NodeMetadata> {
+        if parse_metadata_uri(uri).is_some() {
+            Some(self.0.clone())
+        } else {
+            None
+        }
     }
 }
 
@@ -726,7 +750,7 @@ impl BlockInput {
     }
 }
 
-impl<S: Default> super::State<S> {
+impl<S: Default, M: Default> super::State<S, M> {
     pub fn with_l1_block_range(start: u64, end: u64) -> Self {
         let blocks = (start..end).map(BlockData::empty).collect::<Vec<_>>();
         let blocks_by_hash = blocks
@@ -737,6 +761,7 @@ impl<S: Default> super::State<S> {
             blocks,
             blocks_by_hash,
             storage: Default::default(),
+            metadata_fetcher: Default::default(),
         }
     }
 }
@@ -756,13 +781,14 @@ impl BlockData {
 ///
 /// Returns a lock on the state, frozen after the first observation where the predicate was
 /// satisfied.
-pub async fn subscribe_until<S>(
-    state: &'_ Arc<RwLock<State<S>>>,
+pub async fn subscribe_until<S, M>(
+    state: &'_ Arc<RwLock<State<S, M>>>,
     stream: impl ResettableStream + Send + 'static,
-    p: impl Fn(&State<S>) -> bool,
-) -> RwLockReadGuard<'_, State<S>>
+    p: impl Fn(&State<S, M>) -> bool,
+) -> RwLockReadGuard<'_, State<S, M>>
 where
     S: L1Persistence + Sync + 'static,
+    M: MetadataFetcher + Send + Sync + 'static,
 {
     let task = spawn(State::subscribe(state.clone(), stream));
 

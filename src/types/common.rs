@@ -52,8 +52,8 @@ pub struct NodeSetEntry {
     /// How much commission the node charges.
     pub commission: Ratio,
 
-    /// URI where the node can publish metadata like a human-readable name.
-    pub metadata_uri: Option<Url>,
+    /// Optional metadata like a human-readable name and icon.
+    pub metadata: Option<NodeMetadata>,
 }
 
 /// Information about an L1 block.
@@ -166,4 +166,54 @@ pub struct Withdrawal {
 
     /// The amount of stake.
     pub amount: ESPTokenAmount,
+}
+
+/// Optional descriptive information about a node.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct NodeMetadata {
+    /// Human-readable name for the node.
+    pub name: Option<String>,
+
+    /// Longer description of the node.
+    pub description: Option<String>,
+
+    /// Company or individual operating the node.
+    pub company_name: Option<String>,
+
+    /// Website for `company_name`.
+    pub company_website: Option<Url>,
+
+    /// Consensus client the node is running.
+    pub client_version: Option<String>,
+
+    /// Icon for the node (at different resolutions and pixel aspect ratios).
+    pub icon: Option<ImageSet>,
+}
+
+/// Different versions of the same image, at different resolutions and pixel aspect ratios.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ImageSet {
+    /// 14x14 icons at different pixel ratios.
+    #[serde(rename = "14x14")]
+    pub small: RatioSet,
+
+    /// 24x24 icons at different pixel ratios.
+    #[serde(rename = "24x24")]
+    pub large: RatioSet,
+}
+
+/// Different versions of the same image, at different pixel aspect ratios.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct RatioSet {
+    /// Image source for 1:1 pixel aspect ratio
+    #[serde(rename = "@1x")]
+    pub ratio1: Option<Url>,
+
+    /// Image source for 2:1 pixel aspect ratio
+    #[serde(rename = "@2x")]
+    pub ratio2: Option<Url>,
+
+    /// Image source for 3:1 pixel aspect ratio
+    #[serde(rename = "@3x")]
+    pub ratio3: Option<Url>,
 }

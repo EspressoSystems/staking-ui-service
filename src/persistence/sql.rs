@@ -18,6 +18,7 @@ use alloy::primitives::U256;
 use anyhow::Context;
 use clap::Parser;
 use futures::{TryStreamExt, future::try_join_all};
+use serde_json::Value;
 use sqlx::{
     ConnectOptions, QueryBuilder,
     sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions},
@@ -120,24 +121,24 @@ impl Persistence {
         };
 
         // Load all registered nodes
-        let node_rows = sqlx::query_as::<_, (String, String, String, f64, String, Option<String>)>(
-            "SELECT address, staking_key, state_key, commission, stake, metadata_uri FROM node",
+        let node_rows = sqlx::query_as::<_, (String, String, String, f64, String, Option<Value>)>(
+            "SELECT address, staking_key, state_key, commission, stake, metadata FROM node",
         )
         .fetch_all(&self.pool)
         .await?;
 
         let mut node_set = NodeSet::default();
-        for (address, staking_key, state_key, commission, stake_str, metadata_uri) in node_rows {
+        for (address, staking_key, state_key, commission, stake_str, metadata) in node_rows {
             let node = NodeSetEntry {
                 address: address.parse().context("failed to parse node address")?,
                 staking_key: staking_key.parse().context("failed to parse staking key")?,
                 state_key: state_key.parse().context("failed to parse state key")?,
                 stake: U256::from_str(&stake_str).context("failed to parse node stake")?,
                 commission: Ratio::from(commission as f32),
-                metadata_uri: metadata_uri
-                    .map(|uri| uri.parse())
+                metadata: metadata
+                    .map(serde_json::from_value)
                     .transpose()
-                    .context("failed to parse metadata URI")?,
+                    .context("failed to parse metadata")?,
             };
             node_set.push(node);
         }
@@ -259,22 +260,28 @@ impl Persistence {
     ) -> Result<()> {
         match diff {
             FullNodeSetDiff::NodeUpdate(node) => {
+                let metadata = node
+                    .metadata
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()
+                    .context("serializing metadata")?;
                 sqlx::query(
-                    "INSERT INTO node (address, staking_key, state_key, commission, stake, metadata_uri)
+                    "INSERT INTO node (address, staking_key, state_key, commission, stake, metadata)
                      VALUES ($1, $2, $3, $4, $5, $6)
                      ON CONFLICT(address) DO UPDATE SET
                          staking_key = excluded.staking_key,
                          state_key = excluded.state_key,
                          commission = excluded.commission,
                          stake = excluded.stake,
-                         metadata_uri = excluded.metadata_uri",
+                         metadata = excluded.metadata",
                 )
                 .bind(node.address.to_string())
                 .bind(node.staking_key.to_string())
                 .bind(node.state_key.to_string())
                 .bind(f32::from(node.commission) as f64)
                 .bind(node.stake.to_string())
-                .bind(node.metadata_uri.as_ref().map(|uri| uri.to_string()))
+                .bind(metadata)
                 .execute(&mut **tx)
                 .await?;
             }
@@ -1029,7 +1036,10 @@ mod tests {
 
     use super::*;
     use crate::input::l1::testing::{block_snapshot, make_node};
-    use crate::types::common::{Address, ESPTokenAmount, NodeExit, PendingWithdrawal, Withdrawal};
+    use crate::types::common::{
+        Address, ESPTokenAmount, ImageSet, NodeExit, NodeMetadata, PendingWithdrawal, RatioSet,
+        Withdrawal,
+    };
     use crate::types::global::FullNodeSetDiff;
     use im::ordmap;
 
@@ -2135,5 +2145,86 @@ mod tests {
                 new_node.address => new_delegation
             }
         );
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_node_metadata() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        let options = PersistenceOptions {
+            path: db_path,
+            max_connections: 5,
+        };
+        let mut persistence = Persistence::new(&options).await.unwrap();
+
+        let metadata = NodeMetadata {
+            name: Some("test".into()),
+            description: Some("longer description".into()),
+            company_name: Some("Espresso Systems".into()),
+            company_website: Some("https://www.espressosys.com/".parse().unwrap()),
+            client_version: Some("release-main".into()),
+            icon: Some(ImageSet {
+                small: RatioSet {
+                    ratio1: Some(
+                        "https://www.espressosys.com/icon-14x14@1x.svg"
+                            .parse()
+                            .unwrap(),
+                    ),
+                    ratio2: Some(
+                        "https://www.espressosys.com/icon-14x14@2x.svg"
+                            .parse()
+                            .unwrap(),
+                    ),
+                    ratio3: Some(
+                        "https://www.espressosys.com/icon-14x14@3x.svg"
+                            .parse()
+                            .unwrap(),
+                    ),
+                },
+                large: RatioSet {
+                    ratio1: Some(
+                        "https://www.espressosys.com/icon-24x24@1x.svg"
+                            .parse()
+                            .unwrap(),
+                    ),
+                    ratio2: Some(
+                        "https://www.espressosys.com/icon-24x24@2x.svg"
+                            .parse()
+                            .unwrap(),
+                    ),
+                    ratio3: Some(
+                        "https://www.espressosys.com/icon-24x24@3x.svg"
+                            .parse()
+                            .unwrap(),
+                    ),
+                },
+            }),
+        };
+
+        // Initialize a node.
+        persistence
+            .save_genesis(Snapshot::empty(block_snapshot(0)))
+            .await
+            .unwrap();
+        let node = NodeSetEntry {
+            metadata: Some(metadata.clone()),
+            ..make_node(0)
+        };
+        persistence
+            .apply_updates(vec![Update {
+                block: block_snapshot(1),
+                node_set_diffs: vec![FullNodeSetDiff::NodeUpdate(Arc::new(node.clone()))],
+                wallet_diffs: Default::default(),
+            }])
+            .await
+            .unwrap();
+
+        // Check that we get the same metadata when we read it back.
+        let snapshot = persistence
+            .load_finalized_snapshot()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.node_set[&node.address].metadata, Some(metadata));
     }
 }
