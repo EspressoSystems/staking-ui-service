@@ -261,10 +261,6 @@ pub fn default_node_metadata() -> NodeMetadata {
 pub struct NoMetadata;
 
 impl MetadataFetcher for NoMetadata {
-    async fn fetch_infallible(&self, _uri: &str) -> Option<NodeMetadata> {
-        None
-    }
-
     async fn fetch_content(&self, _uri: &Url) -> Result<NodeMetadataContent> {
         Err(Error::internal().context("NoMetadata"))
     }
@@ -312,7 +308,20 @@ pub fn block_snapshot(number: u64) -> L1BlockSnapshot {
 
 /// Generate an arbitrary node for testing.
 pub fn make_node(i: usize) -> NodeSetEntry {
-    (&validator_registered_event(StdRng::seed_from_u64(i as u64))).into()
+    let e = validator_registered_event(StdRng::seed_from_u64(i as u64));
+    NodeSetEntry::from_event_no_metadata(&e)
+}
+
+impl NodeSetEntry {
+    pub fn from_event_no_metadata(event: &ValidatorRegisteredV2) -> Self {
+        let legacy = ValidatorRegistered {
+            account: event.account,
+            blsVk: event.blsVK,
+            commission: event.commission,
+            schnorrVk: event.schnorrVK,
+        };
+        (&legacy).into()
+    }
 }
 
 /// Generate random L1 events for testing.

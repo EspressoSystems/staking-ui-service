@@ -2211,7 +2211,7 @@ mod tests {
         };
         let metadata = NodeMetadata {
             uri: "https://www.espressosys.com/metadata/".parse().unwrap(),
-            content,
+            content: Some(content),
         };
 
         // Initialize a node.

@@ -35,16 +35,17 @@ pub trait MetadataFetcher: Sync {
     /// the result is [`None`].
     ///
     /// If the resource is unretrievable or the returned resource cannot be parsed as valid
-    /// [`NodeMetadataContent`], returns [`Some`] with a default (empty) content, but the valid URI
-    /// is saved so that the content can be refetched at a later time.
+    /// [`NodeMetadataContent`], returns [`Some`] [`NodeMetadata`], but the
+    /// [`NodeMetadata::content`] is [`None`] (the valid, parsed URI will still be populated in the
+    /// returned [`NodeMetadata`], so that the content can be refetched at a later time).
     fn fetch_infallible(&self, uri: &str) -> impl Send + Future<Output = Option<NodeMetadata>> {
         async move {
             let uri = parse_metadata_uri(uri)?;
             let content = match self.fetch_content(&uri).await {
-                Ok(content) => content,
+                Ok(content) => Some(content),
                 Err(err) => {
                     tracing::warn!(%uri, "unable to fetch metadata, returning default: {err:#}");
-                    NodeMetadataContent::default()
+                    None
                 }
             };
             Some(NodeMetadata { uri, content })
@@ -342,10 +343,7 @@ mod test {
 
         assert_eq!(
             fetcher.fetch_infallible(uri.as_ref()).await,
-            Some(NodeMetadata {
-                uri,
-                content: NodeMetadataContent::default()
-            })
+            Some(NodeMetadata { uri, content: None })
         );
     }
 
@@ -418,7 +416,7 @@ mod test {
             fetcher.fetch_infallible(uri.as_ref()).await.unwrap(),
             NodeMetadata {
                 uri,
-                content: expected
+                content: Some(expected)
             }
         );
 
@@ -543,7 +541,7 @@ mod test {
             fetcher.fetch_infallible(uri.as_ref()).await.unwrap(),
             NodeMetadata {
                 uri,
-                content: expected
+                content: Some(expected)
             }
         );
 

@@ -16,7 +16,7 @@ use futures::{
 };
 use hotshot_contract_adapter::sol_types::{
     RewardClaim::RewardClaimEvents,
-    StakeTableV2::{StakeTableV2Events, ValidatorRegistered, ValidatorRegisteredV2},
+    StakeTableV2::{StakeTableV2Events, ValidatorRegistered},
 };
 use hotshot_types::light_client::StateVerKey;
 use tokio::time::sleep;
@@ -609,6 +609,7 @@ impl Snapshot {
         match event {
             L1Event::StakeTable(ev) => match ev.as_ref() {
                 StakeTableV2Events::ValidatorRegisteredV2(ev) => {
+                    // Authenticate signatures.
                     if let Err(err) = ev.authenticate() {
                         // The contract doesn't check all the signatures, so it's possible that an
                         // invalid event got through. We can safely just ignore it as the consensus
@@ -616,9 +617,22 @@ impl Snapshot {
                         tracing::warn!("got invalid ValidatorRegisteredV2 event: {err:#}");
                         return Default::default();
                     }
+
+                    // Download third-party metadata.
+                    let metadata = metadata_fetcher.fetch_infallible(&ev.metadataUri).await;
+
+                    // Downgrade the event: apart from authentication and metadata, the V2 event
+                    // contains the same information as the V1 event, and can be converted to a node
+                    // the same way.
+                    let legacy = ValidatorRegistered {
+                        account: ev.account,
+                        blsVk: ev.blsVK,
+                        commission: ev.commission,
+                        schnorrVk: ev.schnorrVK,
+                    };
                     let node = NodeSetEntry {
-                        metadata: metadata_fetcher.fetch_infallible(&ev.metadataUri).await,
-                        ..ev.into()
+                        metadata,
+                        ..(&legacy).into()
                     };
                     (vec![FullNodeSetDiff::NodeUpdate(Arc::new(node))], vec![])
                 }
@@ -926,12 +940,12 @@ impl Snapshot {
                 };
 
                 // Only emit a new node entry if the metadata is actually changing.
-                if new != metadata.content {
+                if metadata.content.as_ref() != Some(&new) {
                     tracing::info!(?node, ?new, "updating node metadata due to refresh");
                     Some(NodeSetEntry {
                         metadata: Some(NodeMetadata {
                             uri: metadata.uri.clone(),
-                            content: new,
+                            content: Some(new),
                         }),
                         ..node.clone()
                     })
@@ -1168,20 +1182,6 @@ impl From<StakeTableV2Events> for L1Event {
     }
 }
 
-impl From<&ValidatorRegisteredV2> for NodeSetEntry {
-    fn from(e: &ValidatorRegisteredV2) -> Self {
-        // Downgrade the event: apart from authentication, the V2 event contains the same
-        // information as the V1 event, and can be converted to a node the same way.
-        let legacy = ValidatorRegistered {
-            account: e.account,
-            blsVk: e.blsVK,
-            commission: e.commission,
-            schnorrVk: e.schnorrVK,
-        };
-        (&legacy).into()
-    }
-}
-
 impl From<&ValidatorRegistered> for NodeSetEntry {
     fn from(e: &ValidatorRegistered) -> Self {
         NodeSetEntry {
@@ -1275,7 +1275,7 @@ mod test {
     use espresso_types::{StakeTableState, v0_3::StakeTableEvent};
     use hotshot_contract_adapter::sol_types::StakeTableV2::{
         Delegated, ExitEscrowPeriodUpdated, MetadataUriUpdated, Undelegated, ValidatorExit,
-        ValidatorExitClaimed, WithdrawalClaimed,
+        ValidatorExitClaimed, ValidatorRegisteredV2, WithdrawalClaimed,
     };
     use pretty_assertions::assert_eq;
     use reqwest::Url;
@@ -1868,13 +1868,14 @@ mod test {
 
     #[test_log::test(tokio::test)]
     async fn test_event_validator_registered_v2_valid() {
-        let event = validator_registered_event(rand::thread_rng());
+        let mut event = validator_registered_event(rand::thread_rng());
+        event.metadataUri = "".into();
         let block = test_events(
             &NoMetadata,
             [StakeTableV2Events::ValidatorRegisteredV2(event.clone())],
         )
         .await;
-        let expected = NodeSetEntry::from(&event);
+        let expected = NodeSetEntry::from_event_no_metadata(&event);
         assert_eq!(block.state.node_set.len(), 1);
         assert_eq!(block.state.node_set[&event.account], expected);
         assert_eq!(
@@ -1949,7 +1950,8 @@ mod test {
 
     #[test_log::test(tokio::test)]
     async fn test_event_registration_no_metadata() {
-        let node = validator_registered_event(rand::thread_rng());
+        let mut node = validator_registered_event(rand::thread_rng());
+        node.metadataUri = "".into();
         let block = test_events(
             &NoMetadata,
             [StakeTableV2Events::ValidatorRegisteredV2(node.clone())],
@@ -1971,7 +1973,7 @@ mod test {
             block.state.node_set[&node.account].metadata,
             Some(NodeMetadata {
                 uri: node.metadataUri.parse().unwrap(),
-                content: Default::default()
+                content: Some(NodeMetadataContent::default())
             })
         );
     }
@@ -2015,7 +2017,7 @@ mod test {
             block.state.node_set[&node.account].metadata,
             Some(NodeMetadata {
                 uri: uri.parse().unwrap(),
-                content: Default::default()
+                content: Some(NodeMetadataContent::default())
             })
         );
     }
@@ -2037,7 +2039,8 @@ mod test {
     #[test_log::test(tokio::test)]
     async fn test_exit_escrow_period_updated_and_validator_exit_in_same_block() {
         let genesis = BlockData::empty(0);
-        let node = validator_registered_event(rand::thread_rng());
+        let mut node = validator_registered_event(rand::thread_rng());
+        node.metadataUri = "".into();
 
         let input = BlockInput::empty(1)
             .with_event(StakeTableV2Events::ValidatorRegisteredV2(node.clone()))
@@ -2058,7 +2061,7 @@ mod test {
         assert_eq!(
             block.node_set_update.as_ref().unwrap(),
             &[
-                FullNodeSetDiff::NodeUpdate(Arc::new(NodeSetEntry::from(&node))),
+                FullNodeSetDiff::NodeUpdate(Arc::new(NodeSetEntry::from_event_no_metadata(&node))),
                 FullNodeSetDiff::NodeExit(NodeExit {
                     address: node.account,
                     exit_time: block.block().timestamp() + block.block().exit_escrow_period
@@ -2281,7 +2284,7 @@ mod test {
         // as having the default metadata for a time.
         block = block
             .next(
-                &vec![(uri.clone(), None)],
+                &NoMetadata,
                 &BlockInput::empty(1)
                     .with_event(StakeTableV2Events::ValidatorRegisteredV2(node.clone())),
             )
@@ -2290,7 +2293,7 @@ mod test {
             block.state.node_set[&node.account].metadata,
             Some(NodeMetadata {
                 uri: uri.clone(),
-                content: Default::default(),
+                content: None,
             })
         );
 
@@ -2311,7 +2314,10 @@ mod test {
         }
         assert_eq!(
             block.state.node_set[&node.account].metadata,
-            Some(NodeMetadata { uri, content })
+            Some(NodeMetadata {
+                uri,
+                content: Some(content)
+            })
         );
     }
 
@@ -2324,22 +2330,28 @@ mod test {
         // * One that refreshes and changes.
         let metadata_const = NodeMetadata {
             uri: "https://const-metadata.com".parse().unwrap(),
-            content: NodeMetadataContent {
+            content: Some(NodeMetadataContent {
                 name: Some("const".into()),
                 ..Default::default()
-            },
+            }),
         };
         let metadata_fail = NodeMetadata {
             uri: "https://fail-metadata.com".parse().unwrap(),
-            content: Default::default(),
+            content: Some(NodeMetadataContent {
+                name: Some("fail".into()),
+                ..Default::default()
+            }),
         };
         let metadata_change = NodeMetadata {
             uri: "https://change-metadata.com".parse().unwrap(),
-            content: Default::default(),
+            content: Some(NodeMetadataContent {
+                name: Some("change".into()),
+                ..Default::default()
+            }),
         };
         let after_change_metadata = NodeMetadataContent {
             name: Some("changed metadata".into()),
-            ..metadata_change.content.clone()
+            ..metadata_change.content.clone().unwrap()
         };
 
         let mut state = Snapshot::empty(block_snapshot(0));
@@ -2368,7 +2380,7 @@ mod test {
         );
 
         let fetcher = vec![
-            (metadata_const.uri, Some(metadata_const.content)),
+            (metadata_const.uri, metadata_const.content),
             (metadata_fail.uri, None),
             (
                 metadata_change.uri.clone(),
@@ -2380,7 +2392,7 @@ mod test {
             [NodeSetEntry {
                 metadata: Some(NodeMetadata {
                     uri: metadata_change.uri,
-                    content: after_change_metadata
+                    content: Some(after_change_metadata)
                 }),
                 ..make_node(3)
             }]
@@ -2394,17 +2406,17 @@ mod test {
 
         let before = NodeMetadata {
             uri: "https://before.com".parse().unwrap(),
-            content: NodeMetadataContent {
+            content: Some(NodeMetadataContent {
                 name: Some("before".to_string()),
                 ..Default::default()
-            },
+            }),
         };
         let after = NodeMetadata {
             uri: "https://after.com".parse().unwrap(),
-            content: NodeMetadataContent {
+            content: Some(NodeMetadataContent {
                 name: Some("after".to_string()),
                 ..Default::default()
-            },
+            }),
         };
 
         let mut state = Snapshot::empty(block_snapshot(METADATA_REFRESH_BLOCKS - 1));
@@ -2420,8 +2432,8 @@ mod test {
         );
 
         let fetcher = vec![
-            (before.uri, Some(before.content)),
-            (after.uri.clone(), Some(after.content.clone())),
+            (before.uri, before.content),
+            (after.uri.clone(), after.content.clone()),
         ];
         let update = state
             .apply(

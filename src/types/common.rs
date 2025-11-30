@@ -53,6 +53,8 @@ pub struct NodeSetEntry {
     pub commission: Ratio,
 
     /// Optional metadata like a human-readable name and icon.
+    ///
+    /// May be [`None`] if no metadata URI is registered for this node.
     pub metadata: Option<NodeMetadata>,
 }
 
@@ -180,7 +182,9 @@ pub struct NodeMetadata {
     ///
     /// This content is fetched from a third-party URI, and thus should not be considered trusted,
     /// reliable, or deterministic. It is informational only.
-    pub content: NodeMetadataContent,
+    ///
+    /// May be [`None`] if no (valid) content is available at the published `uri`.
+    pub content: Option<NodeMetadataContent>,
 }
 
 /// Optional descriptive information about a node.

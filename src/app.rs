@@ -199,6 +199,7 @@ mod test {
     use alloy::primitives::Address;
     use futures::future::try_join;
     use portpicker::pick_unused_port;
+    use pretty_assertions::assert_eq;
     use surf_disco::Client;
     use tide_disco::{Error as _, StatusCode};
     use tokio::{task::spawn, time::sleep};
@@ -327,8 +328,9 @@ mod test {
         ));
 
         // Register a node so that we have some non-empty state and updates.
-        let node = validator_registered_event(rand::thread_rng());
-        let node_entry = NodeSetEntry::from(&node);
+        let mut node = validator_registered_event(rand::thread_rng());
+        node.metadataUri = "".into();
+        let node_entry = NodeSetEntry::from_event_no_metadata(&node);
         let mut inputs = VecStream::infinite();
         inputs.push(
             BlockInput::empty(2)
