@@ -168,9 +168,24 @@ pub struct Withdrawal {
     pub amount: ESPTokenAmount,
 }
 
+/// Optional descriptive information about a node, fetched from a third-party URI.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct NodeMetadata {
+    /// The URI this metadata is fetched from.
+    ///
+    /// This URI is registered alongside the node in the staking contraact.
+    pub uri: Url,
+
+    /// The content of the metadata.
+    ///
+    /// This content is fetched from a third-party URI, and thus should not be considered trusted,
+    /// reliable, or deterministic. It is informational only.
+    pub content: NodeMetadataContent,
+}
+
 /// Optional descriptive information about a node.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
-pub struct NodeMetadata {
+pub struct NodeMetadataContent {
     /// Human-readable name for the node.
     pub name: Option<String>,
 

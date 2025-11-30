@@ -5,20 +5,54 @@ use std::time::Duration;
 use crate::{
     Error, Result,
     error::ResultExt,
-    types::common::{ImageSet, NodeMetadata},
+    types::common::{ImageSet, NodeMetadata, NodeMetadataContent},
 };
 use prometheus_parse::Scrape;
 use reqwest::{Url, header::HeaderValue};
 use tide_disco::http::mime::{JSON, PLAIN};
 use tracing::instrument;
 
+/// Metadata sourced from third party URIs should be automatically refreshed every fixed number of
+/// L1 blocks.
+///
+/// 300 L1 blocks on Ethereum takes approximately 300 * 12 = 3600 seconds, or 1 hour.
+///
+/// # Determinism
+///
+/// It is important that this parameter is a fixed constant, not configurable, because it impacts
+/// the derivation of [`FullNodeSetDiff`](crate::types::global::FullNodeSetDiff)s from
+/// [`L1Event`](super::L1Event)s (by injecting a `NodeUpdate` diff for each node whose metadata has
+/// changed every [`METADATA_REFRESH_BLOCKS`] blocks). This derivation is supposed to be
+/// deterministic: two copies of this software processing the same L1 events should derive the same
+/// diffs, even with different environment variables, so this parameter must be fixed.
+pub const METADATA_REFRESH_BLOCKS: u64 = 300;
+
 /// Fetching metadata from third-party URIs.
-pub trait MetadataFetcher {
+pub trait MetadataFetcher: Sync {
     /// Fetch node metadata from the given URI.
     ///
-    /// If the URI is invalid, the resource is unretrievable, or the returned resource cannot be
-    /// parsed as valid [`NodeMetadata`], returns [`None`].
-    fn fetch_infallible(&self, uri: &str) -> impl Send + Future<Output = Option<NodeMetadata>>;
+    /// If the URI is invalid or empty, the node is considered to have opted out of metadata, and
+    /// the result is [`None`].
+    ///
+    /// If the resource is unretrievable or the returned resource cannot be parsed as valid
+    /// [`NodeMetadataContent`], returns [`Some`] with a default (empty) content, but the valid URI
+    /// is saved so that the content can be refetched at a later time.
+    fn fetch_infallible(&self, uri: &str) -> impl Send + Future<Output = Option<NodeMetadata>> {
+        async move {
+            let uri = parse_metadata_uri(uri)?;
+            let content = match self.fetch_content(&uri).await {
+                Ok(content) => content,
+                Err(err) => {
+                    tracing::warn!(%uri, "unable to fetch metadata, returning default: {err:#}");
+                    NodeMetadataContent::default()
+                }
+            };
+            Some(NodeMetadata { uri, content })
+        }
+    }
+
+    /// Download and parse node metadata content from a third-party URI.
+    fn fetch_content(&self, url: &Url) -> impl Send + Future<Output = Result<NodeMetadataContent>>;
 }
 
 /// Object that can download metadata from a given URI.
@@ -41,48 +75,27 @@ impl Default for HttpMetadataFetcher {
 }
 
 impl MetadataFetcher for HttpMetadataFetcher {
-    async fn fetch_infallible(&self, uri: &str) -> Option<NodeMetadata> {
-        match self.fetch(uri).await {
-            Ok(metadata) => metadata,
-            Err(err) => {
-                tracing::warn!(uri, "unable to fetch metadata: {err:#}");
-                None
-            }
-        }
-    }
-}
-
-impl HttpMetadataFetcher {
-    /// Download and parse node metadata from a string-encoded URI emitted by the stake table
-    /// contract.
     #[instrument(skip(self))]
-    pub async fn fetch(&self, uri: &str) -> Result<Option<NodeMetadata>> {
-        let Some(url) = parse_metadata_uri(uri) else {
-            return Ok(None);
-        };
-
+    async fn fetch_content(&self, url: &Url) -> Result<NodeMetadataContent> {
         let res =
-            self.client.get(url).send().await.context(|| {
-                Error::internal().context(format!("downloading metadata from {uri}"))
+            self.client.get(url.clone()).send().await.context(|| {
+                Error::internal().context(format!("downloading metadata from {url}"))
             })?;
 
         let content_type = res.headers().get("Content-Type");
         if content_type == Some(&HeaderValue::from_str(&JSON.to_string()).unwrap()) {
             // Parse response as JSON.
-            let metadata = res.json().await.context(|| {
-                Error::internal().context(format!("malformed JSON metadata from {uri}"))
-            })?;
-            Ok(Some(metadata))
+            res.json().await.context(|| {
+                Error::internal().context(format!("malformed JSON metadata from {url}"))
+            })
         } else if content_type.is_none()
             || content_type == Some(&HeaderValue::from_str(&PLAIN.to_string()).unwrap())
         {
             // Parse response as a set of prometheus metrics.
             let text = res.text().await.context(|| {
-                Error::internal().context(format!("reading metadata response from {uri}"))
+                Error::internal().context(format!("reading metadata response from {url}"))
             })?;
-            Ok(Some(
-                parse_prometheus(&text).map_err(|err| err.context(format!("from {uri}")))?,
-            ))
+            parse_prometheus(&text).map_err(|err| err.context(format!("from {url}")))
         } else {
             Err(Error::internal().context(format!("unrecognized content type {content_type:?}")))
         }
@@ -90,11 +103,11 @@ impl HttpMetadataFetcher {
 }
 
 /// Interpret prometheus labels as node metadata according to Espresso convention.
-fn parse_prometheus(text: &str) -> Result<NodeMetadata> {
+fn parse_prometheus(text: &str) -> Result<NodeMetadataContent> {
     let metrics = Scrape::parse(text.lines().map(String::from).map(Ok))
         .context(|| Error::internal().context("malformed prometheus metadata"))?;
 
-    let mut metadata = NodeMetadata::default();
+    let mut metadata = NodeMetadataContent::default();
     for sample in metrics.samples {
         match sample.metric.as_str() {
             "consensus_node_identity_general" => {
@@ -204,7 +217,7 @@ mod test {
         let metadata = parse_prometheus(text).unwrap();
         assert_eq!(
             metadata,
-            NodeMetadata {
+            NodeMetadataContent {
                 name: Some("test-node".into()),
                 description: Some("a test node".into()),
                 company_name: Some("Espresso Systems".into()),
@@ -274,7 +287,10 @@ mod test {
         # TYPE consensus_node gauge
         consensus_node{key="BLS_VER_KEY~widXdplI_m2zFsHBNxCmo5GfJa0VZtkPI88pRal6eRP9ZDwZth4iMXHTruzDFhnJW6-g3LVr3JJHUG6P3-IVECesRGFjvOEM4TofF2CCPD16uSGYJMpbgWKyw1x2OQYpZTkfDqtwTUtCWRrTNiFfJZYEJfyeQwUACFfF8fCNFwJZ"} 1
         "#;
-        assert_eq!(parse_prometheus(text).unwrap(), NodeMetadata::default());
+        assert_eq!(
+            parse_prometheus(text).unwrap(),
+            NodeMetadataContent::default()
+        );
     }
 
     #[test_log::test]
@@ -285,7 +301,7 @@ mod test {
         "#;
         assert_eq!(
             parse_prometheus(text).unwrap(),
-            NodeMetadata {
+            NodeMetadataContent {
                 icon: Some(ImageSet::default()),
                 ..Default::default()
             }
@@ -322,14 +338,20 @@ mod test {
         let uri = "http://thisisnotarealdomainnamesothisfetchwillfail.com";
 
         // It parses even though it's not a real website.
-        parse_metadata_uri(uri).unwrap();
+        let uri = parse_metadata_uri(uri).unwrap();
 
-        assert_eq!(fetcher.fetch_infallible(uri).await, None);
+        assert_eq!(
+            fetcher.fetch_infallible(uri.as_ref()).await,
+            Some(NodeMetadata {
+                uri,
+                content: NodeMetadataContent::default()
+            })
+        );
     }
 
     #[test_log::test(tokio::test)]
     async fn test_fetch_json() {
-        let expected = NodeMetadata {
+        let expected = NodeMetadataContent {
             name: Some("test".into()),
             description: Some("longer description".into()),
             company_name: Some("Espresso Systems".into()),
@@ -389,12 +411,15 @@ mod test {
         let server = spawn(app.serve(format!("0.0.0.0:{port}"), StaticVersion::<0, 1>::instance()));
 
         let fetcher = HttpMetadataFetcher::default();
+        let uri: Url = format!("http://localhost:{port}/node/metadata")
+            .parse()
+            .unwrap();
         assert_eq!(
-            fetcher
-                .fetch_infallible(&format!("http://localhost:{port}/node/metadata"))
-                .await
-                .unwrap(),
-            expected
+            fetcher.fetch_infallible(uri.as_ref()).await.unwrap(),
+            NodeMetadata {
+                uri,
+                content: expected
+            }
         );
 
         server.abort();
@@ -403,7 +428,7 @@ mod test {
 
     #[test_log::test(tokio::test)]
     async fn test_fetch_prometheus() {
-        let expected = NodeMetadata {
+        let expected = NodeMetadataContent {
             name: Some("test".into()),
             description: Some("longer description".into()),
             company_name: Some("Espresso Systems".into()),
@@ -511,12 +536,15 @@ mod test {
         let server = spawn(app.serve(format!("0.0.0.0:{port}"), StaticVersion::<0, 1>::instance()));
 
         let fetcher = HttpMetadataFetcher::default();
+        let uri: Url = format!("http://localhost:{port}/node/metadata")
+            .parse()
+            .unwrap();
         assert_eq!(
-            fetcher
-                .fetch_infallible(&format!("http://localhost:{port}/node/metadata"))
-                .await
-                .unwrap(),
-            expected
+            fetcher.fetch_infallible(uri.as_ref()).await.unwrap(),
+            NodeMetadata {
+                uri,
+                content: expected
+            }
         );
 
         server.abort();

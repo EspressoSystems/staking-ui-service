@@ -640,8 +640,17 @@ impl L1Persistence for Persistence {
                 // this same service) will always generate the same updates for the same sequence of
                 // L1 blocks. Otherwise, we might be leaving the database in a different state than
                 // if we had applied the update we were given, if someone else had applied a
-                // different update for the same block. This determinism assumption should be upheld
-                // by the rest of the logic in this service.
+                // different update for the same block.
+                //
+                // This determinism assumption should be upheld by the rest of the logic in this
+                // service, with the exception that `NodeUpdate` diffs may have different `metadata`
+                // content when processed by different services, due to inherent nondeterminism in
+                // third-party services providing metadata. This is acceptable since the contents of
+                // the metadata are informational only: they do not effect state _transitions_, and
+                // so at worst, our database will be left with different metadata for a node than it
+                // otherwise would have had by continuing here, but this will not cause our state to
+                // diverge any further: this metadata will not be touched until it is eventually
+                // overwritten in its entirety by a subsequent `MetadataUriUpdated` event.
                 continue;
             }
 
@@ -1037,8 +1046,8 @@ mod tests {
     use super::*;
     use crate::input::l1::testing::{block_snapshot, make_node};
     use crate::types::common::{
-        Address, ESPTokenAmount, ImageSet, NodeExit, NodeMetadata, PendingWithdrawal, RatioSet,
-        Withdrawal,
+        Address, ESPTokenAmount, ImageSet, NodeExit, NodeMetadata, NodeMetadataContent,
+        PendingWithdrawal, RatioSet, Withdrawal,
     };
     use crate::types::global::FullNodeSetDiff;
     use im::ordmap;
@@ -2157,7 +2166,7 @@ mod tests {
         };
         let mut persistence = Persistence::new(&options).await.unwrap();
 
-        let metadata = NodeMetadata {
+        let content = NodeMetadataContent {
             name: Some("test".into()),
             description: Some("longer description".into()),
             company_name: Some("Espresso Systems".into()),
@@ -2199,6 +2208,10 @@ mod tests {
                     ),
                 },
             }),
+        };
+        let metadata = NodeMetadata {
+            uri: "https://www.espressosys.com/metadata/".parse().unwrap(),
+            content,
         };
 
         // Initialize a node.

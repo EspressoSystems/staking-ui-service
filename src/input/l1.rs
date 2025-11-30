@@ -10,7 +10,10 @@ use alloy::primitives::BlockHash;
 use async_lock::{RwLock, RwLockUpgradableReadGuard, RwLockWriteGuard};
 use derive_more::{Deref, DerefMut};
 use espresso_types::{PubKey, v0_3::COMMISSION_BASIS_POINTS};
-use futures::stream::{Stream, StreamExt};
+use futures::{
+    future::join_all,
+    stream::{Stream, StreamExt},
+};
 use hotshot_contract_adapter::sol_types::{
     RewardClaim::RewardClaimEvents,
     StakeTableV2::{StakeTableV2Events, ValidatorRegistered, ValidatorRegisteredV2},
@@ -21,7 +24,7 @@ use tracing::instrument;
 
 use crate::{
     error::{Error, Result, ensure},
-    input::l1::metadata::MetadataFetcher,
+    input::l1::metadata::{METADATA_REFRESH_BLOCKS, MetadataFetcher},
     types::{
         common::{
             Address, Delegation, ESPTokenAmount, L1BlockId, L1BlockInfo, NodeExit, NodeMetadata,
@@ -573,6 +576,17 @@ impl Snapshot {
             }
         }
 
+        // Every so often, refresh metadata sourced from third party URIs, as these can change
+        // contents without emitting a contract event.
+        if id.number.is_multiple_of(METADATA_REFRESH_BLOCKS) {
+            tracing::info!("refreshing metadata");
+            for node in self.refresh_metadata(metadata_fetcher).await {
+                let diff = FullNodeSetDiff::NodeUpdate(Arc::new(node));
+                self.node_set.apply(&diff);
+                node_set_diffs.push(diff);
+            }
+        }
+
         Update {
             block: self.block,
             node_set_diffs,
@@ -882,6 +896,56 @@ impl Snapshot {
                 _ => (vec![], vec![]),
             },
         }
+    }
+
+    /// Refresh metadata sourced from third party URIs.
+    ///
+    /// Fetches the latest metadata for every node. Returns those nodes whose metadata has changed.
+    async fn refresh_metadata(&self, metadata_fetcher: &impl MetadataFetcher) -> Vec<NodeSetEntry> {
+        let fetches = self.node_set.values().filter_map(|node| {
+            // If a node has not registered a metadata URI to begin with, it can't have updated
+            // metadata.
+            let metadata = node.metadata.as_ref()?;
+
+            // Fetch the node's metadata again; see if it has changed.
+            Some(async move {
+                let new = match metadata_fetcher.fetch_content(&metadata.uri).await {
+                    Ok(content) => content,
+                    Err(err) => {
+                        // We know this node has a valid metadata URI, so if we get an error (e.g.
+                        // the third party metadata source is down) it's better to keep the metadata
+                        // that we already have for this node, rather than wipe it out with
+                        // [`None`], so we bail without emitting a new node entry.
+                        tracing::warn!(
+                            %node.address,
+                            %metadata.uri,
+                            "not updating node metadata at refresh due to fetch failure: {err:#}",
+                        );
+                        return None;
+                    }
+                };
+
+                // Only emit a new node entry if the metadata is actually changing.
+                if new != metadata.content {
+                    tracing::info!(?node, ?new, "updating node metadata due to refresh");
+                    Some(NodeSetEntry {
+                        metadata: Some(NodeMetadata {
+                            uri: metadata.uri.clone(),
+                            content: new,
+                        }),
+                        ..node.clone()
+                    })
+                } else {
+                    tracing::debug!(
+                        %node.address,
+                        %metadata.uri,
+                        "not updating node metadata which has not changed",
+                    );
+                    None
+                }
+            })
+        });
+        join_all(fetches).await.into_iter().flatten().collect()
     }
 }
 
@@ -1201,8 +1265,11 @@ mod test {
     use std::time::{Duration, Instant};
 
     use crate::{
-        input::l1::testing::{ConstMetadata, NoMetadata},
-        types::common::Address,
+        input::l1::{
+            metadata::METADATA_REFRESH_BLOCKS,
+            testing::{ConstMetadata, NoMetadata},
+        },
+        types::common::{Address, NodeMetadataContent},
     };
     use alloy::primitives::U256;
     use espresso_types::{StakeTableState, v0_3::StakeTableEvent};
@@ -1211,6 +1278,7 @@ mod test {
         ValidatorExitClaimed, WithdrawalClaimed,
     };
     use pretty_assertions::assert_eq;
+    use reqwest::Url;
     use tide_disco::{Error as _, StatusCode};
 
     use super::{
@@ -1892,15 +1960,20 @@ mod test {
 
     #[test_log::test(tokio::test)]
     async fn test_event_registration_with_metadata() {
-        let metadata = NodeMetadata::default();
         let mut node = validator_registered_event(rand::thread_rng());
         node.metadataUri = "https://testmetadata.com".to_string();
         let block: BlockData = test_events(
-            &ConstMetadata(metadata.clone()),
+            &ConstMetadata::default(),
             [StakeTableV2Events::ValidatorRegisteredV2(node.clone())],
         )
         .await;
-        assert_eq!(block.state.node_set[&node.account].metadata, Some(metadata));
+        assert_eq!(
+            block.state.node_set[&node.account].metadata,
+            Some(NodeMetadata {
+                uri: node.metadataUri.parse().unwrap(),
+                content: Default::default()
+            })
+        );
     }
 
     #[test_log::test(tokio::test)]
@@ -1923,21 +1996,28 @@ mod test {
 
     #[test_log::test(tokio::test)]
     async fn test_event_updated_with_metadata() {
-        let metadata = NodeMetadata::default();
         let mut node = validator_registered_event(rand::thread_rng());
         node.metadataUri = "".to_string();
+
+        let uri = "https://testmetadata.com";
         let block = test_events(
-            &ConstMetadata(metadata.clone()),
+            &ConstMetadata::default(),
             [
                 StakeTableV2Events::ValidatorRegisteredV2(node.clone()),
                 StakeTableV2Events::MetadataUriUpdated(MetadataUriUpdated {
                     validator: node.account,
-                    metadataUri: "https://testmetadata.com".to_string(),
+                    metadataUri: uri.to_string(),
                 }),
             ],
         )
         .await;
-        assert_eq!(block.state.node_set[&node.account].metadata, Some(metadata));
+        assert_eq!(
+            block.state.node_set[&node.account].metadata,
+            Some(NodeMetadata {
+                uri: uri.parse().unwrap(),
+                content: Default::default()
+            })
+        );
     }
 
     #[test_log::test(tokio::test)]
@@ -2184,5 +2264,184 @@ mod test {
 
         // The caught up state only has the latest block.
         assert_eq!(state_catchup.blocks.len(), 1);
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_metadata_refresh() {
+        let node = ValidatorRegisteredV2 {
+            metadataUri: "https://www.metadata.com".into(),
+            ..validator_registered_event(rand::thread_rng())
+        };
+        let uri: Url = node.metadataUri.parse().unwrap();
+
+        let mut block = BlockData::empty(0);
+
+        // Suppose we register a node and for some reason (possibly the third party website is down,
+        // possibly our own network fails) we fail to fetch the metadata. We will register this node
+        // as having the default metadata for a time.
+        block = block
+            .next(
+                &vec![(uri.clone(), None)],
+                &BlockInput::empty(1)
+                    .with_event(StakeTableV2Events::ValidatorRegisteredV2(node.clone())),
+            )
+            .await;
+        assert_eq!(
+            block.state.node_set[&node.account].metadata,
+            Some(NodeMetadata {
+                uri: uri.clone(),
+                content: Default::default(),
+            })
+        );
+
+        // Eventually, after processing a number of blocks, regardless of the events in those
+        // blocks, we will refresh the node's metadata, which gives us another chance to load it
+        // successfully.
+        let content = NodeMetadataContent {
+            name: Some("refreshed".into()),
+            ..Default::default()
+        };
+        for i in 0..METADATA_REFRESH_BLOCKS {
+            block = block
+                .next(
+                    &vec![(uri.clone(), Some(content.clone()))],
+                    &BlockInput::empty(2 + i),
+                )
+                .await;
+        }
+        assert_eq!(
+            block.state.node_set[&node.account].metadata,
+            Some(NodeMetadata { uri, content })
+        );
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_refresh_metadata() {
+        // With four nodes, we cover the four cases that we can encounter in `refresh_metadata`:
+        // * One node that has no metadata
+        // * One whose metadata doesn't change
+        // * One that has metadata and fails to refresh, so we keep the old metadata
+        // * One that refreshes and changes.
+        let metadata_const = NodeMetadata {
+            uri: "https://const-metadata.com".parse().unwrap(),
+            content: NodeMetadataContent {
+                name: Some("const".into()),
+                ..Default::default()
+            },
+        };
+        let metadata_fail = NodeMetadata {
+            uri: "https://fail-metadata.com".parse().unwrap(),
+            content: Default::default(),
+        };
+        let metadata_change = NodeMetadata {
+            uri: "https://change-metadata.com".parse().unwrap(),
+            content: Default::default(),
+        };
+        let after_change_metadata = NodeMetadataContent {
+            name: Some("changed metadata".into()),
+            ..metadata_change.content.clone()
+        };
+
+        let mut state = Snapshot::empty(block_snapshot(0));
+        state.node_set = NodeSet(
+            [
+                NodeSetEntry {
+                    metadata: None,
+                    ..make_node(0)
+                },
+                NodeSetEntry {
+                    metadata: Some(metadata_const.clone()),
+                    ..make_node(1)
+                },
+                NodeSetEntry {
+                    metadata: Some(metadata_fail.clone()),
+                    ..make_node(2)
+                },
+                NodeSetEntry {
+                    metadata: Some(metadata_change.clone()),
+                    ..make_node(3)
+                },
+            ]
+            .into_iter()
+            .map(|node| (node.address, node))
+            .collect(),
+        );
+
+        let fetcher = vec![
+            (metadata_const.uri, Some(metadata_const.content)),
+            (metadata_fail.uri, None),
+            (
+                metadata_change.uri.clone(),
+                Some(after_change_metadata.clone()),
+            ),
+        ];
+        assert_eq!(
+            state.refresh_metadata(&fetcher).await,
+            [NodeSetEntry {
+                metadata: Some(NodeMetadata {
+                    uri: metadata_change.uri,
+                    content: after_change_metadata
+                }),
+                ..make_node(3)
+            }]
+        );
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_refresh_and_update_metadata_same_block() {
+        // If we get a `MetadataUriUpdated` event in the same block that has an automatic metadata
+        // refresh, we prioritize the metadata from the URI in the contract event.
+
+        let before = NodeMetadata {
+            uri: "https://before.com".parse().unwrap(),
+            content: NodeMetadataContent {
+                name: Some("before".to_string()),
+                ..Default::default()
+            },
+        };
+        let after = NodeMetadata {
+            uri: "https://after.com".parse().unwrap(),
+            content: NodeMetadataContent {
+                name: Some("after".to_string()),
+                ..Default::default()
+            },
+        };
+
+        let mut state = Snapshot::empty(block_snapshot(METADATA_REFRESH_BLOCKS - 1));
+        let node = NodeSetEntry {
+            metadata: Some(before.clone()),
+            ..make_node(0)
+        };
+        state.node_set = NodeSet(
+            [node.clone()]
+                .into_iter()
+                .map(|node| (node.address, node))
+                .collect(),
+        );
+
+        let fetcher = vec![
+            (before.uri, Some(before.content)),
+            (after.uri.clone(), Some(after.content.clone())),
+        ];
+        let update = state
+            .apply(
+                &fetcher,
+                block_id(METADATA_REFRESH_BLOCKS),
+                12 * METADATA_REFRESH_BLOCKS,
+                [&StakeTableV2Events::MetadataUriUpdated(MetadataUriUpdated {
+                    validator: node.address,
+                    metadataUri: after.uri.to_string(),
+                })
+                .into()],
+            )
+            .await;
+        assert_eq!(state.node_set[&node.address].metadata, Some(after.clone()));
+        assert_eq!(
+            update.node_set_diffs,
+            [FullNodeSetDiff::NodeUpdate(Arc::new(NodeSetEntry {
+                metadata: Some(after),
+                ..node
+            }))]
+        );
     }
 }

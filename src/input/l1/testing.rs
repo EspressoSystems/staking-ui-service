@@ -11,7 +11,7 @@ use std::{
     time::Duration,
 };
 
-use crate::{input::l1::metadata::parse_metadata_uri, types::common::NodeSetEntry};
+use crate::types::common::{NodeMetadataContent, NodeSetEntry};
 use alloy::{
     network::EthereumWallet,
     primitives::{Address, FixedBytes, U256, keccak256},
@@ -248,6 +248,14 @@ impl L1Catchup for CatchupFromEvents {
     }
 }
 
+/// A dummy [`NodeMetadata`] for testing.
+pub fn default_node_metadata() -> NodeMetadata {
+    NodeMetadata {
+        uri: "https://www.example.com".parse().unwrap(),
+        content: Default::default(),
+    }
+}
+
 /// Dummy [`MetadataFetcher`] that always returns [`None`].
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NoMetadata;
@@ -256,19 +264,29 @@ impl MetadataFetcher for NoMetadata {
     async fn fetch_infallible(&self, _uri: &str) -> Option<NodeMetadata> {
         None
     }
+
+    async fn fetch_content(&self, _uri: &Url) -> Result<NodeMetadataContent> {
+        Err(Error::internal().context("NoMetadata"))
+    }
 }
 
 /// Dummy [`MetadataFetcher`] that returns a given object whenever the URI is valid.
 #[derive(Clone, Debug, Default)]
-pub struct ConstMetadata(pub NodeMetadata);
+pub struct ConstMetadata(pub NodeMetadataContent);
 
 impl MetadataFetcher for ConstMetadata {
-    async fn fetch_infallible(&self, uri: &str) -> Option<NodeMetadata> {
-        if parse_metadata_uri(uri).is_some() {
-            Some(self.0.clone())
-        } else {
-            None
-        }
+    async fn fetch_content(&self, _uri: &Url) -> Result<NodeMetadataContent> {
+        Ok(self.0.clone())
+    }
+}
+
+/// Metadata fetcher which returns responses based on a mapping from URIs.
+impl MetadataFetcher for Vec<(Url, Option<NodeMetadataContent>)> {
+    async fn fetch_content(&self, uri: &Url) -> Result<NodeMetadataContent> {
+        self.iter()
+            .find_map(|(k, v)| if k == uri { Some(v.clone()) } else { None })
+            .ok_or_else(|| Error::not_found().context("unknown URL"))?
+            .ok_or_else(|| Error::internal().context("injected fetch failure"))
     }
 }
 
