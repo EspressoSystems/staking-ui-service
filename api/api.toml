@@ -359,6 +359,8 @@ latest block number.
 
 [route.metrics]
 PATH = ["/metrics"]
+METHOD = "METRICS"
 DOC = """
 Get Prometheus metrics
 """
+
