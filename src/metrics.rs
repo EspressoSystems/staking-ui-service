@@ -4,7 +4,7 @@ use prometheus::{Encoder, Gauge, Opts, Registry, TextEncoder};
 
 /// Prometheus metrics for the staking UI service.
 #[derive(Clone, Debug)]
-pub struct Metrics {
+pub struct PrometheusMetrics {
     registry: Registry,
 
     // L1 metrics
@@ -26,13 +26,13 @@ pub struct Metrics {
     pub active_validators: Gauge,
 }
 
-impl Default for Metrics {
+impl Default for PrometheusMetrics {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Metrics {
+impl PrometheusMetrics {
     /// Create a new metrics instance with all gauges registered.
     pub fn new() -> Self {
         let registry = Registry::new();
@@ -112,7 +112,7 @@ impl Metrics {
     }
 }
 
-impl tide_disco::metrics::Metrics for Metrics {
+impl tide_disco::metrics::Metrics for PrometheusMetrics {
     type Error = prometheus::Error;
 
     fn export(&self) -> Result<String, Self::Error> {

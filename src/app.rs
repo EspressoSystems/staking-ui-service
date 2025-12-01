@@ -14,7 +14,7 @@ use crate::{
         espresso::{self, EspressoClient, EspressoPersistence},
         l1::{self, L1Persistence},
     },
-    metrics::Metrics,
+    metrics::PrometheusMetrics,
 };
 
 type Version = StaticVersion<0, 1>;
@@ -24,12 +24,12 @@ type Version = StaticVersion<0, 1>;
 pub struct State<L, E> {
     l1: Arc<RwLock<L>>,
     espresso: Arc<RwLock<E>>,
-    metrics: Metrics,
+    metrics: PrometheusMetrics,
 }
 
 impl<L, E> State<L, E> {
     /// Set up an app with the given state.
-    pub fn new(l1: Arc<RwLock<L>>, espresso: Arc<RwLock<E>>, metrics: Metrics) -> Self {
+    pub fn new(l1: Arc<RwLock<L>>, espresso: Arc<RwLock<E>>, metrics: PrometheusMetrics) -> Self {
         Self {
             l1,
             espresso,
@@ -216,7 +216,7 @@ mod test {
 
     use crate::{
         input::l1::testing::MemoryStorage,
-        metrics::Metrics,
+        metrics::PrometheusMetrics,
         types::wallet::{WalletSnapshot, WalletUpdate},
     };
     use alloy::primitives::Address;
@@ -262,7 +262,7 @@ mod test {
         client.push_leaf(0, [true]).await;
 
         let storage = EspressoStorage::default();
-        espresso::State::new(storage, client, Metrics::default())
+        espresso::State::new(storage, client, PrometheusMetrics::default())
             .await
             .unwrap()
     }
@@ -275,7 +275,7 @@ mod test {
             Default::default(),
             Snapshot::empty(block_snapshot(0)),
             &NoCatchup,
-            Metrics::default(),
+            PrometheusMetrics::default(),
         )
         .await
         .unwrap()
@@ -291,7 +291,7 @@ mod test {
         let state = State::new(
             Arc::new(RwLock::new(l1)),
             Arc::new(RwLock::new(espresso)),
-            Metrics::default(),
+            PrometheusMetrics::default(),
         );
         let task = spawn(state.serve(port));
 
@@ -349,7 +349,7 @@ mod test {
                 L1Storage::default(),
                 Snapshot::empty(block_snapshot(1)),
                 &NoCatchup,
-                Metrics::default(),
+                PrometheusMetrics::default(),
             )
             .await
             .unwrap(),
@@ -368,7 +368,7 @@ mod test {
         let state = State::new(
             l1,
             Arc::new(RwLock::new(empty_espresso_state().await)),
-            Metrics::default(),
+            PrometheusMetrics::default(),
         );
         let task = spawn(state.serve(port));
 
@@ -443,7 +443,7 @@ mod test {
                 MemoryStorage::default(),
                 Snapshot::empty(block_snapshot(1)),
                 &NoCatchup,
-                Metrics::default(),
+                PrometheusMetrics::default(),
             )
             .await
             .unwrap(),
@@ -478,7 +478,7 @@ mod test {
         let state = State::new(
             l1.clone(),
             Arc::new(RwLock::new(empty_espresso_state().await)),
-            Metrics::default(),
+            PrometheusMetrics::default(),
         );
         let task = spawn(state.serve(port));
 
@@ -607,10 +607,13 @@ mod test {
         let node_0_address = nodes[0].account;
         let node_1_address = nodes[1].account;
 
-        let espresso_state =
-            espresso::State::new(EspressoStorage::default(), espresso, Metrics::default())
-                .await
-                .unwrap();
+        let espresso_state = espresso::State::new(
+            EspressoStorage::default(),
+            espresso,
+            PrometheusMetrics::default(),
+        )
+        .await
+        .unwrap();
         let espresso = Arc::new(RwLock::new(espresso_state));
         let espresso_update_task = espresso::State::update_task(espresso.clone());
 
@@ -619,7 +622,7 @@ mod test {
         let state = State::new(
             Arc::new(RwLock::new(l1)),
             espresso.clone(),
-            Metrics::default(),
+            PrometheusMetrics::default(),
         );
         let server_task = spawn(state.serve(port));
         let update_task = spawn(espresso_update_task);
@@ -714,16 +717,23 @@ mod test {
         let epoch_height = espresso.epoch_height();
         let nodes = espresso.stake_table_for_epoch(epoch).await.unwrap();
 
-        let espresso =
-            espresso::State::new(EspressoStorage::default(), espresso, Metrics::default())
-                .await
-                .unwrap();
+        let espresso = espresso::State::new(
+            EspressoStorage::default(),
+            espresso,
+            PrometheusMetrics::default(),
+        )
+        .await
+        .unwrap();
         // Handle the leaves we gave it.
         let espresso = Arc::new(RwLock::new(espresso));
         let update_task = espresso::State::update_task(espresso.clone());
 
         let l1 = empty_l1_state().await;
-        let state = State::new(Arc::new(RwLock::new(l1)), espresso, Metrics::default());
+        let state = State::new(
+            Arc::new(RwLock::new(l1)),
+            espresso,
+            PrometheusMetrics::default(),
+        );
         let server_task = state.serve(port);
 
         let task = spawn(try_join(update_task, server_task));

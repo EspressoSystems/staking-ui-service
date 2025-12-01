@@ -27,7 +27,7 @@ use tracing::instrument;
 use crate::{
     Error, Result,
     error::ensure,
-    metrics::Metrics,
+    metrics::PrometheusMetrics,
     types::{
         common::{ActiveNodeSetEntry, Address, ESPTokenAmount, EpochAndBlock},
         global::{ActiveNodeSetDiff, ActiveNodeSetSnapshot, ActiveNodeSetUpdate},
@@ -70,7 +70,7 @@ pub struct State<S, C> {
     espresso: C,
 
     /// Prometheus metrics.
-    metrics: Metrics,
+    metrics: PrometheusMetrics,
 }
 
 impl<S: EspressoPersistence, C: EspressoClient> State<S, C> {
@@ -101,7 +101,7 @@ impl<S: EspressoPersistence, C: EspressoClient> State<S, C> {
         Ok(())
     }
 
-    pub async fn new(storage: S, espresso: C, metrics: Metrics) -> Result<Self> {
+    pub async fn new(storage: S, espresso: C, metrics: PrometheusMetrics) -> Result<Self> {
         let epoch_height = espresso.epoch_height().await?;
         Ok(Self {
             last_block: None,
@@ -438,7 +438,7 @@ impl<S: EspressoPersistence, C: EspressoClient> State<S, C> {
         }
     }
 
-    pub fn metrics(&self) -> &Metrics {
+    pub fn metrics(&self) -> &PrometheusMetrics {
         &self.metrics
     }
 
@@ -870,7 +870,7 @@ mod test {
         let signers = signers.clone();
 
         let state = RwLock::new(
-            State::new(storage, espresso, Metrics::default())
+            State::new(storage, espresso, PrometheusMetrics::default())
                 .await
                 .unwrap(),
         );
@@ -973,9 +973,13 @@ mod test {
         leaves.push((leaf.clone(), signers.clone()));
 
         let state = RwLock::new(
-            State::new(MemoryStorage::default(), espresso, Metrics::default())
-                .await
-                .unwrap(),
+            State::new(
+                MemoryStorage::default(),
+                espresso,
+                PrometheusMetrics::default(),
+            )
+            .await
+            .unwrap(),
         );
 
         for (leaf, signers) in leaves {
@@ -1078,7 +1082,7 @@ mod test {
             leaves.push((leaf.clone(), signers.clone()));
         }
 
-        let mut state = State::new(storage, espresso, Metrics::default())
+        let mut state = State::new(storage, espresso, PrometheusMetrics::default())
             .await
             .unwrap();
 
@@ -1152,9 +1156,13 @@ mod test {
         let (leaf, signers) = (leaf.clone(), signers.clone());
 
         let state = RwLock::new(
-            State::new(MemoryStorage::default(), espresso, Metrics::default())
-                .await
-                .unwrap(),
+            State::new(
+                MemoryStorage::default(),
+                espresso,
+                PrometheusMetrics::default(),
+            )
+            .await
+            .unwrap(),
         );
         handle_leaf(state.upgradable_read().await, &leaf, &signers)
             .await
@@ -1198,9 +1206,13 @@ mod test {
         let (leaf, signers) = espresso.push_leaf(0, [true, true, true]).await;
         let (leaf, signers) = (leaf.clone(), signers.clone());
 
-        let mut state = State::new(MemoryStorage::default(), espresso, Metrics::default())
-            .await
-            .unwrap();
+        let mut state = State::new(
+            MemoryStorage::default(),
+            espresso,
+            PrometheusMetrics::default(),
+        )
+        .await
+        .unwrap();
         let pre_state = state.clone();
         let pre_storage = pre_state.storage.cmp_key().await;
 
@@ -1390,7 +1402,7 @@ mod test {
             let espresso_state = State::new(
                 espresso_storage.clone(),
                 espresso_client.clone(),
-                Metrics::default(),
+                PrometheusMetrics::default(),
             )
             .await
             .expect("Failed to initialize Espresso state");
@@ -1409,7 +1421,7 @@ mod test {
             let espresso_state = State::new(
                 espresso_storage.clone(),
                 espresso_client.clone(),
-                Metrics::default(),
+                PrometheusMetrics::default(),
             )
             .await
             .expect("Failed to initialize Espresso state");
@@ -1439,7 +1451,7 @@ mod test {
             let espresso_state = State::new(
                 espresso_storage.clone(),
                 espresso_client.clone(),
-                Metrics::default(),
+                PrometheusMetrics::default(),
             )
             .await
             .expect("Failed to initialize Espresso state");
@@ -1473,7 +1485,7 @@ mod test {
             let espresso_state = State::new(
                 espresso_storage.clone(),
                 espresso_client.clone(),
-                Metrics::default(),
+                PrometheusMetrics::default(),
             )
             .await
             .expect("Failed to initialize Espresso state");
@@ -1507,7 +1519,7 @@ mod test {
             let espresso_state = State::new(
                 espresso_storage.clone(),
                 espresso_client.clone(),
-                Metrics::default(),
+                PrometheusMetrics::default(),
             )
             .await
             .expect("Failed to initialize Espresso state");
@@ -1542,7 +1554,7 @@ mod test {
             let espresso_state = State::new(
                 espresso_storage.clone(),
                 espresso_client.clone(),
-                Metrics::default(),
+                PrometheusMetrics::default(),
             )
             .await
             .expect("Failed to initialize Espresso state");
@@ -1578,7 +1590,7 @@ mod test {
             State::new(
                 MemoryStorage::default(),
                 espresso.clone(),
-                Metrics::default(),
+                PrometheusMetrics::default(),
             )
             .await
             .unwrap(),

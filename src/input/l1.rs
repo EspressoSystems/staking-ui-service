@@ -21,7 +21,7 @@ use tracing::instrument;
 
 use crate::{
     error::{Error, Result, ensure},
-    metrics::Metrics,
+    metrics::PrometheusMetrics,
     types::{
         common::{
             Address, Delegation, ESPTokenAmount, L1BlockId, L1BlockInfo, NodeExit, NodeSetEntry,
@@ -63,7 +63,7 @@ pub struct State<S> {
     storage: S,
 
     /// Prometheus metrics.
-    metrics: Metrics,
+    metrics: PrometheusMetrics,
 }
 
 impl<S: L1Persistence> State<S> {
@@ -75,7 +75,7 @@ impl<S: L1Persistence> State<S> {
         mut storage: S,
         genesis: Snapshot,
         catchup: &impl L1Catchup,
-        metrics: Metrics,
+        metrics: PrometheusMetrics,
     ) -> Result<Self> {
         let mut state = match storage.finalized_snapshot().await? {
             Some(snapshot) => {
@@ -153,7 +153,7 @@ impl<S: L1Persistence> State<S> {
             .set(latest.state.node_set.len() as f64);
     }
 
-    pub fn metrics(&self) -> &Metrics {
+    pub fn metrics(&self) -> &PrometheusMetrics {
         &self.metrics
     }
 
@@ -1235,7 +1235,7 @@ mod test {
             blocks: Default::default(),
             blocks_by_hash: Default::default(),
             storage: S::default(),
-            metrics: Metrics::default(),
+            metrics: PrometheusMetrics::default(),
         };
         for block in blocks {
             state
@@ -1710,7 +1710,7 @@ mod test {
                 storage.clone(),
                 genesis.clone(),
                 &NoCatchup,
-                Metrics::default(),
+                PrometheusMetrics::default(),
             )
             .await
             .unwrap(),
@@ -1734,9 +1734,14 @@ mod test {
         // Restart and check that we reload the finalized snapshot (and don't use the genesis, for
         // which we will pass in some nonsense).
         let genesis = Snapshot::empty(block_snapshot(1000));
-        let state = State::new(storage.clone(), genesis, &NoCatchup, Metrics::default())
-            .await
-            .unwrap();
+        let state = State::new(
+            storage.clone(),
+            genesis,
+            &NoCatchup,
+            PrometheusMetrics::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(state.blocks.len(), 1);
         assert_eq!(state.blocks[0].block(), block_snapshot(1));
 
@@ -2040,7 +2045,7 @@ mod test {
                 MemoryStorage::default(),
                 genesis.clone(),
                 &NoCatchup,
-                Metrics::default(),
+                PrometheusMetrics::default(),
             )
             .await
             .unwrap(),
@@ -2059,7 +2064,7 @@ mod test {
             MemoryStorage::default(),
             genesis,
             &CatchupFromEvents::from_blocks(blocks.clone()),
-            Metrics::default(),
+            PrometheusMetrics::default(),
         )
         .await
         .unwrap();

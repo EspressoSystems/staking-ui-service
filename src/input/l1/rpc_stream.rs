@@ -575,7 +575,7 @@ mod tests {
     use crate::input::l1::testing::MemoryStorage;
     use crate::input::l1::testing::NoCatchup;
     use crate::input::l1::{Snapshot, State};
-    use crate::metrics::Metrics;
+    use crate::metrics::PrometheusMetrics;
     use crate::types::common::Ratio;
     use async_lock::RwLock;
     use tokio::time::sleep;
@@ -1146,7 +1146,7 @@ mod tests {
                 storage.clone(),
                 genesis_snapshot.clone(),
                 &NoCatchup,
-                Metrics::default(),
+                PrometheusMetrics::default(),
             )
             .await
             .unwrap(),

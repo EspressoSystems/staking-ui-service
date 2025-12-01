@@ -13,7 +13,7 @@ use staking_ui_service::{
         },
         l1::{self, RpcCatchup, RpcStream, Snapshot, options::L1ClientOptions},
     },
-    metrics::Metrics,
+    metrics::PrometheusMetrics,
     persistence::sql,
 };
 use tokio::time::sleep;
@@ -113,7 +113,7 @@ impl Options {
             .await
             .map_err(|err| err.context("connecting to Espresso query service"))?;
 
-        let metrics = Metrics::new();
+        let metrics = PrometheusMetrics::new();
 
         // Create server state.
         let l1 = Arc::new(RwLock::new(
