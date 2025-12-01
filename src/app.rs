@@ -12,7 +12,7 @@ use crate::{
     error::{Error, Result, ResultExt, ensure},
     input::{
         espresso::{self, EspressoClient, EspressoPersistence},
-        l1::{self, L1Persistence},
+        l1::{self, L1Persistence, metadata::MetadataFetcher},
     },
     metrics::PrometheusMetrics,
 };
@@ -52,11 +52,12 @@ impl<L: 'static + Send + Sync, E: 'static + Send + Sync> tide_disco::method::Rea
     }
 }
 
-type AppState<LS, ES, EC> = State<l1::State<LS>, espresso::State<ES, EC>>;
+type AppState<LS, LM, ES, EC> = State<l1::State<LS, LM>, espresso::State<ES, EC>>;
 
-impl<LS, ES, EC> AppState<LS, ES, EC>
+impl<LS, LM, ES, EC> AppState<LS, LM, ES, EC>
 where
     LS: L1Persistence + Sync + 'static,
+    LM: MetadataFetcher + Send + Sync + 'static,
     ES: EspressoPersistence + Send + Sync + 'static,
     EC: EspressoClient + 'static,
 {
@@ -84,11 +85,12 @@ where
     }
 }
 
-fn bind_handlers<LS, ES, EC>(
-    api: &mut Api<AppState<LS, ES, EC>, Error, Version>,
+fn bind_handlers<LS, LM, ES, EC>(
+    api: &mut Api<AppState<LS, LM, ES, EC>, Error, Version>,
 ) -> Result<(), ApiError>
 where
     LS: L1Persistence + Sync + 'static,
+    LM: MetadataFetcher + Send + Sync + 'static,
     ES: EspressoPersistence + Send + Sync + 'static,
     EC: EspressoClient + 'static,
 {
@@ -215,13 +217,14 @@ mod test {
     use std::time::Duration;
 
     use crate::{
-        input::l1::testing::MemoryStorage,
+        input::l1::testing::{MemoryStorage, NoMetadata},
         metrics::PrometheusMetrics,
         types::wallet::{WalletSnapshot, WalletUpdate},
     };
     use alloy::primitives::Address;
     use futures::future::try_join;
     use portpicker::pick_unused_port;
+    use pretty_assertions::assert_eq;
     use surf_disco::Client;
     use tide_disco::{Error as _, StatusCode};
     use tokio::{task::spawn, time::sleep};
@@ -270,9 +273,10 @@ mod test {
     /// Generate a trivial L1 state.
     ///
     /// This is useful for testing Espresso-based APIs, which don't depend on the L1 at all.
-    async fn empty_l1_state() -> l1::State<L1Storage> {
+    async fn empty_l1_state() -> l1::State<L1Storage, NoMetadata> {
         l1::State::new(
             Default::default(),
+            NoMetadata,
             Snapshot::empty(block_snapshot(0)),
             &NoCatchup,
             PrometheusMetrics::default(),
@@ -286,7 +290,7 @@ mod test {
         let port = pick_unused_port().unwrap();
         let url = format!("http://localhost:{port}").parse().unwrap();
 
-        let l1 = l1::State::<L1Storage>::with_l1_block_range(1, 3);
+        let l1 = l1::State::<L1Storage, NoMetadata>::with_l1_block_range(1, 3);
         let espresso = empty_espresso_state().await;
         let state = State::new(
             Arc::new(RwLock::new(l1)),
@@ -347,6 +351,7 @@ mod test {
         let l1 = Arc::new(RwLock::new(
             l1::State::new(
                 L1Storage::default(),
+                NoMetadata,
                 Snapshot::empty(block_snapshot(1)),
                 &NoCatchup,
                 PrometheusMetrics::default(),
@@ -356,8 +361,9 @@ mod test {
         ));
 
         // Register a node so that we have some non-empty state and updates.
-        let node = validator_registered_event(rand::thread_rng());
-        let node_entry = NodeSetEntry::from(&node);
+        let mut node = validator_registered_event(rand::thread_rng());
+        node.metadataUri = "".into();
+        let node_entry = NodeSetEntry::from_event_no_metadata(&node);
         let mut inputs = VecStream::infinite();
         inputs.push(
             BlockInput::empty(2)
@@ -410,7 +416,10 @@ mod test {
             .await
             .unwrap();
         assert_eq!(update.l1_block, block_snapshot(2).info());
-        assert_eq!(update.diff, [FullNodeSetDiff::NodeUpdate(node_entry)]);
+        assert_eq!(
+            update.diff,
+            [FullNodeSetDiff::NodeUpdate(Arc::new(node_entry))]
+        );
 
         tracing::info!("queries at unknown block hash should return 404");
         let err = client
@@ -441,6 +450,7 @@ mod test {
         let l1 = Arc::new(RwLock::new(
             l1::State::new(
                 MemoryStorage::default(),
+                NoMetadata,
                 Snapshot::empty(block_snapshot(1)),
                 &NoCatchup,
                 PrometheusMetrics::default(),

@@ -574,6 +574,7 @@ mod tests {
 
     use crate::input::l1::testing::MemoryStorage;
     use crate::input::l1::testing::NoCatchup;
+    use crate::input::l1::testing::NoMetadata;
     use crate::input::l1::{Snapshot, State};
     use crate::metrics::PrometheusMetrics;
     use crate::types::common::Ratio;
@@ -1144,6 +1145,7 @@ mod tests {
         let state = Arc::new(RwLock::new(
             State::new(
                 storage.clone(),
+                NoMetadata,
                 genesis_snapshot.clone(),
                 &NoCatchup,
                 PrometheusMetrics::default(),
