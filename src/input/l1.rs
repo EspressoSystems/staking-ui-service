@@ -21,6 +21,7 @@ use tracing::instrument;
 
 use crate::{
     error::{Error, Result, ensure},
+    metrics::Metrics,
     types::{
         common::{
             Address, Delegation, ESPTokenAmount, L1BlockId, L1BlockInfo, NodeExit, NodeSetEntry,
@@ -60,6 +61,9 @@ pub struct State<S> {
 
     /// Persistent storage handle.
     storage: S,
+
+    /// Prometheus metrics.
+    metrics: Metrics,
 }
 
 impl<S: L1Persistence> State<S> {
@@ -67,7 +71,12 @@ impl<S: L1Persistence> State<S> {
     ///
     /// Previously saved state will be loaded from `storage` if possible. If there is no previous
     /// state in storage, the given genesis state will be used.
-    pub async fn new(mut storage: S, genesis: Snapshot, catchup: &impl L1Catchup) -> Result<Self> {
+    pub async fn new(
+        mut storage: S,
+        genesis: Snapshot,
+        catchup: &impl L1Catchup,
+        metrics: Metrics,
+    ) -> Result<Self> {
         let mut state = match storage.finalized_snapshot().await? {
             Some(snapshot) => {
                 tracing::info!(?snapshot.block, "starting from saved snapshot");
@@ -111,16 +120,41 @@ impl<S: L1Persistence> State<S> {
             .into_iter()
             .collect();
         let blocks = vec![finalized];
-        Ok(Self {
+        let state = Self {
             blocks,
             blocks_by_hash,
             storage,
-        })
+            metrics,
+        };
+        state.update_metrics();
+        Ok(state)
     }
 
     /// Get the latest known L1 block.
     pub fn latest_l1_block(&self) -> L1BlockId {
         self.blocks[self.blocks.len() - 1].block().id()
+    }
+
+    pub fn update_metrics(&self) {
+        let latest = self.blocks.last().expect("blocks is never empty");
+        let finalized = &self.blocks[0];
+
+        self.metrics
+            .latest_l1_block
+            .set(latest.block().number() as f64);
+        self.metrics
+            .finalized_l1_block
+            .set(finalized.block().number() as f64);
+        self.metrics
+            .unique_wallets
+            .set(latest.state.wallets.len() as f64);
+        self.metrics
+            .node_count
+            .set(latest.state.node_set.len() as f64);
+    }
+
+    pub fn metrics(&self) -> &Metrics {
+        &self.metrics
     }
 
     /// Get the hashes identifying a particular L1 block.
@@ -334,6 +368,8 @@ impl<S: L1Persistence> State<S> {
             .blocks_by_hash
             .insert(new_block.block().hash(), new_block.block().number());
         state.blocks.push(new_block);
+
+        state.update_metrics();
 
         Ok(())
     }
@@ -1199,6 +1235,7 @@ mod test {
             blocks: Default::default(),
             blocks_by_hash: Default::default(),
             storage: S::default(),
+            metrics: Metrics::default(),
         };
         for block in blocks {
             state
@@ -1669,9 +1706,14 @@ mod test {
         let genesis = Snapshot::empty(block_snapshot(0));
         let storage = MemoryStorage::default();
         let state = Arc::new(RwLock::new(
-            State::new(storage.clone(), genesis.clone(), &NoCatchup)
-                .await
-                .unwrap(),
+            State::new(
+                storage.clone(),
+                genesis.clone(),
+                &NoCatchup,
+                Metrics::default(),
+            )
+            .await
+            .unwrap(),
         ));
         // Initializing the state should cause a genesis snapshot to be saved.
         assert_eq!(
@@ -1692,7 +1734,7 @@ mod test {
         // Restart and check that we reload the finalized snapshot (and don't use the genesis, for
         // which we will pass in some nonsense).
         let genesis = Snapshot::empty(block_snapshot(1000));
-        let state = State::new(storage.clone(), genesis, &NoCatchup)
+        let state = State::new(storage.clone(), genesis, &NoCatchup, Metrics::default())
             .await
             .unwrap();
         assert_eq!(state.blocks.len(), 1);
@@ -1994,9 +2036,14 @@ mod test {
 
         // Start the normal state.
         let state_block_by_block = Arc::new(RwLock::new(
-            State::new(MemoryStorage::default(), genesis.clone(), &NoCatchup)
-                .await
-                .unwrap(),
+            State::new(
+                MemoryStorage::default(),
+                genesis.clone(),
+                &NoCatchup,
+                Metrics::default(),
+            )
+            .await
+            .unwrap(),
         ));
         let mut stream = VecStream::infinite();
         for block in &blocks {
@@ -2012,6 +2059,7 @@ mod test {
             MemoryStorage::default(),
             genesis,
             &CatchupFromEvents::from_blocks(blocks.clone()),
+            Metrics::default(),
         )
         .await
         .unwrap();

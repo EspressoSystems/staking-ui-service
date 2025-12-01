@@ -307,6 +307,7 @@ mod test {
         State,
         testing::{EPOCH_HEIGHT, MemoryStorage, start_pos_network},
     };
+    use crate::metrics::Metrics;
 
     use super::*;
 
@@ -523,7 +524,7 @@ mod test {
         let opt = QueryServiceOptions::new(format!("http://localhost:{port}").parse().unwrap());
         let client = QueryServiceClient::new(opt).await.unwrap();
         let state = Arc::new(RwLock::new(
-            State::new(MemoryStorage::default(), client.clone())
+            State::new(MemoryStorage::default(), client.clone(), Metrics::default())
                 .await
                 .unwrap(),
         ));
