@@ -474,16 +474,6 @@ mod test {
         network.stop_consensus().await;
         sleep(Duration::from_secs(2)).await;
 
-        let l1_block: L1BlockId = client.get("l1/block/latest").send().await.unwrap();
-        let full_node_set: FullNodeSetSnapshot = client
-            .get(&format!("nodes/all/{}", l1_block.hash))
-            .send()
-            .await
-            .unwrap();
-        let active_node_set: ActiveNodeSetSnapshot =
-            client.get("nodes/active").send().await.unwrap();
-
-        // Use reqwest directly for metrics endpoint
         let metrics_url = format!("http://localhost:{port}/v0/staking/metrics");
         let metrics: String = reqwest::get(&metrics_url)
             .await
@@ -493,32 +483,35 @@ mod test {
             .unwrap();
         tracing::info!(metrics = %metrics, "got metrics");
 
-        let metrics_latest_l1 = get_metric_value(&metrics, "latest_l1_block");
-        assert_eq!(metrics_latest_l1 as u64, l1_block.number,);
+        let metrics_latest_l1 = get_metric_value(&metrics, "latest_l1_block") as u64;
+        let metrics_node_count = get_metric_value(&metrics, "node_count") as usize;
+        let metrics_latest_espresso = get_metric_value(&metrics, "latest_espresso_block") as u64;
+        let metrics_current_epoch = get_metric_value(&metrics, "current_epoch") as u64;
+        let metrics_active_validators = get_metric_value(&metrics, "active_validators") as usize;
+        let metrics_unique_wallets = get_metric_value(&metrics, "unique_wallets") as usize;
 
-        let metrics_node_count = get_metric_value(&metrics, "node_count");
-        assert_eq!(metrics_node_count as usize, full_node_set.nodes.len(),);
+        let l1_block: L1BlockId = client.get("l1/block/latest").send().await.unwrap();
+        let full_node_set: FullNodeSetSnapshot = client
+            .get(&format!("nodes/all/{}", l1_block.hash))
+            .send()
+            .await
+            .unwrap();
+        let active_node_set: ActiveNodeSetSnapshot =
+            client.get("nodes/active").send().await.unwrap();
 
-        let metrics_latest_espresso = get_metric_value(&metrics, "latest_espresso_block");
+        // L1 Anvil keeps advancing
+        // so l1 block can be greater than or equal to the metrics l1
+        assert!(l1_block.number >= metrics_latest_l1);
+        assert_eq!(metrics_node_count, full_node_set.nodes.len());
+
+        // consensus is stopped, so these should match exactly
         assert_eq!(
-            metrics_latest_espresso as u64,
             active_node_set.espresso_block.block,
+            metrics_latest_espresso
         );
-
-        let metrics_current_epoch = get_metric_value(&metrics, "current_epoch");
-        assert_eq!(
-            metrics_current_epoch as u64,
-            active_node_set.espresso_block.epoch,
-        );
-
-        let metrics_active_validators = get_metric_value(&metrics, "active_validators");
-        assert_eq!(
-            metrics_active_validators as usize,
-            active_node_set.nodes.len(),
-        );
-
-        let metrics_unique_wallets = get_metric_value(&metrics, "unique_wallets");
-        assert_eq!(metrics_unique_wallets as usize, 3);
+        assert_eq!(active_node_set.espresso_block.epoch, metrics_current_epoch);
+        assert_eq!(metrics_active_validators, active_node_set.nodes.len());
+        assert_eq!(metrics_unique_wallets, 3);
 
         task.abort();
         let _ = task.await;
