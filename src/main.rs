@@ -483,7 +483,14 @@ mod test {
         let active_node_set: ActiveNodeSetSnapshot =
             client.get("nodes/active").send().await.unwrap();
 
-        let metrics: String = client.get("metrics").send().await.unwrap();
+        // Use reqwest directly for metrics endpoint
+        let metrics_url = format!("http://localhost:{port}/v0/staking/metrics");
+        let metrics: String = reqwest::get(&metrics_url)
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
         tracing::info!(metrics = %metrics, "got metrics");
 
         let metrics_latest_l1 = get_metric_value(&metrics, "latest_l1_block");
