@@ -93,13 +93,3 @@ test-log = { version = "0.2", features = [
     "color",
     "trace",
 ], default-features = false }
-
-[patch."https://github.com/EspressoSystems/espresso-network.git"]
-espresso-types = { git = "https://github.com/EspressoSystems//espresso-network.git", branch = "jb/pub-reward-rate" }
-hotshot-contract-adapter = { git = "https://github.com/EspressoSystems//espresso-network.git", branch = "jb/pub-reward-rate" }
-hotshot-query-service = { git = "https://github.com/EspressoSystems//espresso-network.git", branch = "jb/pub-reward-rate" }
-hotshot-types = { git = "https://github.com/EspressoSystems//espresso-network.git", branch = "jb/pub-reward-rate" }
-espresso-contract-deployer = { git = "https://github.com/EspressoSystems//espresso-network.git", branch = "jb/pub-reward-rate" }
-hotshot-state-prover = { git = "https://github.com/EspressoSystems//espresso-network.git", branch = "jb/pub-reward-rate" }
-sequencer = { git = "https://github.com/EspressoSystems//espresso-network.git", branch = "jb/pub-reward-rate" }
-staking-cli = { git = "https://github.com/EspressoSystems//espresso-network.git", branch = "jb/pub-reward-rate" }
