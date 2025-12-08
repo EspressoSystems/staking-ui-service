@@ -120,7 +120,7 @@ impl EspressoClient for MockEspressoClient {
         Ok(nodes)
     }
 
-    async fn apr_for_epoch(&self, _epoch: u64) -> Result<Ratio> {
+    async fn apr_for_epoch(&self, _epoch: u64, _total_staked: ESPTokenAmount) -> Result<Ratio> {
         Ok(self.apr)
     }
 
@@ -286,6 +286,7 @@ impl MockEspressoClient {
         self.epoch_height
     }
 
+    /// The fixed APR that this mock will always return for [`apr_for_epoch`](Self::apr_for_epoch).
     pub fn apr(&self) -> Ratio {
         self.apr
     }
@@ -486,3 +487,5 @@ pub async fn start_pos_network(
 
     (network, deployment, storage)
 }
+
+pub const DEFAULT_TOKEN_SUPPLY: ESPTokenAmount = ESPTokenAmount::ONE.saturating_shl(128);

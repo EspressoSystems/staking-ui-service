@@ -597,8 +597,9 @@ impl EpochState {
             .block_reward(epoch)
             .await
             .map_err(|err| err.context("fetching block reward for epoch"))?;
+        let total_staked = stake_table.values().map(|node| node.stake).sum();
         let apr = espresso
-            .apr_for_epoch(epoch)
+            .apr_for_epoch(epoch, total_staked)
             .await
             .map_err(|err| err.context("fetching APR for epoch"))?;
         let state = Self::new(epoch, stake_table, drb_result, block_reward, apr);
@@ -815,7 +816,11 @@ pub trait EspressoClient: Clone + Send + Sync {
     ) -> impl Send + Future<Output = Result<ValidatorMap>>;
 
     /// Fetch or calculate the rewards APR for the requested epoch.
-    fn apr_for_epoch(&self, epoch: u64) -> impl Send + Future<Output = Result<Ratio>>;
+    fn apr_for_epoch(
+        &self,
+        epoch: u64,
+        total_staked: ESPTokenAmount,
+    ) -> impl Send + Future<Output = Result<Ratio>>;
 
     /// Fetch a leaf.
     fn leaf(&self, height: u64) -> impl Send + Future<Output = Result<Leaf2>>;
@@ -841,7 +846,9 @@ pub trait EspressoClient: Clone + Send + Sync {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::input::espresso::testing::{MockEspressoClient, fake_drb_result};
+    use crate::input::espresso::testing::{
+        DEFAULT_TOKEN_SUPPLY, MockEspressoClient, fake_drb_result,
+    };
 
     use crate::input::espresso::client::{QueryServiceClient, QueryServiceOptions};
     use crate::persistence::sql::{Persistence, PersistenceOptions};
@@ -884,7 +891,7 @@ mod test {
                     block: last_leaf.height(),
                     timestamp: last_leaf.block_header().timestamp_millis(),
                 },
-                apr: espresso.apr_for_epoch(epoch).await.unwrap(),
+                apr: espresso.apr(),
                 nodes,
             },
             Default::default(),
@@ -1102,7 +1109,7 @@ mod test {
                     block: last_leaf.height(),
                     timestamp: last_leaf.block_header().timestamp_millis(),
                 },
-                apr: espresso.apr_for_epoch(epoch).await.unwrap(),
+                apr: espresso.apr(),
                 nodes,
             },
             Default::default(),
@@ -1414,10 +1421,12 @@ mod test {
         tracing::info!("Started Espresso network on port {espresso_port}");
 
         let espresso_url = format!("http://localhost:{espresso_port}");
-        let espresso_client =
-            QueryServiceClient::new(QueryServiceOptions::new(espresso_url.parse().unwrap()))
-                .await
-                .expect("Failed to create Espresso client");
+        let espresso_client = QueryServiceClient::new(
+            QueryServiceOptions::new(espresso_url.parse().unwrap()),
+            DEFAULT_TOKEN_SUPPLY,
+        )
+        .await
+        .expect("Failed to create Espresso client");
 
         let current_epoch = espresso_client.wait_for_epochs().await;
         tracing::info!("Epochs started, current epoch: {current_epoch}");
@@ -1757,8 +1766,8 @@ mod test {
             self.inner.stake_table_for_epoch(epoch).await
         }
 
-        async fn apr_for_epoch(&self, epoch: u64) -> Result<Ratio> {
-            self.inner.apr_for_epoch(epoch).await
+        async fn apr_for_epoch(&self, epoch: u64, total_staked: ESPTokenAmount) -> Result<Ratio> {
+            self.inner.apr_for_epoch(epoch, total_staked).await
         }
 
         async fn block_reward(&self, epoch: u64) -> Result<ESPTokenAmount> {
