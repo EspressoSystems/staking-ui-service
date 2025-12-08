@@ -1,0 +1,3 @@
+ALTER TABLE espresso_block
+    ADD COLUMN apr REAL NOT NULL;
+    

@@ -18,7 +18,7 @@ use crate::{
     Error, Result,
     error::ensure,
     input::espresso::EspressoClient,
-    types::common::{Address, ESPTokenAmount},
+    types::common::{Address, ESPTokenAmount, Ratio},
 };
 
 /// The version used for serialized messages from the query service.
@@ -201,6 +201,10 @@ impl EspressoClient for QueryServiceClient {
             ))
         );
         Ok(nodes)
+    }
+
+    async fn apr_for_epoch(&self, _epoch: u64) -> Result<Ratio> {
+        Ok(Ratio::new(1, 1))
     }
 
     async fn block_reward(&self, epoch: u64) -> Result<ESPTokenAmount> {
