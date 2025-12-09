@@ -187,27 +187,129 @@ pub struct NodeMetadata {
     pub content: Option<NodeMetadataContent>,
 }
 
+/// Optimal serialization of a struct with optional fields.
+///
+/// For self-describing formats (e.g. JSON) a [`None`] optional field can be omitted entirely,
+/// leading to smaller and cleaner output. For non-self-describing formats (e.g. bincode) a sentinel
+/// value must still be serialized indicating a value of [`None`].
+///
+/// # Syntax
+///
+/// ```
+/// #[derive(Deserialize)]
+/// struct Example {
+///     #[serde(default)]
+///     field1: Option<i32>,
+///
+///     #[serde(default)]
+///     field2: Option<String>,
+/// }
+///
+/// serialize_struct_with_opt_fields!(Example {
+///     field1,
+///     field2,
+/// })
+/// ```
+///
+/// Optionally, fields can be renamed in the human-readable wire format using a string literal
+/// followed by `@` (a la the `name @ Pattern { .. }` syntax in rust pattern matching) along with a
+/// `#[serde(rename = "...")]` directive.
+///
+/// ```
+/// #[derive(Deserialize)]
+/// struct Example {
+///     #[serde(default)]
+///     field1: Option<i32>,
+///
+///     #[serde(default, rename = "another field!")]
+///     field2: Option<String>,
+/// }
+///
+/// serialize_struct_with_opt_fields!(Example {
+///     field1,
+///     "another field!" @ field2,
+/// })
+/// ```
+macro_rules! serialize_struct_with_opt_fields {
+    ($t:ident { $($($name:literal@)?$f:ident),+ $(,)?}) => {
+        impl Serialize for $t {
+            fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+                use serde::ser::SerializeStruct;
+
+                // Unpack struct to cause a compiler error if we don't mention every field.
+                let $t { $($f),+ } = self;
+
+                if s.is_human_readable() {
+                    // For self-describing formats (e.g. JSON) only serialize fields which are not
+                    // [`None`].
+                    let mut n = 0;
+                    $(
+                        if $f.is_some() {
+                            n += 1;
+                        }
+                    )+
+                    let mut s = s.serialize_struct(stringify!($t), n)?;
+                    $(
+                        if let Some(value) = $f {
+                            s.serialize_field(serialize_struct_with_opt_fields!(@field_name $($name@)?$f), value)?;
+                        }
+                    )+
+                    s.end()
+                } else {
+                    let n = [$(stringify!($f)),+].len();
+                    let mut s = s.serialize_struct(stringify!($t), n)?;
+                    $(
+                        s.serialize_field(serialize_struct_with_opt_fields!(@field_name $($name@)?$f), $f)?;
+                    )+
+                    s.end()
+                }
+            }
+        }
+    };
+
+    // Helper patterns which allow us to pattern match on the presence or absence of the optional
+    // `"name" @ field` syntax, returning the name that should be used for this field in the
+    // serialized output.
+    (@field_name $name:literal@$f:ident) => { $name };
+    (@field_name $f:ident) => { stringify!($f) };
+}
+
 /// Optional descriptive information about a node.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
 pub struct NodeMetadataContent {
     /// Human-readable name for the node.
+    #[serde(default)]
     pub name: Option<String>,
 
     /// Longer description of the node.
+    #[serde(default)]
     pub description: Option<String>,
 
     /// Company or individual operating the node.
+    #[serde(default)]
     pub company_name: Option<String>,
 
     /// Website for `company_name`.
+    #[serde(default)]
     pub company_website: Option<Url>,
 
     /// Consensus client the node is running.
+    #[serde(default)]
     pub client_version: Option<String>,
 
     /// Icon for the node (at different resolutions and pixel aspect ratios).
+    #[serde(default)]
     pub icon: Option<ImageSet>,
 }
+
+serialize_struct_with_opt_fields!(NodeMetadataContent {
+    name,
+    description,
+    company_name,
+    company_website,
+    client_version,
+    icon,
+});
 
 /// Different versions of the same image, at different resolutions and pixel aspect ratios.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -222,17 +324,96 @@ pub struct ImageSet {
 }
 
 /// Different versions of the same image, at different pixel aspect ratios.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
 pub struct RatioSet {
     /// Image source for 1:1 pixel aspect ratio
     #[serde(rename = "@1x")]
+    #[serde(default)]
     pub ratio1: Option<Url>,
 
     /// Image source for 2:1 pixel aspect ratio
     #[serde(rename = "@2x")]
+    #[serde(default)]
     pub ratio2: Option<Url>,
 
     /// Image source for 3:1 pixel aspect ratio
     #[serde(rename = "@3x")]
+    #[serde(default)]
     pub ratio3: Option<Url>,
+}
+
+serialize_struct_with_opt_fields!(RatioSet {
+    "@1x" @ ratio1,
+    "@2x" @ ratio2,
+    "@3x" @ ratio3,
+});
+
+#[cfg(test)]
+mod test {
+    use pretty_assertions::assert_eq;
+    use serde_json::json;
+
+    use super::*;
+
+    #[test_log::test]
+    fn test_ratio_set_json() {
+        let set = RatioSet {
+            ratio1: Some("http://example.com/".parse().unwrap()),
+            ratio2: None,
+            ratio3: None,
+        };
+        let json = serde_json::to_value(set.clone()).unwrap();
+
+        // Omitted fields are omitted from the JSON.
+        assert_eq!(
+            json,
+            json!({
+                "@1x": "http://example.com/"
+            })
+        );
+
+        // Check round trip.
+        assert_eq!(set, serde_json::from_value(json).unwrap());
+    }
+
+    #[test_log::test]
+    fn test_ratio_set_bincode() {
+        let set = RatioSet {
+            ratio1: Some("http://example.com/".parse().unwrap()),
+            ratio2: None,
+            ratio3: None,
+        };
+        let bytes = bincode::serialize(&set).unwrap();
+        assert_eq!(set, bincode::deserialize(&bytes).unwrap());
+    }
+
+    #[test_log::test]
+    fn test_node_metadata_content_json() {
+        let metadata = NodeMetadataContent {
+            name: Some("test".into()),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(metadata.clone()).unwrap();
+
+        // Omitted fields are omitted from the JSON.
+        assert_eq!(
+            json,
+            json!({
+                "name": "test"
+            })
+        );
+
+        // Check round trip.
+        assert_eq!(metadata, serde_json::from_value(json).unwrap());
+    }
+
+    #[test_log::test]
+    fn test_node_metadata_content_bincode() {
+        let metadata = NodeMetadataContent {
+            name: Some("test".into()),
+            ..Default::default()
+        };
+        let bytes = bincode::serialize(&metadata).unwrap();
+        assert_eq!(metadata, bincode::deserialize(&bytes).unwrap());
+    }
 }

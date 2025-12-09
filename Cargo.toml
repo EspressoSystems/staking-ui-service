@@ -86,6 +86,7 @@ vergen = { version = "8", features = ["build", "git", "gitcl"] }
 # Enable our own `testing` feature when building tests.
 staking-ui-service = { path = ".", features = ["testing"] }
 
+bincode = "1"
 portpicker = "0.1"
 tempfile = "3"
 test-log = { version = "0.2", features = [

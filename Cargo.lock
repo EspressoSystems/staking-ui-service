@@ -10375,6 +10375,7 @@ dependencies = [
  "anyhow",
  "async-lock 3.4.1",
  "async-trait",
+ "bincode",
  "bitvec",
  "clap 4.5.51",
  "cld",
