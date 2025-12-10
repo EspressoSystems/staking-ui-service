@@ -13,7 +13,8 @@ use alloy::{
     primitives::utils::format_ether,
     providers::Provider,
     rpc::types::Filter,
-    sol_types::SolEventInterface,
+    sol,
+    sol_types::{SolEvent, SolEventInterface},
 };
 use hotshot_contract_adapter::sol_types::{
     EspToken,
@@ -160,6 +161,10 @@ pub async fn get_initial_token_supply(
     Ok(initial_supply)
 }
 
+sol! {
+    event Upgrade(address implementation);
+}
+
 pub(super) async fn get_events(
     provider: &impl Provider,
     filter: Filter,
@@ -196,15 +201,26 @@ pub(super) async fn get_events(
 
         // Try to decode stake table event
         if log.address() == stake_table_address {
-            let event = StakeTableV2Events::decode_raw_log(log.topics(), &log.data().data)
-                .unwrap_or_else(|e| {
+            let event = match StakeTableV2Events::decode_raw_log(log.topics(), &log.data().data) {
+                Ok(event) => event,
+                Err(e) => {
+                    // ONLY ON DECAF an earlier version of the stake table contract included this
+                    // `Upgrade(address)` event which is no longer present in the contract, and thus
+                    // not parseable by the generated contract bindings. If we encounter this event,
+                    // it is safe to ignore it, since upgrade events don't affect our state anyways.
+                    if let Ok(event) = Upgrade::decode_raw_log(log.topics(), &log.data().data) {
+                        tracing::warn!(%event.implementation, "ignoring legacy Upgrade event");
+                        continue;
+                    }
+
                     // This is a panic, not an error, as it should be impossible to successfully
                     // retrieve an event from the stake table address but not be able to decode it.
                     panic!(
                         "failed to decode event from stake table {stake_table_address}, tx {:?}: {e:#}",
                         log.transaction_hash
                     );
-                });
+                }
+            };
             events_for_block.push(L1Event::StakeTable(Arc::new(event)));
             continue;
         }
