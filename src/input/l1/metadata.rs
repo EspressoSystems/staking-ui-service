@@ -141,11 +141,16 @@ impl MetadataFetcher for HttpMetadataFetcher {
         } else if content_type.is_none()
             || content_type == Some(&HeaderValue::from_str(&PLAIN.to_string()).unwrap())
         {
-            // Parse response as a set of prometheus metrics.
+            // Content-type is plain text or missing. Try JSON first (some hosts like GitHub
+            // raw serve JSON files as text/plain), then fall back to prometheus metrics.
             let text = res.text().await.context(|| {
                 Error::internal().context(format!("reading metadata response from {url}"))
             })?;
-            parse_prometheus(&text).map_err(|err| err.context(format!("from {url}")))
+            if let Ok(metadata) = serde_json::from_str(&text) {
+                Ok(metadata)
+            } else {
+                parse_prometheus(&text).map_err(|err| err.context(format!("from {url}")))
+            }
         } else {
             Err(Error::internal().context(format!("unrecognized content type {content_type:?}")))
         }
