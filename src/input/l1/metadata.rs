@@ -8,7 +8,7 @@ use crate::{
     types::common::{ImageSet, NodeMetadata, NodeMetadataContent},
 };
 use prometheus_parse::Scrape;
-use reqwest::{Url, header::HeaderValue};
+use reqwest::Url;
 use tagged_base64::TaggedBase64;
 use tide_disco::http::mime::{JSON, PLAIN};
 use tracing::instrument;
@@ -132,15 +132,18 @@ impl MetadataFetcher for HttpMetadataFetcher {
                 Error::internal().context(format!("downloading metadata from {url}"))
             })?;
 
-        let content_type = res.headers().get("Content-Type");
-        if content_type == Some(&HeaderValue::from_str(&JSON.to_string()).unwrap()) {
+        let content_type = res
+            .headers()
+            .get("Content-Type")
+            .and_then(|v| v.to_str().ok())
+            .map(|ct| ct.split(';').next().unwrap().trim());
+
+        if content_type == Some(JSON.essence()) {
             // Parse response as JSON.
             res.json().await.context(|| {
                 Error::internal().context(format!("malformed JSON metadata from {url}"))
             })
-        } else if content_type.is_none()
-            || content_type == Some(&HeaderValue::from_str(&PLAIN.to_string()).unwrap())
-        {
+        } else if content_type.is_none() || content_type == Some(PLAIN.essence()) {
             // Content-type is plain text or missing. Try JSON first (some hosts like GitHub
             // raw serve JSON files as text/plain), then fall back to prometheus metrics.
             let text = res.text().await.context(|| {
