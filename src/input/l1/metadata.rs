@@ -136,10 +136,13 @@ impl MetadataFetcher for HttpMetadataFetcher {
         let text = res.text().await.context(|| {
             Error::internal().context(format!("reading metadata response from {url}"))
         })?;
-        if let Ok(metadata) = serde_json::from_str(&text) {
-            Ok(metadata)
-        } else {
-            parse_prometheus(&text).map_err(|err| err.context(format!("from {url}")))
+        match serde_json::from_str(&text) {
+            Ok(metadata) => Ok(metadata),
+            Err(json_err) => parse_prometheus(&text).map_err(|err| {
+                err.context(format!(
+                    "from {url}: failed to parse as JSON ({json_err}) or metrics"
+                ))
+            }),
         }
     }
 }
