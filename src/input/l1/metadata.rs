@@ -749,19 +749,15 @@ mod test {
 
         let routes = json_route.or(plain_route).or(metrics_route);
 
-        let port = pick_unused_port().unwrap();
-        let (addr, server) =
-            warp::serve(routes).bind_with_graceful_shutdown(([127, 0, 0, 1], port), async {
-                futures::future::pending::<()>().await;
-            });
-
+        let (addr, server) = warp::serve(routes).bind_ephemeral(([127, 0, 0, 1], 0));
+        println!("server listening on http://{addr}");
         let server_handle = spawn(server);
 
         tokio::time::sleep(Duration::from_secs(1)).await;
 
         let fetcher = HttpMetadataFetcher::default();
 
-        let uri: Url = format!("http://{addr}/json",).parse().unwrap();
+        let uri: Url = format!("http://{addr}/json").parse().unwrap();
         let result = fetcher.fetch_content(&uri).await.unwrap();
         assert_eq!(result, expected,);
 
