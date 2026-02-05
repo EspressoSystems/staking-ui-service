@@ -258,6 +258,7 @@ mod test {
     use tokio::spawn;
     use toml::toml;
     use vbs::version::{StaticVersion, StaticVersionType};
+    use warp::Filter;
 
     #[test_log::test]
     fn test_parse_prometheus_all_fields() {
@@ -678,5 +679,98 @@ mod test {
 
         server.abort();
         server.await.ok();
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_metadata_parsing_different_content_type() {
+        let pub_key = PubKey::generated_from_seed_indexed(Default::default(), 42).0;
+        let expected = NodeMetadataContent {
+            pub_key,
+            name: Some("test-node".into()),
+            description: Some("Test description".into()),
+            company_name: Some("Test Company".into()),
+            company_website: Some("https://example.com/".parse().unwrap()),
+            client_version: Some("v1.0.0".into()),
+            icon: None,
+        };
+
+        let json_content = serde_json::to_string(&expected).unwrap();
+
+        let metrics = PrometheusMetrics::default();
+        {
+            let m: &dyn Metrics = &metrics;
+            m.gauge_family("consensus_node".into(), vec!["key".into()])
+                .create(vec![pub_key.to_string()])
+                .set(1);
+            m.gauge_family(
+                "consensus_node_identity_general".into(),
+                vec![
+                    "name".into(),
+                    "description".into(),
+                    "company_name".into(),
+                    "company_website".into(),
+                ],
+            )
+            .create(vec![
+                expected.name.clone().unwrap(),
+                expected.description.clone().unwrap(),
+                expected.company_name.clone().unwrap(),
+                expected.company_website.as_ref().unwrap().to_string(),
+            ])
+            .set(1);
+            m.gauge_family("consensus_version".into(), vec!["desc".into()])
+                .create(vec![expected.client_version.clone().unwrap()])
+                .set(1);
+        }
+        let metrics_text = tide_disco::metrics::Metrics::export(&metrics).unwrap();
+
+        let json_route = {
+            let json = json_content.clone();
+            warp::path("json").map(move || {
+                warp::reply::with_header(json.clone(), "content-type", "application/json")
+            })
+        };
+
+        let plain_route = {
+            let json = json_content.clone();
+            warp::path("plain")
+                .map(move || warp::reply::with_header(json.clone(), "content-type", "text/plain"))
+        };
+
+        let metrics_route = {
+            let metrics = metrics_text.clone();
+            warp::path("metrics").map(move || {
+                warp::reply::with_header(metrics.clone(), "content-type", "text/plain")
+            })
+        };
+
+        let routes = json_route.or(plain_route).or(metrics_route);
+
+        let port = pick_unused_port().unwrap();
+        let (addr, server) =
+            warp::serve(routes).bind_with_graceful_shutdown(([127, 0, 0, 1], port), async {
+                futures::future::pending::<()>().await;
+            });
+
+        let server_handle = spawn(server);
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        let fetcher = HttpMetadataFetcher::default();
+
+        let uri: Url = format!("http://{addr}/json",).parse().unwrap();
+        let result = fetcher.fetch_content(&uri).await.unwrap();
+        assert_eq!(result, expected,);
+
+        let uri: Url = format!("http://{addr}/plain").parse().unwrap();
+        let result = fetcher.fetch_content(&uri).await.unwrap();
+        assert_eq!(result, expected,);
+
+        let uri: Url = format!("http://{addr}/metrics").parse().unwrap();
+        let result = fetcher.fetch_content(&uri).await.unwrap();
+        assert_eq!(result, expected);
+
+        server_handle.abort();
+        server_handle.await.ok();
     }
 }
