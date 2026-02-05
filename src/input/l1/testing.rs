@@ -11,8 +11,8 @@ use std::{
     time::Duration,
 };
 
+use crate::metrics::PrometheusMetrics;
 use crate::types::common::{NodeMetadataContent, NodeSetEntry};
-use crate::{input::l1::metadata::SafeMetadataUrl, metrics::PrometheusMetrics};
 use alloy::{
     network::EthereumWallet,
     primitives::{Address, FixedBytes, U256, keccak256},
@@ -262,10 +262,7 @@ pub fn default_node_metadata() -> NodeMetadata {
 pub struct NoMetadata;
 
 impl MetadataFetcher for NoMetadata {
-    async fn fetch_content_from_safe_url(
-        &self,
-        _uri: SafeMetadataUrl,
-    ) -> Result<NodeMetadataContent> {
+    async fn fetch_content(&self, _uri: &Url) -> Result<NodeMetadataContent> {
         Err(Error::internal().context("NoMetadata"))
     }
 }
@@ -284,23 +281,16 @@ impl ConstMetadata {
 }
 
 impl MetadataFetcher for ConstMetadata {
-    async fn fetch_content_from_safe_url(
-        &self,
-        _uri: SafeMetadataUrl,
-    ) -> Result<NodeMetadataContent> {
+    async fn fetch_content(&self, _uri: &Url) -> Result<NodeMetadataContent> {
         Ok(self.0.clone())
     }
 }
 
 /// Metadata fetcher which returns responses based on a mapping from URIs.
 impl MetadataFetcher for Vec<(Url, Option<NodeMetadataContent>)> {
-    async fn fetch_content_from_safe_url(
-        &self,
-        uri: SafeMetadataUrl,
-    ) -> Result<NodeMetadataContent> {
-        let uri = uri.into();
+    async fn fetch_content(&self, uri: &Url) -> Result<NodeMetadataContent> {
         self.iter()
-            .find_map(|(k, v)| if *k == uri { Some(v.clone()) } else { None })
+            .find_map(|(k, v)| if k == uri { Some(v.clone()) } else { None })
             .ok_or_else(|| Error::not_found().context("unknown URL"))?
             .ok_or_else(|| Error::internal().context("injected fetch failure"))
     }

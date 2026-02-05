@@ -2,7 +2,6 @@
 
 use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
-    sync::OnceLock,
     time::Duration,
 };
 
@@ -11,7 +10,6 @@ use crate::{
     error::{ResultExt, ensure},
     types::common::{ImageSet, NodeMetadata, NodeMetadataContent},
 };
-use derive_more::Into;
 use hickory_resolver::{Resolver, TokioResolver};
 use prometheus_parse::Scrape;
 use reqwest::Url;
@@ -85,18 +83,7 @@ pub trait MetadataFetcher: Sync {
     }
 
     /// Download and parse node metadata content from a third-party URI.
-    fn fetch_content(&self, url: &Url) -> impl Send + Future<Output = Result<NodeMetadataContent>> {
-        async move {
-            let safe_url = SafeMetadataUrl::from_url(url.clone()).await?;
-            self.fetch_content_from_safe_url(safe_url).await
-        }
-    }
-
-    /// Download and parse node metadata content from a sanitized third-party URI.
-    fn fetch_content_from_safe_url(
-        &self,
-        url: SafeMetadataUrl,
-    ) -> impl Send + Future<Output = Result<NodeMetadataContent>>;
+    fn fetch_content(&self, url: &Url) -> impl Send + Future<Output = Result<NodeMetadataContent>>;
 
     /// Download and parse node metadata content from a third-party URI, authenticating against the
     /// given public key.
@@ -122,85 +109,16 @@ pub trait MetadataFetcher: Sync {
     }
 }
 
-/// A third-party metadata URI which has been sanitized to exclude malicious URLs.
-///
-/// Malicious URLs include reserved IP address ranges and loopback hosts (e.g. `localhost`).
-/// Attempting to fetch metadata from such URLs could cause this service to make a request to its
-/// own intranet, potentially leaking sensitive data.
-///
-/// This sanitized type can be successfully constructed from a raw [`Url`] only if that URL is
-/// confirmed not to be one of the excluded categories.
-#[derive(Clone, Debug, Into)]
-pub struct SafeMetadataUrl(Url);
-
-impl SafeMetadataUrl {
-    async fn from_url(url: Url) -> Result<Self> {
-        let Some(host) = url.host() else {
-            return Err(Error::bad_request().context("metadata URI does not have a host"));
-        };
-        match host {
-            Host::Domain(domain) => {
-                let resolver = RESOLVER.get_or_init(|| Resolver::builder_tokio().unwrap().build());
-                let ips = resolver.lookup_ip(domain).await.context(|| {
-                    Error::internal().context(format!("could not resolve metadata host {host}"))
-                })?;
-                for ip in ips {
-                    match ip {
-                        IpAddr::V4(ipv4) => check_metadata_ipv4_safety(ipv4)?,
-                        IpAddr::V6(ipv6) => check_metadata_ipv6_safety(ipv6)?,
-                    }
-                }
-            }
-            Host::Ipv4(ipv4) => check_metadata_ipv4_safety(ipv4)?,
-            Host::Ipv6(ipv6) => check_metadata_ipv6_safety(ipv6)?,
-        }
-
-        Ok(Self(url))
-    }
-}
-
-static RESOLVER: OnceLock<TokioResolver> = OnceLock::new();
-
-/// Check that an IPv4 address is safe to make a metadata request to.
-///
-/// This function filters out reserved IP address ranges.
-fn check_metadata_ipv4_safety(ip: Ipv4Addr) -> Result<()> {
-    ensure!(
-        !(ip.is_broadcast()
-            || ip.is_link_local()
-            || ip.is_loopback()
-            || ip.is_multicast()
-            || ip.is_private()
-            || ip.is_unspecified()
-            || ip.is_documentation()),
-        Error::bad_request().context(format!("metadata IP {ip} is in reserved range"))
-    );
-    Ok(())
-}
-
-/// Check that an IPv6 address is safe to make a metadata request to.
-///
-/// This function filters out reserved IPv6 address ranges, as well as unsafe IPv4 addresses encoded
-/// in IPv6 format.
-fn check_metadata_ipv6_safety(ip: Ipv6Addr) -> Result<()> {
-    if let Some(ipv4) = ip.to_ipv4_mapped() {
-        check_metadata_ipv4_safety(ipv4)?;
-    }
-    ensure!(
-        !(ip.is_loopback()
-            || ip.is_multicast()
-            || ip.is_unicast_link_local()
-            || ip.is_unique_local()
-            || ip.is_unspecified()),
-        Error::bad_request().context(format!("metadata IP {ip} is in reserved range"))
-    );
-    Ok(())
-}
-
 /// Object that can download metadata from a given URI.
 #[derive(Clone, Debug)]
 pub struct HttpMetadataFetcher {
     client: reqwest::Client,
+    resolver: TokioResolver,
+
+    // Allow fetching from `localhost` in unit tests, where the staking service and metadata server
+    // run on the same host.
+    #[cfg(test)]
+    allow_local: bool,
 }
 
 impl Default for HttpMetadataFetcher {
@@ -212,17 +130,61 @@ impl Default for HttpMetadataFetcher {
                 .timeout(Duration::from_secs(3))
                 .build()
                 .unwrap(),
+            resolver: Resolver::builder_tokio().unwrap().build(),
+
+            #[cfg(test)]
+            allow_local: false,
         }
+    }
+}
+
+impl HttpMetadataFetcher {
+    /// Check that a third-party metadata URI is safe to fetch from.
+    ///
+    /// Malicious URLs include reserved IP address ranges and loopback hosts (e.g. `localhost`).
+    /// Attempting to fetch metadata from such URLs could cause this service to make a request to
+    /// its own intranet, potentially leaking sensitive data.
+    async fn check_metadata_uri_safety(&self, url: &Url) -> Result<()> {
+        let Some(host) = url.host() else {
+            return Err(Error::bad_request().context("URI does not have a host"));
+        };
+
+        // Allow fetching from `localhost` in unit tests, where the staking service and metadata
+        // server run on the same host.
+        #[cfg(test)]
+        if self.allow_local
+            && [Host::Domain("localhost"), Host::Ipv4(Ipv4Addr::LOCALHOST)].contains(&host)
+        {
+            return Ok(());
+        }
+
+        match host {
+            Host::Domain(domain) => {
+                let ips = self.resolver.lookup_ip(domain).await.context(|| {
+                    Error::internal().context(format!("could not resolve metadata host {host}"))
+                })?;
+                for ip in ips {
+                    let res = match ip {
+                        IpAddr::V4(ipv4) => check_metadata_ipv4_safety(ipv4),
+                        IpAddr::V6(ipv6) => check_metadata_ipv6_safety(ipv6),
+                    };
+                    res.map_err(|err| err.context(format!("for host {domain}")))?;
+                }
+            }
+            Host::Ipv4(ipv4) => check_metadata_ipv4_safety(ipv4)?,
+            Host::Ipv6(ipv6) => check_metadata_ipv6_safety(ipv6)?,
+        }
+
+        Ok(())
     }
 }
 
 impl MetadataFetcher for HttpMetadataFetcher {
     #[instrument(skip(self))]
-    async fn fetch_content_from_safe_url(
-        &self,
-        safe_url: SafeMetadataUrl,
-    ) -> Result<NodeMetadataContent> {
-        let url = Url::from(safe_url);
+    async fn fetch_content(&self, url: &Url) -> Result<NodeMetadataContent> {
+        self.check_metadata_uri_safety(url)
+            .await
+            .map_err(|err| err.context("disallowed metadata URI"))?;
         let res =
             self.client.get(url.clone()).send().await.context(|| {
                 Error::internal().context(format!("downloading metadata from {url}"))
@@ -242,6 +204,42 @@ impl MetadataFetcher for HttpMetadataFetcher {
             }),
         }
     }
+}
+
+/// Check that an IPv4 address is safe to make a metadata request to.
+///
+/// This function filters out reserved IP address ranges.
+fn check_metadata_ipv4_safety(ip: Ipv4Addr) -> Result<()> {
+    ensure!(
+        !(ip.is_broadcast()
+            || ip.is_link_local()
+            || ip.is_loopback()
+            || ip.is_multicast()
+            || ip.is_private()
+            || ip.is_unspecified()
+            || ip.is_documentation()),
+        Error::bad_request().context(format!("IP {ip} is in reserved range"))
+    );
+    Ok(())
+}
+
+/// Check that an IPv6 address is safe to make a metadata request to.
+///
+/// This function filters out reserved IPv6 address ranges, as well as unsafe IPv4 addresses encoded
+/// in IPv6 format.
+fn check_metadata_ipv6_safety(ip: Ipv6Addr) -> Result<()> {
+    if let Some(ipv4) = ip.to_ipv4_mapped() {
+        check_metadata_ipv4_safety(ipv4)?;
+    }
+    ensure!(
+        !(ip.is_loopback()
+            || ip.is_multicast()
+            || ip.is_unicast_link_local()
+            || ip.is_unique_local()
+            || ip.is_unspecified()),
+        Error::bad_request().context(format!("IP {ip} is in reserved range"))
+    );
+    Ok(())
 }
 
 /// Interpret prometheus labels as node metadata according to Espresso convention.
@@ -609,7 +607,10 @@ mod test {
         let port = pick_unused_port().unwrap();
         let server = spawn(app.serve(format!("0.0.0.0:{port}"), StaticVersion::<0, 1>::instance()));
 
-        let fetcher = HttpMetadataFetcher::default();
+        let fetcher = HttpMetadataFetcher {
+            allow_local: true,
+            ..Default::default()
+        };
         let uri: Url = format!("http://localhost:{port}/node/metadata")
             .parse()
             .unwrap();
@@ -766,7 +767,10 @@ mod test {
         let port = pick_unused_port().unwrap();
         let server = spawn(app.serve(format!("0.0.0.0:{port}"), StaticVersion::<0, 1>::instance()));
 
-        let fetcher = HttpMetadataFetcher::default();
+        let fetcher = HttpMetadataFetcher {
+            allow_local: true,
+            ..Default::default()
+        };
         let uri: Url = format!("http://localhost:{port}/node/metadata")
             .parse()
             .unwrap();
@@ -853,7 +857,10 @@ mod test {
 
         tokio::time::sleep(Duration::from_secs(1)).await;
 
-        let fetcher = HttpMetadataFetcher::default();
+        let fetcher = HttpMetadataFetcher {
+            allow_local: true,
+            ..Default::default()
+        };
 
         let uri: Url = format!("http://{addr}/json").parse().unwrap();
         let result = fetcher.fetch_content(&uri).await.unwrap();
@@ -875,25 +882,28 @@ mod test {
     #[test_log::test]
     async fn test_malicious_uri_file() {
         let url = Url::parse("file:///etc/hosts").unwrap();
-        let err = SafeMetadataUrl::from_url(url).await.unwrap_err();
+        let err = HttpMetadataFetcher::default()
+            .check_metadata_uri_safety(&url)
+            .await
+            .unwrap_err();
         tracing::info!("metadata sanitization failed as expected: {err:#}");
         assert_eq!(err.status(), StatusCode::BAD_REQUEST);
-        assert!(
-            err.to_string()
-                .contains("metadata URI does not have a host")
-        );
+        assert!(err.to_string().contains("URI does not have a host"));
     }
 
     #[tokio::test]
     #[test_log::test]
     async fn test_malicious_uri_loopback() {
         let url = Url::parse("http://localhost:8080").unwrap();
-        let err = SafeMetadataUrl::from_url(url).await.unwrap_err();
+        let err = HttpMetadataFetcher::default()
+            .check_metadata_uri_safety(&url)
+            .await
+            .unwrap_err();
         tracing::info!("metadata sanitization failed as expected: {err:#}");
         assert_eq!(err.status(), StatusCode::BAD_REQUEST);
         assert!(
             err.to_string()
-                .contains("IP 127.0.0.1 is in reserved range")
+                .contains("for host localhost: IP 127.0.0.1 is in reserved range")
         );
     }
 
@@ -901,7 +911,10 @@ mod test {
     #[test_log::test]
     async fn test_malicious_uri_ipv4_loopback() {
         let url = Url::parse("http://127.0.0.1:8080").unwrap();
-        let err = SafeMetadataUrl::from_url(url).await.unwrap_err();
+        let err = HttpMetadataFetcher::default()
+            .check_metadata_uri_safety(&url)
+            .await
+            .unwrap_err();
         tracing::info!("metadata sanitization failed as expected: {err:#}");
         assert_eq!(err.status(), StatusCode::BAD_REQUEST);
         assert!(
@@ -914,7 +927,10 @@ mod test {
     #[test_log::test]
     async fn test_malicious_uri_ipv4_link_local() {
         let url = Url::parse("http://169.254.169.254:8080").unwrap();
-        let err = SafeMetadataUrl::from_url(url).await.unwrap_err();
+        let err = HttpMetadataFetcher::default()
+            .check_metadata_uri_safety(&url)
+            .await
+            .unwrap_err();
         tracing::info!("metadata sanitization failed as expected: {err:#}");
         assert_eq!(err.status(), StatusCode::BAD_REQUEST);
         assert!(
@@ -932,7 +948,10 @@ mod test {
         tracing::info!(%ipv4, %ipv6);
 
         let url = Url::parse(&format!("http://[{ipv6}]:8080")).unwrap();
-        let err = SafeMetadataUrl::from_url(url).await.unwrap_err();
+        let err = HttpMetadataFetcher::default()
+            .check_metadata_uri_safety(&url)
+            .await
+            .unwrap_err();
         tracing::info!("metadata sanitization failed as expected: {err:#}");
         assert_eq!(err.status(), StatusCode::BAD_REQUEST);
         assert!(
@@ -945,7 +964,10 @@ mod test {
     #[test_log::test]
     async fn test_malicious_uri_ipv6_loopback() {
         let url = Url::parse("http://[::1]:8080").unwrap();
-        let err = SafeMetadataUrl::from_url(url).await.unwrap_err();
+        let err = HttpMetadataFetcher::default()
+            .check_metadata_uri_safety(&url)
+            .await
+            .unwrap_err();
         tracing::info!("metadata sanitization failed as expected: {err:#}");
         assert_eq!(err.status(), StatusCode::BAD_REQUEST);
         assert!(err.to_string().contains("IP ::1 is in reserved range"));
@@ -955,7 +977,10 @@ mod test {
     #[test_log::test]
     async fn test_malicious_uri_ipv6_link_local() {
         let url = Url::parse("http://[fe80::ffff:ffff:ffff:ffff]:8080").unwrap();
-        let err = SafeMetadataUrl::from_url(url).await.unwrap_err();
+        let err = HttpMetadataFetcher::default()
+            .check_metadata_uri_safety(&url)
+            .await
+            .unwrap_err();
         tracing::info!("metadata sanitization failed as expected: {err:#}");
         assert_eq!(err.status(), StatusCode::BAD_REQUEST);
         assert!(
