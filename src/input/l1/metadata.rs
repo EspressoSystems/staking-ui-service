@@ -194,7 +194,7 @@ fn check_metadata_ipv6_safety(ip: Ipv6Addr) -> Result<()> {
     Ok(())
 }
 
-const BLOCKED_DOMAINS: &[&str] = &["localhost"];
+const BLOCKED_DOMAINS: &[&str] = &["localhost", "broadcasthost"];
 
 /// Object that can download metadata from a given URI.
 #[derive(Clone, Debug)]
