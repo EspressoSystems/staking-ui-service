@@ -10,7 +10,6 @@ use crate::{
 use prometheus_parse::Scrape;
 use reqwest::Url;
 use tagged_base64::TaggedBase64;
-use tide_disco::http::mime::{JSON, PLAIN};
 use tracing::instrument;
 
 /// Metadata sourced from third party URIs should be automatically refreshed every fixed number of
@@ -132,30 +131,15 @@ impl MetadataFetcher for HttpMetadataFetcher {
                 Error::internal().context(format!("downloading metadata from {url}"))
             })?;
 
-        let content_type = res
-            .headers()
-            .get("Content-Type")
-            .and_then(|v| v.to_str().ok())
-            .map(|ct| ct.split(';').next().unwrap().trim());
-
-        if content_type == Some(JSON.essence()) {
-            // Parse response as JSON.
-            res.json().await.context(|| {
-                Error::internal().context(format!("malformed JSON metadata from {url}"))
-            })
-        } else if content_type.is_none() || content_type == Some(PLAIN.essence()) {
-            // Content-type is plain text or missing. Try JSON first (some hosts like GitHub
-            // raw serve JSON files as text/plain), then fall back to prometheus metrics.
-            let text = res.text().await.context(|| {
-                Error::internal().context(format!("reading metadata response from {url}"))
-            })?;
-            if let Ok(metadata) = serde_json::from_str(&text) {
-                Ok(metadata)
-            } else {
-                parse_prometheus(&text).map_err(|err| err.context(format!("from {url}")))
-            }
+        // Ignore content type and always try JSON first (some hosts like GitHub raw serve
+        // JSON files as text/plain), then fall back to prometheus metrics.
+        let text = res.text().await.context(|| {
+            Error::internal().context(format!("reading metadata response from {url}"))
+        })?;
+        if let Ok(metadata) = serde_json::from_str(&text) {
+            Ok(metadata)
         } else {
-            Err(Error::internal().context(format!("unrecognized content type {content_type:?}")))
+            parse_prometheus(&text).map_err(|err| err.context(format!("from {url}")))
         }
     }
 }
