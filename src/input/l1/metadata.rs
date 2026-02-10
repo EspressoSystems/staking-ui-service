@@ -292,6 +292,9 @@ fn parse_prometheus(text: &str) -> Result<NodeMetadataContent> {
             "consensus_node_identity_icon" => {
                 let mut icon = ImageSet::default();
                 for (label, value) in sample.labels.iter() {
+                    if value.is_empty() {
+                        continue;
+                    }
                     let url = match value.parse() {
                         Ok(url) => url,
                         Err(err) => {
