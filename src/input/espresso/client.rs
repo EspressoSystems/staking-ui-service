@@ -271,7 +271,9 @@ impl EspressoClient for QueryServiceClient {
                 attempt += 1;
                 match self
                     .inner
-                    .get(&format!("reward-state-v2/reward-amounts/{block}/{offset}/{limit}"))
+                    .get(&format!(
+                        "reward-state-v2/reward-amounts/{block}/{offset}/{limit}"
+                    ))
                     .send()
                     .await
                 {
