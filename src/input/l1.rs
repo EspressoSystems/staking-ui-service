@@ -1310,7 +1310,7 @@ mod test {
         types::common::{Address, NodeMetadataContent},
     };
     use alloy::primitives::U256;
-    use espresso_types::{StakeTableState, v0_3::StakeTableEvent};
+    use espresso_types::{RegisteredValidatorMap, StakeTableState, v0_3::StakeTableEvent};
     use hotshot_contract_adapter::sol_types::StakeTableV2::{
         Delegated, ExitEscrowPeriodUpdated, MetadataUriUpdated, Undelegated, ValidatorExit,
         ValidatorExitClaimed, ValidatorRegisteredV2, WithdrawalClaimed,
@@ -1356,7 +1356,12 @@ mod test {
     /// used by consensus.
     fn check_stake_table_consistency(nodes: &NodeSet, stake_table: &StakeTableState) {
         tracing::debug!("checking state consistency");
-        let validators = stake_table.validators();
+        let validators: RegisteredValidatorMap = stake_table
+            .validators()
+            .clone()
+            .into_iter()
+            .filter(|(_, v)| v.authenticated)
+            .collect();
         assert_eq!(validators.len(), nodes.len());
         for node in nodes.values() {
             let validator = &validators[&node.address];
