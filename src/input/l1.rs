@@ -931,7 +931,8 @@ impl Snapshot {
                 | StakeTableV2Events::RoleAdminChanged(_)
                 | StakeTableV2Events::RoleGranted(_)
                 | StakeTableV2Events::RoleRevoked(_)
-                | StakeTableV2Events::Upgraded(_) => {
+                | StakeTableV2Events::Upgraded(_)
+                | StakeTableV2Events::MinDelegateAmountUpdated(_) => {
                     tracing::debug!("skipping irrelevant event");
                     (vec![], vec![])
                 }
