@@ -463,7 +463,7 @@ impl Persistence {
                 // event does not contain enough information to accurately correlate every
                 // withdrawal to the correct pending withdrawal. Thus, it is possible that a
                 // previous withdrawal that was meant to clear a pending withdrawal from this node
-                // got misinterpeted as clearing a different pending withdrawal, leaving a stale
+                // got misinterpreted as clearing a different pending withdrawal, leaving a stale
                 // withdrawal to this node in our database. Now, having overwritten this stale
                 // withdrawal with a fresh one, our state should once again match the contract
                 // state.
