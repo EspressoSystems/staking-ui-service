@@ -902,6 +902,21 @@ impl Snapshot {
                     );
                 }
                 StakeTableV2Events::WithdrawalClaimed(ev) => {
+                    // V2 undelegation IDs start from 1. ID 0 is reserved for legacy V1
+                    // undelegations whose claims are already handled by the V1 Withdrawal
+                    // event. Skip to avoid double-counting. May happen on Decaf, must
+                    // not happen on mainnet.
+                    if ev.undelegationId == 0 {
+                        tracing::warn!(
+                            delegator = %ev.delegator,
+                            validator = %ev.validator,
+                            amount = %ev.amount,
+                            "ignoring WithdrawalClaimed for legacy V1 undelegation. \
+                             May happen on Decaf, must not happen on mainnet."
+                        );
+                        return (vec![], vec![]);
+                    }
+
                     let wallet = self.wallets.get(&ev.delegator).unwrap_or_else(|| {
                         panic!(
                             "got WithdrawalClaimed event for non existent wallet: {}",
@@ -911,14 +926,17 @@ impl Snapshot {
 
                     if !wallet.pending_undelegations.contains_key(&ev.validator) {
                         panic!(
-                            "got WithdrawalClaimed but no pending undelegation for delegator {} validator {} amount {}",
+                            "got WithdrawalClaimed but no pending undelegation for \
+                             delegator {} validator {} amount {}",
                             ev.delegator, ev.validator, ev.amount
                         );
                     }
 
+                    let node = ev.validator;
+
                     let withdrawal = Withdrawal {
                         delegator: ev.delegator,
-                        node: ev.validator,
+                        node,
                         amount: ev.amount,
                     };
                     let wallet_diff = WalletDiff::UndelegationWithdrawal(withdrawal);
@@ -1142,7 +1160,7 @@ impl Wallet {
                     // ONLY ON DECAF this is ok. The legacy withdrawal event does not contain
                     // enough information to accurately correlate every withdrawal to the correct
                     // pending withdrawal. Thus, it is possible that a previous withdrawal that was
-                    // meant to clear a pending undelegation from this node got misinterpeted as
+                    // meant to clear a pending undelegation from this node got misinterpreted as
                     // clearing a different undelegation, leaving a stale undelegation to this node
                     // in the wallet state. Now, having overwritten this stale undelegation with a
                     // fresh one, our state should once again match the contract state.
@@ -1353,7 +1371,7 @@ mod test {
     use espresso_types::{RegisteredValidatorMap, StakeTableState, v0_3::StakeTableEvent};
     use hotshot_contract_adapter::sol_types::StakeTableV2::{
         Delegated, ExitEscrowPeriodUpdated, MetadataUriUpdated, Undelegated, ValidatorExit,
-        ValidatorRegisteredV2, Withdrawal,
+        ValidatorRegisteredV2, Withdrawal, WithdrawalClaimed,
     };
     use pretty_assertions::assert_eq;
     use reqwest::Url;
@@ -2344,6 +2362,127 @@ mod test {
         let wallet = block5.state.wallets.get(&delegator).unwrap();
         assert_eq!(wallet.nodes.len(), 0);
         assert_eq!(wallet.pending_undelegations.len(), 0);
+        assert_eq!(wallet.pending_exits.len(), 0);
+    }
+
+    /// Regression test for the Decaf testnet crash: the service panicked on
+    /// `WithdrawalClaimed(undelegationId=0)` because it expected a matching pending undelegation
+    /// that had already been consumed by a V1 `Withdrawal` for an undelegation by the same
+    /// delegator and amount from a different validator.
+    ///
+    /// Each undelegation is claimed via either a V1 `Withdrawal` or a V2 `WithdrawalClaimed`, never
+    /// both. The V1 `Withdrawal(account, amount)` has no validator address, so the service matches
+    /// pending undelegations by amount. When multiple pending undelegations have the same amount,
+    /// it may consume the wrong one. The `WithdrawalClaimed(undelegationId=0)` are now skipped
+    /// because the withdrawal from this validator may have been "accidentally" consumed by the
+    /// amount matching logic.
+    #[test_log::test(tokio::test(flavor = "multi_thread"))]
+    async fn test_legacy_v1_withdrawal_claimed_is_ignored() {
+        let delegator = Address::random();
+        let amount = U256::from(900);
+        let num_v1_claims = 5;
+        let num_v2_claims = 5;
+
+        // Validators whose undelegations will be claimed via Withdrawal event.
+        let claim_v1_vals: Vec<_> = (0..num_v1_claims)
+            .map(|_| {
+                let reg = validator_registered_event(rand::thread_rng());
+                let addr = reg.account;
+                (addr, reg)
+            })
+            .collect();
+
+        // Validators whose undelegations will be claimed via WithdrawalClaimed event.
+        let claim_v2_vals: Vec<_> = (0..num_v2_claims)
+            .map(|_| {
+                let reg = validator_registered_event(rand::thread_rng());
+                let addr = reg.account;
+                (addr, reg)
+            })
+            .collect();
+
+        // Block 1: Register all validators, delegate the same amount to each.
+        let mut events = Vec::new();
+        for (_, reg) in claim_v1_vals.iter().chain(claim_v2_vals.iter()) {
+            events.push(StakeTableV2Events::ValidatorRegisteredV2(reg.clone()));
+        }
+        for (addr, _) in claim_v1_vals.iter().chain(claim_v2_vals.iter()) {
+            events.push(StakeTableV2Events::Delegated(Delegated {
+                delegator,
+                validator: *addr,
+                amount,
+            }));
+        }
+        let mut block = test_events(&NoMetadata, events).await;
+
+        // Undelegate from every validator.
+        let mut block_num = 2u64;
+        for (addr, _) in claim_v1_vals.iter().chain(claim_v2_vals.iter()) {
+            block = block
+                .next(
+                    &NoMetadata,
+                    &BlockInput::empty(block_num).with_event(StakeTableV2Events::Undelegated(
+                        Undelegated {
+                            delegator,
+                            validator: *addr,
+                            amount,
+                        },
+                    )),
+                )
+                .await;
+            block_num += 1;
+        }
+
+        let total = num_v1_claims + num_v2_claims;
+        let wallet = block.state.wallets.get(&delegator).unwrap();
+        assert_eq!(wallet.pending_undelegations.len(), total);
+
+        // Claim via Withdrawal events. Each matches by amount (no validator address),
+        // so may consume another validator's pending undelegation instead of the
+        // intended one.
+        for _ in 0..num_v1_claims {
+            block = block
+                .next(
+                    &NoMetadata,
+                    &BlockInput::empty(block_num).with_event(StakeTableV2Events::Withdrawal(
+                        Withdrawal {
+                            account: delegator,
+                            amount,
+                        },
+                    )),
+                )
+                .await;
+            block_num += 1;
+        }
+
+        let wallet = block.state.wallets.get(&delegator).unwrap();
+        assert_eq!(wallet.pending_undelegations.len(), num_v2_claims);
+
+        // WithdrawalClaimed with undelegationId=0 for each remaining validator. These
+        // are skipped because the Withdrawal amount-matching may have already consumed
+        // this validator's pending undelegation. Must not panic.
+        for (addr, _) in &claim_v2_vals {
+            block = block
+                .next(
+                    &NoMetadata,
+                    &BlockInput::empty(block_num).with_event(
+                        StakeTableV2Events::WithdrawalClaimed(WithdrawalClaimed {
+                            delegator,
+                            validator: *addr,
+                            undelegationId: 0,
+                            amount,
+                        }),
+                    ),
+                )
+                .await;
+            block_num += 1;
+        }
+
+        // The WithdrawalClaimed events were skipped (undelegationId=0). The Withdrawal
+        // events consumed num_v1_claims pending undelegations by amount-matching,
+        // so num_v2_claims remain (which validators they belong to is non-deterministic).
+        let wallet = block.state.wallets.get(&delegator).unwrap();
+        assert_eq!(wallet.pending_undelegations.len(), num_v2_claims);
         assert_eq!(wallet.pending_exits.len(), 0);
     }
 
