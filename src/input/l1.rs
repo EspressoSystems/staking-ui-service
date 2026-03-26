@@ -909,16 +909,53 @@ impl Snapshot {
                         )
                     });
 
-                    if !wallet.pending_undelegations.contains_key(&ev.validator) {
+                    // For V2 undelegations (ID >= 1), the pending undelegation must exist
+                    // for the exact validator.
+                    //
+                    // For legacy V1 undelegations (ID == 0), the pending undelegation for
+                    // this validator may have been consumed by a V1 Withdrawal event that
+                    // matched by amount instead of by validator. In that case, find any
+                    // pending undelegation with the same amount to reconcile the state.
+                    // The linear scan is acceptable since this only applies to legacy V1
+                    // undelegations on the Decaf testnet.
+                    let node = if wallet.pending_undelegations.contains_key(&ev.validator) {
+                        ev.validator
+                    } else if ev.undelegationId == 0 {
+                        if let Some((_, pending)) = wallet
+                            .pending_undelegations
+                            .iter()
+                            .find(|(_, p)| p.amount == ev.amount)
+                        {
+                            tracing::warn!(
+                                delegator = %ev.delegator,
+                                validator = %ev.validator,
+                                matched_node = %pending.node,
+                                amount = %ev.amount,
+                                "WithdrawalClaimed for legacy V1 undelegation matched \
+                                 different pending undelegation by amount"
+                            );
+                            pending.node
+                        } else {
+                            tracing::warn!(
+                                delegator = %ev.delegator,
+                                validator = %ev.validator,
+                                amount = %ev.amount,
+                                "ignoring WithdrawalClaimed for legacy V1 undelegation \
+                                 with no matching pending undelegation"
+                            );
+                            return (vec![], vec![]);
+                        }
+                    } else {
                         panic!(
-                            "got WithdrawalClaimed but no pending undelegation for delegator {} validator {} amount {}",
+                            "got WithdrawalClaimed but no pending undelegation for \
+                             delegator {} validator {} amount {}",
                             ev.delegator, ev.validator, ev.amount
                         );
-                    }
+                    };
 
                     let withdrawal = Withdrawal {
                         delegator: ev.delegator,
-                        node: ev.validator,
+                        node,
                         amount: ev.amount,
                     };
                     let wallet_diff = WalletDiff::UndelegationWithdrawal(withdrawal);
@@ -1142,7 +1179,7 @@ impl Wallet {
                     // ONLY ON DECAF this is ok. The legacy withdrawal event does not contain
                     // enough information to accurately correlate every withdrawal to the correct
                     // pending withdrawal. Thus, it is possible that a previous withdrawal that was
-                    // meant to clear a pending undelegation from this node got misinterpeted as
+                    // meant to clear a pending undelegation from this node got misinterpreted as
                     // clearing a different undelegation, leaving a stale undelegation to this node
                     // in the wallet state. Now, having overwritten this stale undelegation with a
                     // fresh one, our state should once again match the contract state.
