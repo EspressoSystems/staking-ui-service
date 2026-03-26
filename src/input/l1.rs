@@ -2366,17 +2366,16 @@ mod test {
     }
 
     /// Regression test for the Decaf testnet crash: the service panicked on
-    /// `WithdrawalClaimed(undelegationId=0)` because it expected a matching pending
-    /// undelegation that had already been consumed by a V1 `Withdrawal` for an
-    /// undelegation by the same delegator and amount from a different validator.
+    /// `WithdrawalClaimed(undelegationId=0)` because it expected a matching pending undelegation
+    /// that had already been consumed by a V1 `Withdrawal` for an undelegation by the same
+    /// delegator and amount from a different validator.
     ///
-    /// Each undelegation is claimed via either a V1 `Withdrawal` or a V2
-    /// `WithdrawalClaimed`, never both. The V1 `Withdrawal(account, amount)` has no
-    /// validator address, so the service matches pending undelegations by amount.
-    /// When multiple pending undelegations have the same amount, it may consume the
-    /// wrong one. The `WithdrawalClaimed(undelegationId=0)` is now skipped since the
-    /// V1 `Withdrawal` already handled the claim. This may leave stale pending
-    /// undelegations on Decaf, which is acceptable for a testnet.
+    /// Each undelegation is claimed via either a V1 `Withdrawal` or a V2 `WithdrawalClaimed`, never
+    /// both. The V1 `Withdrawal(account, amount)` has no validator address, so the service matches
+    /// pending undelegations by amount. When multiple pending undelegations have the same amount,
+    /// it may consume the wrong one. The `WithdrawalClaimed(undelegationId=0)` are now skipped
+    /// because the withdrawal from this validator may have been "accidentally" consumed by the
+    /// amount matching logic.
     #[test_log::test(tokio::test(flavor = "multi_thread"))]
     async fn test_legacy_v1_withdrawal_claimed_is_ignored() {
         let delegator = Address::random();
@@ -2459,9 +2458,9 @@ mod test {
         let wallet = block.state.wallets.get(&delegator).unwrap();
         assert_eq!(wallet.pending_undelegations.len(), num_v2_claims);
 
-        // V2 WithdrawalClaimed with undelegationId=0 for the V2 validators. These are
-        // legacy claims that get skipped (the V1 Withdrawal already handled the actual
-        // withdrawal). Must not panic.
+        // WithdrawalClaimed with undelegationId=0 for each V2 validator. These are
+        // skipped because the V1 Withdrawal amount-matching may have already consumed
+        // this validator's pending undelegation. Must not panic.
         for (addr, _) in &v2_validators {
             block = block
                 .next(
@@ -2479,10 +2478,9 @@ mod test {
             block_num += 1;
         }
 
-        // The V2 WithdrawalClaimed events were skipped (undelegationId=0). The V1
-        // Withdrawals cleared num_v1_claims pending undelegations, so num_v2_claims
-        // remain (though which validators they belong to is non-deterministic due to
-        // amount-matching).
+        // The WithdrawalClaimed events were skipped (undelegationId=0). The V1
+        // Withdrawals consumed num_v1_claims pending undelegations by amount-matching,
+        // so num_v2_claims remain (which validators they belong to is non-deterministic).
         let wallet = block.state.wallets.get(&delegator).unwrap();
         assert_eq!(wallet.pending_undelegations.len(), num_v2_claims);
         assert_eq!(wallet.pending_exits.len(), 0);
