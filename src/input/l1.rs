@@ -2383,8 +2383,8 @@ mod test {
         let num_v1_claims = 5;
         let num_v2_claims = 5;
 
-        // Validators whose undelegations will be claimed via V1 Withdrawal.
-        let v1_validators: Vec<_> = (0..num_v1_claims)
+        // Validators whose undelegations will be claimed via Withdrawal event.
+        let claim_v1_vals: Vec<_> = (0..num_v1_claims)
             .map(|_| {
                 let reg = validator_registered_event(rand::thread_rng());
                 let addr = reg.account;
@@ -2392,8 +2392,8 @@ mod test {
             })
             .collect();
 
-        // Validators whose undelegations will be claimed via V2 WithdrawalClaimed.
-        let v2_validators: Vec<_> = (0..num_v2_claims)
+        // Validators whose undelegations will be claimed via WithdrawalClaimed event.
+        let claim_v2_vals: Vec<_> = (0..num_v2_claims)
             .map(|_| {
                 let reg = validator_registered_event(rand::thread_rng());
                 let addr = reg.account;
@@ -2403,10 +2403,10 @@ mod test {
 
         // Block 1: Register all validators, delegate the same amount to each.
         let mut events = Vec::new();
-        for (_, reg) in v1_validators.iter().chain(v2_validators.iter()) {
+        for (_, reg) in claim_v1_vals.iter().chain(claim_v2_vals.iter()) {
             events.push(StakeTableV2Events::ValidatorRegisteredV2(reg.clone()));
         }
-        for (addr, _) in v1_validators.iter().chain(v2_validators.iter()) {
+        for (addr, _) in claim_v1_vals.iter().chain(claim_v2_vals.iter()) {
             events.push(StakeTableV2Events::Delegated(Delegated {
                 delegator,
                 validator: *addr,
@@ -2417,7 +2417,7 @@ mod test {
 
         // Undelegate from every validator.
         let mut block_num = 2u64;
-        for (addr, _) in v1_validators.iter().chain(v2_validators.iter()) {
+        for (addr, _) in claim_v1_vals.iter().chain(claim_v2_vals.iter()) {
             block = block
                 .next(
                     &NoMetadata,
@@ -2437,9 +2437,9 @@ mod test {
         let wallet = block.state.wallets.get(&delegator).unwrap();
         assert_eq!(wallet.pending_undelegations.len(), total);
 
-        // Claim the V1 validators via V1 Withdrawal. Each matches by amount (no
-        // validator address), so may consume a V2 validator's pending undelegation
-        // instead of the intended one.
+        // Claim via Withdrawal events. Each matches by amount (no validator address),
+        // so may consume another validator's pending undelegation instead of the
+        // intended one.
         for _ in 0..num_v1_claims {
             block = block
                 .next(
@@ -2458,10 +2458,10 @@ mod test {
         let wallet = block.state.wallets.get(&delegator).unwrap();
         assert_eq!(wallet.pending_undelegations.len(), num_v2_claims);
 
-        // WithdrawalClaimed with undelegationId=0 for each V2 validator. These are
-        // skipped because the V1 Withdrawal amount-matching may have already consumed
+        // WithdrawalClaimed with undelegationId=0 for each remaining validator. These
+        // are skipped because the Withdrawal amount-matching may have already consumed
         // this validator's pending undelegation. Must not panic.
-        for (addr, _) in &v2_validators {
+        for (addr, _) in &claim_v2_vals {
             block = block
                 .next(
                     &NoMetadata,
@@ -2478,8 +2478,8 @@ mod test {
             block_num += 1;
         }
 
-        // The WithdrawalClaimed events were skipped (undelegationId=0). The V1
-        // Withdrawals consumed num_v1_claims pending undelegations by amount-matching,
+        // The WithdrawalClaimed events were skipped (undelegationId=0). The Withdrawal
+        // events consumed num_v1_claims pending undelegations by amount-matching,
         // so num_v2_claims remain (which validators they belong to is non-deterministic).
         let wallet = block.state.wallets.get(&delegator).unwrap();
         assert_eq!(wallet.pending_undelegations.len(), num_v2_claims);
