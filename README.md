@@ -70,7 +70,7 @@ There are three long-lived branches:
 
   ```sh
   git checkout release-decaf
-  git pull
+  git pull --rebase
   git rebase origin/main
   git push --force
   ```
