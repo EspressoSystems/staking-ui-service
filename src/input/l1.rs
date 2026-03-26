@@ -902,6 +902,21 @@ impl Snapshot {
                     );
                 }
                 StakeTableV2Events::WithdrawalClaimed(ev) => {
+                    // V2 undelegation IDs start from 1. ID 0 is reserved for legacy V1
+                    // undelegations whose claims are already handled by the V1 Withdrawal
+                    // event. Skip to avoid double-counting. May happen on Decaf, must
+                    // not happen on mainnet.
+                    if ev.undelegationId == 0 {
+                        tracing::warn!(
+                            delegator = %ev.delegator,
+                            validator = %ev.validator,
+                            amount = %ev.amount,
+                            "ignoring WithdrawalClaimed for legacy V1 undelegation. \
+                             May happen on Decaf, must not happen on mainnet."
+                        );
+                        return (vec![], vec![]);
+                    }
+
                     let wallet = self.wallets.get(&ev.delegator).unwrap_or_else(|| {
                         panic!(
                             "got WithdrawalClaimed event for non existent wallet: {}",
@@ -909,49 +924,15 @@ impl Snapshot {
                         )
                     });
 
-                    // For V2 undelegations (ID >= 1), the pending undelegation must exist
-                    // for the exact validator.
-                    //
-                    // For legacy V1 undelegations (ID == 0), the pending undelegation for
-                    // this validator may have been consumed by a V1 Withdrawal event that
-                    // matched by amount instead of by validator. In that case, find any
-                    // pending undelegation with the same amount to reconcile the state.
-                    // The linear scan is acceptable since this only applies to legacy V1
-                    // undelegations on the Decaf testnet.
-                    let node = if wallet.pending_undelegations.contains_key(&ev.validator) {
-                        ev.validator
-                    } else if ev.undelegationId == 0 {
-                        if let Some((_, pending)) = wallet
-                            .pending_undelegations
-                            .iter()
-                            .find(|(_, p)| p.amount == ev.amount)
-                        {
-                            tracing::warn!(
-                                delegator = %ev.delegator,
-                                validator = %ev.validator,
-                                matched_node = %pending.node,
-                                amount = %ev.amount,
-                                "WithdrawalClaimed for legacy V1 undelegation matched \
-                                 different pending undelegation by amount"
-                            );
-                            pending.node
-                        } else {
-                            tracing::warn!(
-                                delegator = %ev.delegator,
-                                validator = %ev.validator,
-                                amount = %ev.amount,
-                                "ignoring WithdrawalClaimed for legacy V1 undelegation \
-                                 with no matching pending undelegation"
-                            );
-                            return (vec![], vec![]);
-                        }
-                    } else {
+                    if !wallet.pending_undelegations.contains_key(&ev.validator) {
                         panic!(
                             "got WithdrawalClaimed but no pending undelegation for \
                              delegator {} validator {} amount {}",
                             ev.delegator, ev.validator, ev.amount
                         );
-                    };
+                    }
+
+                    let node = ev.validator;
 
                     let withdrawal = Withdrawal {
                         delegator: ev.delegator,
@@ -2386,14 +2367,13 @@ mod test {
 
     /// Regression test for the Decaf testnet crash.
     ///
-    /// The V1 `Withdrawal(account, amount)` event has no validator address, so the
-    /// service matches pending undelegations by amount. When a delegator has multiple
-    /// pending undelegations with the same amount to different validators, the V1
-    /// `Withdrawal` may consume the wrong one. Later, the V2 contract emits
-    /// `WithdrawalClaimed` with `undelegationId=0` for the undelegation that was
-    /// actually claimed, but the service already cleared it (or a different one with
-    /// the same amount). The `WithdrawalClaimed` handler falls back to clearing any
-    /// pending undelegation with the matching amount, reconciling the state.
+    /// Each undelegation is claimed via either a V1 `Withdrawal` or a V2
+    /// `WithdrawalClaimed`, never both. The V1 `Withdrawal(account, amount)` has no
+    /// validator address, so the service matches pending undelegations by amount.
+    /// When multiple pending undelegations have the same amount, it may consume the
+    /// wrong one. The later `WithdrawalClaimed(undelegationId=0)` for a different
+    /// undelegation is skipped since it is a legacy V1 claim. This may leave stale
+    /// pending undelegations on Decaf, which is acceptable for a testnet.
     #[test_log::test(tokio::test(flavor = "multi_thread"))]
     async fn test_legacy_v1_withdrawal_claimed_is_ignored() {
         let delegator = Address::random();
@@ -2476,10 +2456,9 @@ mod test {
         let wallet = block.state.wallets.get(&delegator).unwrap();
         assert_eq!(wallet.pending_undelegations.len(), num_v2_claims);
 
-        // Claim the V2 validators via V2 WithdrawalClaimed. Their pending
-        // undelegations may or may not still exist (V1 Withdrawals above may have
-        // consumed them by amount). The handler falls back to matching by amount
-        // when the exact validator is not found. Must not panic.
+        // V2 WithdrawalClaimed with undelegationId=0 for the V2 validators. These are
+        // legacy claims that get skipped (the V1 Withdrawal already handled the actual
+        // withdrawal). Must not panic.
         for (addr, _) in &v2_validators {
             block = block
                 .next(
@@ -2497,9 +2476,12 @@ mod test {
             block_num += 1;
         }
 
-        // All undelegations accounted for.
+        // The V2 WithdrawalClaimed events were skipped (undelegationId=0). The V1
+        // Withdrawals cleared num_v1_claims pending undelegations, so num_v2_claims
+        // remain (though which validators they belong to is non-deterministic due to
+        // amount-matching).
         let wallet = block.state.wallets.get(&delegator).unwrap();
-        assert_eq!(wallet.pending_undelegations.len(), 0);
+        assert_eq!(wallet.pending_undelegations.len(), num_v2_claims);
         assert_eq!(wallet.pending_exits.len(), 0);
     }
 
