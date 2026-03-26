@@ -2365,15 +2365,18 @@ mod test {
         assert_eq!(wallet.pending_exits.len(), 0);
     }
 
-    /// Regression test for the Decaf testnet crash.
+    /// Regression test for the Decaf testnet crash: the service panicked on
+    /// `WithdrawalClaimed(undelegationId=0)` because it expected a matching pending
+    /// undelegation that had already been consumed by a V1 `Withdrawal` for an
+    /// undelegation by the same delegator and amount from a different validator.
     ///
     /// Each undelegation is claimed via either a V1 `Withdrawal` or a V2
     /// `WithdrawalClaimed`, never both. The V1 `Withdrawal(account, amount)` has no
     /// validator address, so the service matches pending undelegations by amount.
     /// When multiple pending undelegations have the same amount, it may consume the
-    /// wrong one. The later `WithdrawalClaimed(undelegationId=0)` for a different
-    /// undelegation is skipped since it is a legacy V1 claim. This may leave stale
-    /// pending undelegations on Decaf, which is acceptable for a testnet.
+    /// wrong one. The `WithdrawalClaimed(undelegationId=0)` is now skipped since the
+    /// V1 `Withdrawal` already handled the claim. This may leave stale pending
+    /// undelegations on Decaf, which is acceptable for a testnet.
     #[test_log::test(tokio::test(flavor = "multi_thread"))]
     async fn test_legacy_v1_withdrawal_claimed_is_ignored() {
         let delegator = Address::random();
