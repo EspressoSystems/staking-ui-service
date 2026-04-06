@@ -60,7 +60,8 @@ impl Persistence {
                 .ok_or_else(|| anyhow::anyhow!("invalid path"))?,
         )?
         .create_if_missing(true)
-        .log_statements(LevelFilter::Debug);
+        .log_statements(LevelFilter::Debug)
+        .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal);
 
         // Create connection pool
         let pool = SqlitePoolOptions::new()
