@@ -12,7 +12,7 @@ use alloy::{
     eips::{BlockId, BlockNumberOrTag},
     primitives::utils::format_ether,
     providers::Provider,
-    rpc::types::Filter,
+    rpc::types::{Filter, Log},
     sol_types::SolEventInterface,
 };
 use hotshot_contract_adapter::sol_types::{
@@ -100,51 +100,76 @@ pub async fn load_genesis(
 pub async fn get_initial_token_supply(
     provider: &impl Provider,
     stake_table: Address,
+    chunk_size: u64,
 ) -> Result<ESPTokenAmount> {
     // Get the token contract from the stake table contract.
-    let stake_table = StakeTableV2::new(stake_table, provider);
-    let token =
-        stake_table.token().call().await.context(|| {
+    let stake_table_contract = StakeTableV2::new(stake_table, provider);
+    let token_address =
+        stake_table_contract.token().call().await.context(|| {
             Error::internal().context("getting token address from stake table contract")
         })?;
-    let token = EspToken::new(token, provider);
+    let token = EspToken::new(token_address, provider);
 
-    // Get the transaction where the token contract was initialized.
-    let init_logs = token
+    // Try a full-range query first, falling back to a chunked backwards scan if the provider
+    // rejects it (some enforce a max block range). The first initialization event is the original
+    // one with the mint; later ones are emitted on contract upgrades.
+    let init_log = match token
         .Initialized_filter()
         .from_block(0)
         .to_block(BlockNumberOrTag::Finalized)
         .query()
         .await
-        .context(|| Error::internal().context("getting token initialized block"))?;
-    // Take the first initialization event. This will be the one with the mint event. Subsequent
-    // initialized events are emitted when the contract is updated to new versions.
-    let init_log = &init_logs
-        .first()
-        .ok_or_else(|| Error::internal().context("missing token initialized event"))?
-        .1;
+    {
+        Ok(init_logs) => {
+            init_logs
+                .into_iter()
+                .next()
+                .ok_or_else(|| Error::internal().context("missing token initialized event"))?
+                .1
+        }
+        Err(err) => {
+            tracing::warn!(%err, "full-range token Initialized query failed, falling back to scan");
+            let stake_table_init_block = stake_table_contract
+                .initializedAtBlock()
+                .call()
+                .await
+                .context(|| Error::internal().context("getting stake table initialization block"))?
+                .to::<u64>();
+            scan_token_contract_initialized_event_log(
+                provider,
+                token_address,
+                stake_table_init_block,
+                chunk_size,
+            )
+            .await?
+        }
+    };
+
+    let init_block = init_log
+        .block_number
+        .ok_or_else(|| Error::internal().context("missing token initialization block number"))?;
     let init_tx_hash = init_log.transaction_hash.ok_or_else(|| {
         Error::internal().context("missing token initialization transaction hash")
     })?;
-    let init_tx = provider
-        .get_transaction_receipt(init_tx_hash)
+
+    // Query Transfer events in the initialization block instead of fetching the transaction
+    // receipt, which pruned L1 nodes may not have.
+    let transfer_logs = token
+        .Transfer_filter()
+        .from_block(init_block)
+        .to_block(init_block)
+        .query()
         .await
-        .context(|| {
-            Error::internal()
-                .context("getting receipt for token initialization transaction {init_tx_hash}")
-        })?
+        .context(|| Error::internal().context("getting Transfer logs at token init block"))?;
+
+    let (mint_transfer, _) = transfer_logs
+        .iter()
+        .find(|(_, log)| log.transaction_hash == Some(init_tx_hash))
         .ok_or_else(|| {
             Error::internal().context(format!(
-                "missing receipt for token initialization transaction {init_tx_hash}"
+                "token initialization transaction {init_tx_hash} is missing mint transfer"
             ))
         })?;
-
-    // Now we can get the initial mint transfer event from the initializing transaction.
-    let mint_transfer = init_tx.decoded_log::<EspToken::Transfer>().ok_or_else(|| {
-        Error::internal().context(format!(
-            "token initialization transaction {init_tx_hash} is missing mint transfer"
-        ))
-    })?;
 
     tracing::debug!(?mint_transfer, "mint transfer event");
     ensure!(
@@ -158,6 +183,54 @@ pub async fn get_initial_token_supply(
     let initial_supply = mint_transfer.value;
     tracing::info!("Initial token amount: {} ESP", format_ether(initial_supply));
     Ok(initial_supply)
+}
+
+/// Bounds the backwards scan. Real deployments have a gap of a handful of blocks (24 on mainnet, 3
+/// on decaf), but on slow-deploy testnets with 1s blocks the gap can grow to many days.
+const MAX_BLOCKS_SCANNED: u64 = 500_000;
+
+/// Scan backwards from the stake table init block to find the token's `Initialized` event. Used
+/// when a full-range query is rejected for exceeding the provider's max block range.
+async fn scan_token_contract_initialized_event_log(
+    provider: &impl Provider,
+    token_address: Address,
+    stake_table_init_block: u64,
+    chunk_size: u64,
+) -> Result<Log> {
+    let token = EspToken::new(token_address, provider);
+    let mut total_scanned = 0u64;
+    let mut to_block = stake_table_init_block;
+    let mut from_block = stake_table_init_block.saturating_sub(chunk_size);
+
+    loop {
+        if total_scanned >= MAX_BLOCKS_SCANNED {
+            return Err(Error::internal().context(format!(
+                "exceeded max scan range ({MAX_BLOCKS_SCANNED}) while searching for token \
+                 Initialized event"
+            )));
+        }
+
+        let init_logs = token
+            .Initialized_filter()
+            .from_block(from_block)
+            .to_block(to_block)
+            .query()
+            .await
+            .context(|| {
+                Error::internal().context(format!(
+                    "scanning Initialized events [{from_block}, {to_block}]"
+                ))
+            })?;
+
+        if let Some((_, init_log)) = init_logs.into_iter().next() {
+            tracing::info!(from_block, "found token Initialized event during scan");
+            return Ok(init_log);
+        }
+
+        total_scanned += chunk_size;
+        to_block = to_block.saturating_sub(chunk_size);
+        from_block = from_block.saturating_sub(chunk_size);
+    }
 }
 
 pub(super) async fn get_events(
@@ -237,7 +310,7 @@ pub(super) async fn get_events(
 mod test {
     use alloy::{
         node_bindings::Anvil,
-        primitives::U256,
+        primitives::{U256, utils::parse_ether},
         providers::{ProviderBuilder, WalletProvider, ext::AnvilApi},
         signers::local::MnemonicBuilder,
     };
@@ -477,7 +550,7 @@ mod test {
             .unwrap();
 
         assert_eq!(
-            get_initial_token_supply(&provider, deployment.stake_table_addr)
+            get_initial_token_supply(&provider, deployment.stake_table_addr, 10_000)
                 .await
                 .unwrap(),
             U256::try_from(initial_token_supply).unwrap()
@@ -485,5 +558,65 @@ mod test {
                     .unwrap()
                     .pow(decimals.try_into().unwrap())
         );
+
+        // The chunked scan fallback finds the same Initialized event as the full-range query.
+        let full_init_log = token
+            .Initialized_filter()
+            .from_block(0)
+            .to_block(BlockNumberOrTag::Finalized)
+            .query()
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+            .1;
+        let stake_table_init_block = StakeTableV2::new(deployment.stake_table_addr, &provider)
+            .initializedAtBlock()
+            .call()
+            .await
+            .unwrap()
+            .to::<u64>();
+        let scan_init_log = scan_token_contract_initialized_event_log(
+            &provider,
+            deployment.token_addr,
+            stake_table_init_block,
+            5,
+        )
+        .await
+        .unwrap();
+        assert_eq!(scan_init_log.block_number, full_init_log.block_number);
+        assert_eq!(
+            scan_init_log.transaction_hash,
+            full_init_log.transaction_hash
+        );
+    }
+
+    #[ignore]
+    #[test_log::test(tokio::test)]
+    async fn test_get_initial_token_supply_decaf() {
+        let provider = ProviderBuilder::new()
+            .connect_http("https://ethereum-sepolia.publicnode.com".parse().unwrap());
+        let stake_table: Address = "0x40304fbe94d5e7d1492dd90c53a2d63e8506a037"
+            .parse()
+            .unwrap();
+        let supply = get_initial_token_supply(&provider, stake_table, 100)
+            .await
+            .unwrap();
+        assert_eq!(supply, parse_ether("10000000000").unwrap());
+    }
+
+    #[ignore]
+    #[test_log::test(tokio::test)]
+    async fn test_get_initial_token_supply_mainnet() {
+        let provider = ProviderBuilder::new()
+            .connect_http("https://ethereum-rpc.publicnode.com".parse().unwrap());
+        let stake_table: Address = "0xcef474d372b5b09defe2af187bf17338dc704451"
+            .parse()
+            .unwrap();
+        let supply = get_initial_token_supply(&provider, stake_table, 100)
+            .await
+            .unwrap();
+        assert_eq!(supply, parse_ether("3590000000").unwrap());
     }
 }
