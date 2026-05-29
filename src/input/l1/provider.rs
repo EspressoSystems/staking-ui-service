@@ -111,8 +111,9 @@ pub async fn get_initial_token_supply(
     let token = EspToken::new(token_address, provider);
 
     // Try a full-range query first, falling back to a chunked backwards scan if the provider
-    // rejects it (some enforce a max block range). The first initialization event is the original
-    // one with the mint; later ones are emitted on contract upgrades.
+    // rejects it (some enforce a max block range). The mint happens in the original `initializer`,
+    // which emits `Initialized(1)`; later versions (e.g. the V2 upgrade) emit higher versions
+    // without minting, so we match on version 1 rather than event order.
     let init_log = match token
         .Initialized_filter()
         .from_block(0)
@@ -123,7 +124,7 @@ pub async fn get_initial_token_supply(
         Ok(init_logs) => {
             init_logs
                 .into_iter()
-                .next()
+                .find(|(event, _)| event.version == 1)
                 .ok_or_else(|| Error::internal().context("missing token initialized event"))?
                 .1
         }
@@ -189,8 +190,9 @@ pub async fn get_initial_token_supply(
 /// on decaf), but on slow-deploy testnets with 1s blocks the gap can grow to many days.
 const MAX_BLOCKS_SCANNED: u64 = 500_000;
 
-/// Scan backwards from the stake table init block to find the token's `Initialized` event. Used
-/// when a full-range query is rejected for exceeding the provider's max block range.
+/// Scan backwards from the stake table init block to find the token's `Initialized(1)` event (the
+/// original mint). Used when a full-range query is rejected for exceeding the provider's max block
+/// range.
 async fn scan_token_contract_initialized_event_log(
     provider: &impl Provider,
     token_address: Address,
@@ -222,7 +224,7 @@ async fn scan_token_contract_initialized_event_log(
                 ))
             })?;
 
-        if let Some((_, init_log)) = init_logs.into_iter().next() {
+        if let Some((_, init_log)) = init_logs.into_iter().find(|(event, _)| event.version == 1) {
             tracing::info!(from_block, "found token Initialized event during scan");
             return Ok(init_log);
         }
@@ -588,6 +590,38 @@ mod test {
         assert_eq!(scan_init_log.block_number, full_init_log.block_number);
         assert_eq!(
             scan_init_log.transaction_hash,
+            full_init_log.transaction_hash
+        );
+
+        // Regression: the token is upgraded to V2 via `reinitializer(2)`, which emits a second
+        // `Initialized(2)` event at a higher block than the original mint's `Initialized(1)`. When
+        // the scan starts above the V2 event, it must skip it and return the version 1 event with
+        // the mint, not the most recent one.
+        let all_init_logs = token
+            .Initialized_filter()
+            .from_block(0)
+            .to_block(BlockNumberOrTag::Finalized)
+            .query()
+            .await
+            .unwrap();
+        let v2_block = all_init_logs
+            .iter()
+            .find(|(event, _)| event.version == 2)
+            .expect("token V2 upgrade emits Initialized(2)")
+            .1
+            .block_number
+            .unwrap();
+        let scan_above_v2 = scan_token_contract_initialized_event_log(
+            &provider,
+            deployment.token_addr,
+            v2_block,
+            1,
+        )
+        .await
+        .unwrap();
+        assert_eq!(scan_above_v2.block_number, full_init_log.block_number);
+        assert_eq!(
+            scan_above_v2.transaction_hash,
             full_init_log.transaction_hash
         );
     }
