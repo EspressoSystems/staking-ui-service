@@ -101,7 +101,7 @@ impl QueryServiceOptions {
 #[derive(Clone, Debug)]
 pub struct QueryServiceClient {
     inner: Client<hotshot_query_service::Error, FormatVersion>,
-    /// JSON client for node/validators to workaronud bincode breakage
+    /// JSON client for node/validators to workaround bincode breakage
     client_json: Client<hotshot_query_service::Error, FormatVersion>,
     epoch_start_block: u64,
     epoch_height: u64,
