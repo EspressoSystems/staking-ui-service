@@ -229,6 +229,13 @@ async fn scan_token_contract_initialized_event_log(
             return Ok(init_log);
         }
 
+        // We have scanned down to genesis without finding the event. This should not happen since
+        // the token is initialized before the stake table.
+        if from_block == 0 {
+            return Err(Error::internal()
+                .context("reached block 0 without finding token Initialized(1) event"));
+        }
+
         total_scanned += chunk_size;
         to_block = to_block.saturating_sub(chunk_size);
         from_block = from_block.saturating_sub(chunk_size);
