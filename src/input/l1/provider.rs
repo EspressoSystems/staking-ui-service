@@ -12,7 +12,7 @@ use alloy::{
     eips::{BlockId, BlockNumberOrTag},
     primitives::utils::format_ether,
     providers::Provider,
-    rpc::types::Filter,
+    rpc::types::{Filter, Log},
     sol_types::SolEventInterface,
 };
 use hotshot_contract_adapter::sol_types::{
@@ -96,33 +96,64 @@ pub async fn load_genesis(
 }
 
 /// Get the amount of Espresso tokens issued in the initial mint event.
+///
+/// `events_max_block_range` is the chunk size used when falling back to a backwards scan because
+/// the wide-range `eth_getLogs` query is rejected by the L1 RPC (e.g. reth's default 100k cap).
 #[instrument(skip(provider))]
 pub async fn get_initial_token_supply(
     provider: &impl Provider,
     stake_table: Address,
+    events_max_block_range: u64,
 ) -> Result<ESPTokenAmount> {
     // Get the token contract from the stake table contract.
-    let stake_table = StakeTableV2::new(stake_table, provider);
-    let token =
-        stake_table.token().call().await.context(|| {
+    let stake_table_contract = StakeTableV2::new(stake_table, provider);
+    let token_address =
+        stake_table_contract.token().call().await.context(|| {
             Error::internal().context("getting token address from stake table contract")
         })?;
-    let token = EspToken::new(token, provider);
+    let token = EspToken::new(token_address, provider);
 
-    // Get the transaction where the token contract was initialized.
-    let init_logs = token
+    // The stake table is deployed after the token, so the token's Initialized event is at or
+    // before this block. Used as the upper bound for the backwards-scan fallback.
+    let stake_table_init_block = stake_table_contract
+        .initializedAtBlock()
+        .block(BlockId::finalized())
+        .call()
+        .await
+        .context(|| Error::internal().context("getting stake table initialized block"))?
+        .to::<u64>();
+
+    // Try a single wide-range query first. This works against dev-mode L1 nodes and archive nodes
+    // without a block-range cap. If the RPC rejects it (e.g. JSON-RPC -32602 "query exceeds max
+    // block range"), fall back to scanning backwards in fixed-size chunks.
+    let wide_range_result = token
         .Initialized_filter()
         .from_block(0)
         .to_block(BlockNumberOrTag::Finalized)
         .query()
-        .await
-        .context(|| Error::internal().context("getting token initialized block"))?;
+        .await;
     // Take the first initialization event. This will be the one with the mint event. Subsequent
     // initialized events are emitted when the contract is updated to new versions.
-    let init_log = &init_logs
-        .first()
-        .ok_or_else(|| Error::internal().context("missing token initialized event"))?
-        .1;
+    let init_log = match wide_range_result {
+        Ok(init_logs) => init_logs
+            .first()
+            .ok_or_else(|| Error::internal().context("missing token initialized event"))?
+            .1
+            .clone(),
+        Err(err) => {
+            tracing::warn!(
+                "wide-range query for token Initialized event failed ({err:#}), falling back to \
+                 chunked backwards scan"
+            );
+            scan_token_initialized_event(
+                provider,
+                token_address,
+                stake_table_init_block,
+                events_max_block_range,
+            )
+            .await?
+        },
+    };
     let init_tx_hash = init_log.transaction_hash.ok_or_else(|| {
         Error::internal().context("missing token initialization transaction hash")
     })?;
@@ -158,6 +189,68 @@ pub async fn get_initial_token_supply(
     let initial_supply = mint_transfer.value;
     tracing::info!("Initial token amount: {} ESP", format_ether(initial_supply));
     Ok(initial_supply)
+}
+
+/// Scans backwards in fixed-size block ranges for the token contract's `Initialized` event.
+///
+/// Used as a fallback when the full-range `Initialized_filter().from_block(0).to_block(Finalized)`
+/// query is rejected by the L1 RPC because the range exceeds its `eth_getLogs` block-range cap
+/// (e.g. reth defaults to 100k blocks, JSON-RPC error -32602).
+///
+/// Starts at the stake table contract's init block (the token is deployed before the stake table,
+/// so the event is at or before this block) and scans backwards in chunks of `chunk_size` until
+/// it finds the event or scans `MAX_BLOCKS_SCANNED` blocks total.
+async fn scan_token_initialized_event(
+    provider: &impl Provider,
+    token_address: Address,
+    stake_table_init_block: u64,
+    chunk_size: u64,
+) -> Result<Log> {
+    const MAX_BLOCKS_SCANNED: u64 = 200_000;
+    ensure!(
+        chunk_size > 0,
+        Error::internal().context("chunk size must be non-zero for token Initialized event scan")
+    );
+
+    let token = EspToken::new(token_address, provider);
+    let mut total_scanned: u64 = 0;
+    let mut to_block = stake_table_init_block;
+    let mut from_block = stake_table_init_block.saturating_sub(chunk_size);
+
+    loop {
+        tracing::debug!(from_block, to_block, "scanning for token Initialized event");
+        let init_logs = token
+            .Initialized_filter()
+            .from_block(from_block)
+            .to_block(to_block)
+            .query()
+            .await
+            .context(|| Error::internal().context("scanning for token Initialized event"))?;
+
+        if let Some((_, log)) = init_logs.first() {
+            tracing::info!(
+                from_block,
+                to_block,
+                tx_hash = ?log.transaction_hash,
+                "found token Initialized event during chunked scan"
+            );
+            return Ok(log.clone());
+        }
+
+        total_scanned = total_scanned.saturating_add(chunk_size);
+        if from_block == 0 {
+            return Err(Error::internal()
+                .context("scanned back to block 0 without finding token Initialized event"));
+        }
+        if total_scanned >= MAX_BLOCKS_SCANNED {
+            return Err(Error::internal().context(format!(
+                "exceeded {MAX_BLOCKS_SCANNED} block scan limit while searching for token \
+                 Initialized event"
+            )));
+        }
+        to_block = from_block;
+        from_block = from_block.saturating_sub(chunk_size);
+    }
 }
 
 pub(super) async fn get_events(
@@ -477,13 +570,50 @@ mod test {
             .unwrap();
 
         assert_eq!(
-            get_initial_token_supply(&provider, deployment.stake_table_addr)
+            get_initial_token_supply(&provider, deployment.stake_table_addr, 10_000)
                 .await
                 .unwrap(),
             U256::try_from(initial_token_supply).unwrap()
                 * U256::try_from(10)
                     .unwrap()
                     .pow(decimals.try_into().unwrap())
+        );
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_scan_token_initialized_event_chunked() {
+        // Deploy contracts, then mine extra blocks so the token Initialized event is several
+        // chunks behind the stake table init block, and verify that the chunked backwards scan
+        // finds it.
+        let anvil = Anvil::new().args(["--slots-in-an-epoch", "0"]).spawn();
+        let rpc_url: Url = anvil.endpoint().parse().unwrap();
+        let deployment = ContractDeployment::deploy(rpc_url.clone()).await.unwrap();
+        let provider = ProviderBuilder::new().connect_http(rpc_url);
+
+        // Move the head a few chunks past the stake table init block to force the scan to walk
+        // backwards in multiple iterations before reaching the event.
+        provider.anvil_mine(Some(20), None).await.unwrap();
+
+        let stake_table_contract = StakeTableV2::new(deployment.stake_table_addr, &provider);
+        let stake_table_init_block = stake_table_contract
+            .initializedAtBlock()
+            .call()
+            .await
+            .unwrap()
+            .to::<u64>();
+        let token_address = stake_table_contract.token().call().await.unwrap();
+
+        // Tiny chunk size guarantees the first chunk doesn't cover the event.
+        let log = scan_token_initialized_event(&provider, token_address, stake_table_init_block, 3)
+            .await
+            .unwrap();
+        let init_block = log
+            .block_number
+            .expect("Initialized log must have a block number");
+        assert!(
+            init_block <= stake_table_init_block,
+            "Initialized event ({init_block}) must be at or before stake table init block \
+             ({stake_table_init_block})"
         );
     }
 }
