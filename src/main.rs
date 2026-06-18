@@ -111,8 +111,12 @@ impl Options {
         tracing::info!(?genesis_block, "loaded L1 genesis");
         let genesis = Snapshot::empty(genesis_block);
 
-        let initial_token_supply =
-            get_initial_token_supply(&l1_provider, self.l1_options.stake_table_address).await?;
+        let initial_token_supply = get_initial_token_supply(
+            &l1_provider,
+            self.l1_options.stake_table_address,
+            self.l1_options.l1_events_max_block_range,
+        )
+        .await?;
 
         // Connect to L1.
         let l1_catchup = RpcCatchup::new(&self.l1_options)?;
