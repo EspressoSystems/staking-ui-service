@@ -1457,7 +1457,7 @@ mod test {
     use espresso_types::{RegisteredValidatorMap, StakeTableState, v0_3::StakeTableEvent};
     use hotshot_contract_adapter::sol_types::StakeTableV3::{
         Delegated, ExitEscrowPeriodUpdated, MetadataUriUpdated, P2pAddrUpdated, Undelegated,
-        ValidatorExit, ValidatorRegisteredV2, Withdrawal, X25519KeyUpdated, WithdrawalClaimed,
+        ValidatorExit, ValidatorRegisteredV2, Withdrawal, WithdrawalClaimed, X25519KeyUpdated,
     };
     use pretty_assertions::assert_eq;
     use reqwest::Url;
@@ -2604,10 +2604,10 @@ mod test {
         // Block 1: Register all validators, delegate the same amount to each.
         let mut events = Vec::new();
         for (_, reg) in claim_v1_vals.iter().chain(claim_v2_vals.iter()) {
-            events.push(StakeTableV2Events::ValidatorRegisteredV2(reg.clone()));
+            events.push(StakeTableV3Events::ValidatorRegisteredV2(reg.clone()));
         }
         for (addr, _) in claim_v1_vals.iter().chain(claim_v2_vals.iter()) {
-            events.push(StakeTableV2Events::Delegated(Delegated {
+            events.push(StakeTableV3Events::Delegated(Delegated {
                 delegator,
                 validator: *addr,
                 amount,
@@ -2621,7 +2621,7 @@ mod test {
             block = block
                 .next(
                     &NoMetadata,
-                    &BlockInput::empty(block_num).with_event(StakeTableV2Events::Undelegated(
+                    &BlockInput::empty(block_num).with_event(StakeTableV3Events::Undelegated(
                         Undelegated {
                             delegator,
                             validator: *addr,
@@ -2644,7 +2644,7 @@ mod test {
             block = block
                 .next(
                     &NoMetadata,
-                    &BlockInput::empty(block_num).with_event(StakeTableV2Events::Withdrawal(
+                    &BlockInput::empty(block_num).with_event(StakeTableV3Events::Withdrawal(
                         Withdrawal {
                             account: delegator,
                             amount,
@@ -2666,7 +2666,7 @@ mod test {
                 .next(
                     &NoMetadata,
                     &BlockInput::empty(block_num).with_event(
-                        StakeTableV2Events::WithdrawalClaimed(WithdrawalClaimed {
+                        StakeTableV3Events::WithdrawalClaimed(WithdrawalClaimed {
                             delegator,
                             validator: *addr,
                             undelegationId: 0,
