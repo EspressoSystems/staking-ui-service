@@ -2,6 +2,7 @@
 
 use std::{
     collections::{BTreeMap, HashMap},
+    fmt,
     sync::Arc,
     time::Duration,
 };
@@ -14,9 +15,12 @@ use futures::{
     future::join_all,
     stream::{Stream, StreamExt},
 };
-use hotshot_contract_adapter::sol_types::{
-    RewardClaim::RewardClaimEvents,
-    StakeTableV2::{StakeTableV2Events, ValidatorRegistered},
+use hotshot_contract_adapter::{
+    sol_types::{
+        RewardClaim::RewardClaimEvents,
+        StakeTableV3::{StakeTableV3Events, ValidatorRegistered},
+    },
+    stake_table::StakeTableSolError,
 };
 use hotshot_types::light_client::StateVerKey;
 use tokio::time::sleep;
@@ -640,42 +644,66 @@ impl Snapshot {
         tracing::debug!("processing L1 event");
         match event {
             L1Event::StakeTable(ev) => match ev.as_ref() {
-                StakeTableV2Events::ValidatorRegisteredV2(ev) => {
-                    // Authenticate signatures.
-                    if let Err(err) = ev.authenticate() {
-                        // The contract doesn't check all the signatures, so it's possible that an
-                        // invalid event got through. We can safely just ignore it as the consensus
-                        // protocol will do the same.
-                        tracing::warn!("got invalid ValidatorRegisteredV2 event: {err:#}");
-                        return Default::default();
-                    }
-
-                    // Downgrade the event: apart from authentication and metadata, the V2 event
-                    // contains the same information as the V1 event, and can be converted to a node
-                    // the same way.
-                    let legacy = ValidatorRegistered {
-                        account: ev.account,
-                        blsVk: ev.blsVK,
-                        commission: ev.commission,
-                        schnorrVk: ev.schnorrVK,
+                // V2 events remain in the on-chain history, so both must be handled. The V3 event
+                // additionally carries an x25519 key and p2p address, which this service ignores.
+                ev @ (StakeTableV3Events::ValidatorRegisteredV2(_)
+                | StakeTableV3Events::ValidatorRegisteredV3(_)) => {
+                    // Authenticate signatures. The contract doesn't check all the signatures, so an
+                    // invalid event may get through. We can safely ignore it as the consensus
+                    // protocol will do the same.
+                    let (mut node, metadata_uri): (NodeSetEntry, &str) = match ev {
+                        StakeTableV3Events::ValidatorRegisteredV2(ev) => {
+                            let (bls, schnorr) = match ev.authenticate() {
+                                Ok(keys) => keys,
+                                Err(err) => {
+                                    tracing::warn!(
+                                        "got invalid ValidatorRegisteredV2 event: {err:#}"
+                                    );
+                                    return Default::default();
+                                }
+                            };
+                            (
+                                node_set_entry(ev.account, ev.commission, bls, schnorr),
+                                &ev.metadataUri,
+                            )
+                        }
+                        StakeTableV3Events::ValidatorRegisteredV3(ev) => {
+                            let (bls, schnorr) = match ev.authenticate() {
+                                Ok(keys) => keys,
+                                Err(err) => {
+                                    tracing::warn!(
+                                        "got invalid ValidatorRegisteredV3 event: {err:#}"
+                                    );
+                                    return Default::default();
+                                }
+                            };
+                            (
+                                node_set_entry(ev.account, ev.commission, bls, schnorr),
+                                &ev.metadataUri,
+                            )
+                        }
+                        _ => unreachable!(),
                     };
-                    let mut node: NodeSetEntry = (&legacy).into();
 
                     // Download third-party metadata.
                     node.metadata = metadata_fetcher
-                        .fetch_infallible_authenticated(&ev.metadataUri, &node.staking_key)
+                        .fetch_infallible_authenticated(metadata_uri, &node.staking_key)
                         .await;
 
                     (vec![FullNodeSetDiff::NodeUpdate(Arc::new(node))], vec![])
                 }
-                StakeTableV2Events::ValidatorRegistered(ev) => {
+                StakeTableV3Events::ValidatorRegistered(ev) => {
                     tracing::warn!("received legacy ValidatorRegistered event");
-                    (
-                        vec![FullNodeSetDiff::NodeUpdate(Arc::new(ev.into()))],
-                        vec![],
-                    )
+                    let node = match NodeSetEntry::try_from(ev) {
+                        Ok(node) => node,
+                        Err(err) => {
+                            tracing::warn!("got invalid ValidatorRegistered event: {err:#}");
+                            return Default::default();
+                        }
+                    };
+                    (vec![FullNodeSetDiff::NodeUpdate(Arc::new(node))], vec![])
                 }
-                StakeTableV2Events::ExitEscrowPeriodUpdated(ev) => {
+                StakeTableV3Events::ExitEscrowPeriodUpdated(ev) => {
                     // This should be quite rare, we can be a little loud about it.
                     tracing::warn!(
                         old = self.block.exit_escrow_period,
@@ -688,13 +716,13 @@ impl Snapshot {
                     // on the node set or the wallets.
                     (vec![], vec![])
                 }
-                ev @ (StakeTableV2Events::ValidatorExit(_)
-                | StakeTableV2Events::ValidatorExitV2(_)) => {
+                ev @ (StakeTableV3Events::ValidatorExit(_)
+                | StakeTableV3Events::ValidatorExitV2(_)) => {
                     let (validator, exit_time) = match ev {
-                        StakeTableV2Events::ValidatorExit(e) => {
+                        StakeTableV3Events::ValidatorExit(e) => {
                             (e.validator, timestamp + self.block.exit_escrow_period)
                         }
-                        StakeTableV2Events::ValidatorExitV2(e) => {
+                        StakeTableV3Events::ValidatorExitV2(e) => {
                             (e.validator, e.unlocksAt.to::<u64>())
                         }
                         _ => unreachable!(),
@@ -734,7 +762,22 @@ impl Snapshot {
 
                     (vec![node_diff], wallet_diffs)
                 }
-                StakeTableV2Events::ConsensusKeysUpdated(ev) => {
+                StakeTableV3Events::ConsensusKeysUpdated(ev) => {
+                    let staking_key = match PubKey::try_from(ev.blsVK) {
+                        Ok(key) => key,
+                        Err(err) => {
+                            tracing::warn!("got invalid ConsensusKeysUpdated bls key: {err:#}");
+                            return Default::default();
+                        }
+                    };
+                    let state_key = match StateVerKey::try_from(ev.schnorrVK) {
+                        Ok(key) => key,
+                        Err(err) => {
+                            tracing::warn!("got invalid ConsensusKeysUpdated schnorr key: {err:#}");
+                            return Default::default();
+                        }
+                    };
+
                     let node = self.node_set.get(&ev.account).unwrap_or_else(|| {
                         panic!(
                             "got ConsensusKeysUpdated event for non existent validator: {}",
@@ -743,17 +786,20 @@ impl Snapshot {
                     });
 
                     let diff = FullNodeSetDiff::NodeUpdate(Arc::new(NodeSetEntry {
-                        staking_key: PubKey::from(ev.blsVK).into(),
-                        state_key: StateVerKey::from(ev.schnorrVK).into(),
+                        staking_key: staking_key.into(),
+                        state_key: state_key.into(),
                         ..node.clone()
                     }));
                     (vec![diff], vec![])
                 }
-                StakeTableV2Events::ConsensusKeysUpdatedV2(ev) => {
-                    if let Err(err) = ev.authenticate() {
-                        tracing::warn!("got invalid ConsensusKeysUpdatedV2 event: {err:#}");
-                        return Default::default();
-                    }
+                StakeTableV3Events::ConsensusKeysUpdatedV2(ev) => {
+                    let (staking_key, state_key) = match ev.authenticate() {
+                        Ok(keys) => keys,
+                        Err(err) => {
+                            tracing::warn!("got invalid ConsensusKeysUpdatedV2 event: {err:#}");
+                            return Default::default();
+                        }
+                    };
 
                     let node = self.node_set.get(&ev.account).unwrap_or_else(|| {
                         panic!(
@@ -763,13 +809,13 @@ impl Snapshot {
                     });
 
                     let diff = FullNodeSetDiff::NodeUpdate(Arc::new(NodeSetEntry {
-                        staking_key: PubKey::from(ev.blsVK).into(),
-                        state_key: StateVerKey::from(ev.schnorrVK).into(),
+                        staking_key: staking_key.into(),
+                        state_key: state_key.into(),
                         ..node.clone()
                     }));
                     (vec![diff], vec![])
                 }
-                StakeTableV2Events::CommissionUpdated(ev) => {
+                StakeTableV3Events::CommissionUpdated(ev) => {
                     let node = self.node_set.get(&ev.validator).unwrap_or_else(|| {
                         panic!(
                             "got CommissionUpdated event for non existent validator: {}",
@@ -786,7 +832,7 @@ impl Snapshot {
                     }));
                     (vec![diff], vec![])
                 }
-                StakeTableV2Events::MetadataUriUpdated(ev) => {
+                StakeTableV3Events::MetadataUriUpdated(ev) => {
                     let node = self.node_set.get(&ev.validator).unwrap_or_else(|| {
                         panic!(
                             "got MetadataUriUpdated event for non existent validator: {}",
@@ -801,7 +847,7 @@ impl Snapshot {
                     }));
                     (vec![diff], vec![])
                 }
-                StakeTableV2Events::Delegated(ev) => {
+                StakeTableV3Events::Delegated(ev) => {
                     let node = self.node_set.get(&ev.validator).unwrap_or_else(|| {
                         panic!(
                             "got Delegated event for non existent validator: {}",
@@ -824,15 +870,15 @@ impl Snapshot {
                     (vec![node_diff], vec![(ev.delegator, wallet_diff)])
                 }
                 ev
-                @ (StakeTableV2Events::Undelegated(_) | StakeTableV2Events::UndelegatedV2(_)) => {
+                @ (StakeTableV3Events::Undelegated(_) | StakeTableV3Events::UndelegatedV2(_)) => {
                     let (validator, delegator, amount, available_time) = match ev {
-                        StakeTableV2Events::Undelegated(e) => (
+                        StakeTableV3Events::Undelegated(e) => (
                             e.validator,
                             e.delegator,
                             e.amount,
                             timestamp + self.block.exit_escrow_period,
                         ),
-                        StakeTableV2Events::UndelegatedV2(e) => {
+                        StakeTableV3Events::UndelegatedV2(e) => {
                             (e.validator, e.delegator, e.amount, e.unlocksAt.to::<u64>())
                         }
                         _ => unreachable!(),
@@ -859,20 +905,20 @@ impl Snapshot {
                 }
                 // Legacy withdrawal event from the old StakeTable contract.
                 //
-                // The new StakeTableV2 contract emits `WithdrawalClaimed` and
+                // The new StakeTableV3 contract emits `WithdrawalClaimed` and
                 // `ValidatorExitClaimed` events which include the validator address.
                 //
                 // This event should never be emitted on mainnet because
                 // mainnet will have new stake table contract
-                StakeTableV2Events::Withdrawal(ev) => {
+                StakeTableV3Events::Withdrawal(ev) => {
                     panic!(
                         "Received legacy Withdrawal event account={}, amount={}. \
                         This event is from the old StakeTable contract.
-                        The StakeTableV2 contract emits WithdrawalClaimed and ValidatorExitClaimed instead.",
+                        The StakeTableV3 contract emits WithdrawalClaimed and ValidatorExitClaimed instead.",
                         ev.account, ev.amount
                     );
                 }
-                StakeTableV2Events::WithdrawalClaimed(ev) => {
+                StakeTableV3Events::WithdrawalClaimed(ev) => {
                     let wallet = self.wallets.get(&ev.delegator).unwrap_or_else(|| {
                         panic!(
                             "got WithdrawalClaimed event for non existent wallet: {}",
@@ -895,7 +941,7 @@ impl Snapshot {
                     let wallet_diff = WalletDiff::UndelegationWithdrawal(withdrawal);
                     (vec![], vec![(ev.delegator, wallet_diff)])
                 }
-                StakeTableV2Events::ValidatorExitClaimed(ev) => {
+                StakeTableV3Events::ValidatorExitClaimed(ev) => {
                     let wallet = self.wallets.get(&ev.delegator).unwrap_or_else(|| {
                         panic!(
                             "got ValidatorExitClaimed event for non existent wallet: {}",
@@ -922,17 +968,19 @@ impl Snapshot {
                 // (rather than matching on _) so that it is clear that we are not missing any
                 // important events, and if new event types are added, the compiler will force us to
                 // handle them explicitly.
-                StakeTableV2Events::MaxCommissionIncreaseUpdated(_)
-                | StakeTableV2Events::MinDelegateAmountUpdated(_)
-                | StakeTableV2Events::MinCommissionUpdateIntervalUpdated(_)
-                | StakeTableV2Events::OwnershipTransferred(_)
-                | StakeTableV2Events::Paused(_)
-                | StakeTableV2Events::Unpaused(_)
-                | StakeTableV2Events::Initialized(_)
-                | StakeTableV2Events::RoleAdminChanged(_)
-                | StakeTableV2Events::RoleGranted(_)
-                | StakeTableV2Events::RoleRevoked(_)
-                | StakeTableV2Events::Upgraded(_) => {
+                StakeTableV3Events::X25519KeyUpdated(_)
+                | StakeTableV3Events::P2pAddrUpdated(_)
+                | StakeTableV3Events::MaxCommissionIncreaseUpdated(_)
+                | StakeTableV3Events::MinDelegateAmountUpdated(_)
+                | StakeTableV3Events::MinCommissionUpdateIntervalUpdated(_)
+                | StakeTableV3Events::OwnershipTransferred(_)
+                | StakeTableV3Events::Paused(_)
+                | StakeTableV3Events::Unpaused(_)
+                | StakeTableV3Events::Initialized(_)
+                | StakeTableV3Events::RoleAdminChanged(_)
+                | StakeTableV3Events::RoleGranted(_)
+                | StakeTableV3Events::RoleRevoked(_)
+                | StakeTableV3Events::Upgraded(_) => {
                     tracing::debug!("skipping irrelevant event");
                     (vec![], vec![])
                 }
@@ -1199,13 +1247,34 @@ pub struct BlockInput {
 }
 
 /// The set of L1 events that we care about.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub enum L1Event {
     /// An event emitted by the reward claim contract.
     Reward(Arc<RewardClaimEvents>),
 
     /// An event emitted by the stake table contract.
-    StakeTable(Arc<StakeTableV2Events>),
+    StakeTable(Arc<StakeTableV3Events>),
+}
+
+// The generated sol event enums no longer derive `Debug`, but they do implement `Serialize`, so
+// render their contents as JSON.
+impl fmt::Debug for L1Event {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Reward(e) => write!(
+                f,
+                "Reward({})",
+                serde_json::to_string(e).unwrap_or_default()
+            ),
+            Self::StakeTable(e) => {
+                write!(
+                    f,
+                    "StakeTable({})",
+                    serde_json::to_string(e).unwrap_or_default()
+                )
+            }
+        }
+    }
 }
 
 impl From<RewardClaimEvents> for L1Event {
@@ -1214,24 +1283,41 @@ impl From<RewardClaimEvents> for L1Event {
     }
 }
 
-impl From<StakeTableV2Events> for L1Event {
-    fn from(event: StakeTableV2Events) -> Self {
+impl From<StakeTableV3Events> for L1Event {
+    fn from(event: StakeTableV3Events) -> Self {
         Self::StakeTable(Arc::new(event))
     }
 }
 
-impl From<&ValidatorRegistered> for NodeSetEntry {
-    fn from(e: &ValidatorRegistered) -> Self {
-        NodeSetEntry {
-            address: e.account,
-            staking_key: PubKey::from(e.blsVk).into(),
-            state_key: StateVerKey::from(e.schnorrVk).into(),
-            commission: Ratio::new(e.commission as usize, COMMISSION_BASIS_POINTS as usize),
-            // All nodes start with 0 stake, a separate delegation event will be generated when
-            // someone delegates non-zero stake to a node.
-            stake: ESPTokenAmount::ZERO,
-            metadata: None,
-        }
+/// Build a node set entry from already-parsed consensus keys.
+fn node_set_entry(
+    address: Address,
+    commission: u16,
+    staking_key: PubKey,
+    state_key: StateVerKey,
+) -> NodeSetEntry {
+    NodeSetEntry {
+        address,
+        staking_key: staking_key.into(),
+        state_key: state_key.into(),
+        commission: Ratio::new(commission as usize, COMMISSION_BASIS_POINTS as usize),
+        // All nodes start with 0 stake, a separate delegation event will be generated when someone
+        // delegates non-zero stake to a node.
+        stake: ESPTokenAmount::ZERO,
+        metadata: None,
+    }
+}
+
+impl TryFrom<&ValidatorRegistered> for NodeSetEntry {
+    type Error = StakeTableSolError;
+
+    fn try_from(e: &ValidatorRegistered) -> std::result::Result<Self, Self::Error> {
+        Ok(node_set_entry(
+            e.account,
+            e.commission,
+            PubKey::try_from(e.blsVk)?,
+            StateVerKey::try_from(e.schnorrVk)?,
+        ))
     }
 }
 
@@ -1309,11 +1395,12 @@ mod test {
         },
         types::common::{Address, NodeMetadataContent},
     };
-    use alloy::primitives::U256;
+    use alloy::primitives::{FixedBytes, U256};
     use espresso_types::{RegisteredValidatorMap, StakeTableState, v0_3::StakeTableEvent};
-    use hotshot_contract_adapter::sol_types::StakeTableV2::{
-        Delegated, ExitEscrowPeriodUpdated, MetadataUriUpdated, Undelegated, ValidatorExit,
-        ValidatorExitClaimed, ValidatorRegisteredV2, WithdrawalClaimed,
+    use hotshot_contract_adapter::sol_types::StakeTableV3::{
+        Delegated, ExitEscrowPeriodUpdated, MetadataUriUpdated, P2pAddrUpdated, Undelegated,
+        ValidatorExit, ValidatorExitClaimed, ValidatorRegisteredV2, WithdrawalClaimed,
+        X25519KeyUpdated,
     };
     use pretty_assertions::assert_eq;
     use reqwest::Url;
@@ -1327,10 +1414,11 @@ mod test {
     use crate::{
         input::l1::testing::{
             CatchupFromEvents, EventGenerator, InputGenerator, NoCatchup, block_snapshot,
-            subscribe_until, validator_registered_event,
+            subscribe_until, validator_registered_event, validator_registered_v3_event,
         },
         types::common::{Delegation, Ratio},
     };
+    use rand::{SeedableRng, rngs::StdRng};
 
     /// Generate a test [`State`] from a list of L1 blocks.
     fn from_blocks<S: Default, M: Default>(
@@ -1371,7 +1459,7 @@ mod test {
                 Ratio::new(validator.commission.into(), 10_000),
             );
             assert_eq!(node.stake, validator.stake);
-            assert_eq!(node.staking_key, validator.stake_table_key.into());
+            assert_eq!(node.staking_key, validator.stake_table_key.unwrap().into());
         }
     }
 
@@ -1537,6 +1625,118 @@ mod test {
     }
 
     #[test_log::test(tokio::test)]
+    async fn test_register_validator_v3() {
+        // Regression: StakeTableV3 introduced ValidatorRegisteredV3, X25519KeyUpdated, and
+        // P2pAddrUpdated events. The service previously only decoded StakeTableV2 events and
+        // panicked on any V3 event. A V3 registration must produce a node the same as V2, ignoring
+        // the x25519 key and p2p address.
+        let event = validator_registered_v3_event(StdRng::seed_from_u64(0));
+        let input = BlockInput::empty(1)
+            .with_event(StakeTableV3Events::ValidatorRegisteredV3(event.clone()));
+        let block = BlockData::empty(0).next(&NoMetadata, &input).await;
+
+        let node = block
+            .state
+            .node_set
+            .get(&event.account)
+            .expect("V3-registered node present in node set");
+        assert_eq!(node.address, event.account);
+        assert_eq!(
+            node.staking_key,
+            PubKey::try_from(event.blsVK).unwrap().into()
+        );
+        assert_eq!(
+            node.state_key,
+            StateVerKey::try_from(event.schnorrVK).unwrap().into()
+        );
+        assert_eq!(
+            node.commission,
+            Ratio::new(event.commission as usize, COMMISSION_BASIS_POINTS as usize),
+        );
+        assert_eq!(node.stake, ESPTokenAmount::ZERO);
+
+        // The V3-only X25519KeyUpdated and P2pAddrUpdated events carry networking data the service
+        // ignores. Applying them must not panic and must not change the node set.
+        let x25519 = BlockInput::empty(2).with_event(StakeTableV3Events::X25519KeyUpdated(
+            X25519KeyUpdated {
+                validator: event.account,
+                x25519Key: FixedBytes::<32>::with_last_byte(2),
+            },
+        ));
+        let p2p =
+            BlockInput::empty(3).with_event(StakeTableV3Events::P2pAddrUpdated(P2pAddrUpdated {
+                validator: event.account,
+                p2pAddr: "/ip4/127.0.0.1/tcp/5678".into(),
+            }));
+        let block = block.next(&NoMetadata, &x25519).await;
+        assert_eq!(block.node_set_update.as_deref(), Some(&[][..]));
+        let block = block.next(&NoMetadata, &p2p).await;
+        assert_eq!(block.node_set_update.as_deref(), Some(&[][..]));
+        assert_eq!(block.state.node_set.get(&event.account), Some(node));
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_register_validator_v2() {
+        // The V2 registration event predates V3 but stays in on-chain history, so it must still
+        // produce a node.
+        let event = validator_registered_event(StdRng::seed_from_u64(1));
+        let input = BlockInput::empty(1)
+            .with_event(StakeTableV3Events::ValidatorRegisteredV2(event.clone()));
+        let block = BlockData::empty(0).next(&NoMetadata, &input).await;
+
+        let node = block
+            .state
+            .node_set
+            .get(&event.account)
+            .expect("V2-registered node present in node set");
+        assert_eq!(
+            node.staking_key,
+            PubKey::try_from(event.blsVK).unwrap().into()
+        );
+        assert_eq!(
+            node.state_key,
+            StateVerKey::try_from(event.schnorrVK).unwrap().into()
+        );
+        assert_eq!(
+            node.commission,
+            Ratio::new(event.commission as usize, COMMISSION_BASIS_POINTS as usize),
+        );
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_register_validator_v1() {
+        // The original (V1) registration event has no signatures and predates V2/V3 but stays in
+        // on-chain history, so it must still produce a node.
+        let v2 = validator_registered_event(StdRng::seed_from_u64(2));
+        let event = ValidatorRegistered {
+            account: v2.account,
+            blsVk: v2.blsVK,
+            schnorrVk: v2.schnorrVK,
+            commission: v2.commission,
+        };
+        let input = BlockInput::empty(1).with_event(StakeTableV3Events::ValidatorRegistered(event));
+        let block = BlockData::empty(0).next(&NoMetadata, &input).await;
+
+        let node = block
+            .state
+            .node_set
+            .get(&event.account)
+            .expect("V1-registered node present in node set");
+        assert_eq!(
+            node.staking_key,
+            PubKey::try_from(event.blsVk).unwrap().into()
+        );
+        assert_eq!(
+            node.state_key,
+            StateVerKey::try_from(event.schnorrVk).unwrap().into()
+        );
+        assert_eq!(
+            node.commission,
+            Ratio::new(event.commission as usize, COMMISSION_BASIS_POINTS as usize),
+        );
+    }
+
+    #[test_log::test(tokio::test)]
     async fn test_replay_consistency() {
         let mut block = BlockData::empty(0);
         let mut state = StakeTableState::default();
@@ -1557,7 +1757,8 @@ mod test {
             for event in &input.events {
                 if let L1Event::StakeTable(e) = event {
                     let Ok(stake_table_event) = e.as_ref().clone().try_into() else {
-                        tracing::info!(?e, "skipping GCL-irrelevant contract event");
+                        let event = serde_json::to_string(e.as_ref()).unwrap();
+                        tracing::info!(%event, "skipping GCL-irrelevant contract event");
                         continue;
                     };
                     state.apply_event(stake_table_event).unwrap().unwrap();
@@ -1885,7 +2086,7 @@ mod test {
     /// * if an event is invalid, the state is not modified and no updates are recorded.
     async fn test_events(
         metadata_fetcher: &impl MetadataFetcher,
-        events: impl IntoIterator<Item = StakeTableV2Events>,
+        events: impl IntoIterator<Item = StakeTableV3Events>,
     ) -> BlockData {
         let mut curr = BlockData::empty(0);
         let mut stake_table = StakeTableState::default();
@@ -1928,7 +2129,7 @@ mod test {
         event.metadataUri = "".into();
         let block = test_events(
             &NoMetadata,
-            [StakeTableV2Events::ValidatorRegisteredV2(event.clone())],
+            [StakeTableV3Events::ValidatorRegisteredV2(event.clone())],
         )
         .await;
         let expected = NodeSetEntry::from_event_no_metadata(&event);
@@ -1949,7 +2150,7 @@ mod test {
 
         let block = test_events(
             &NoMetadata,
-            [StakeTableV2Events::ValidatorRegisteredV2(event)],
+            [StakeTableV3Events::ValidatorRegisteredV2(event)],
         )
         .await;
         assert_eq!(block.state.node_set.len(), 0);
@@ -1964,7 +2165,7 @@ mod test {
 
         let block = test_events(
             &NoMetadata,
-            [StakeTableV2Events::ValidatorRegisteredV2(event)],
+            [StakeTableV3Events::ValidatorRegisteredV2(event)],
         )
         .await;
         assert_eq!(block.state.node_set.len(), 0);
@@ -1976,8 +2177,8 @@ mod test {
         let next = test_events(
             &NoMetadata,
             [
-                StakeTableV2Events::ValidatorRegisteredV2(node.clone()),
-                StakeTableV2Events::ValidatorExit(ValidatorExit {
+                StakeTableV3Events::ValidatorRegisteredV2(node.clone()),
+                StakeTableV3Events::ValidatorExit(ValidatorExit {
                     validator: node.account,
                 }),
             ],
@@ -1997,7 +2198,7 @@ mod test {
     async fn test_event_validator_exit_invalid_not_found() {
         test_events(
             &NoMetadata,
-            [StakeTableV2Events::ValidatorExit(ValidatorExit {
+            [StakeTableV3Events::ValidatorExit(ValidatorExit {
                 validator: Address::random(),
             })],
         )
@@ -2010,7 +2211,7 @@ mod test {
         node.metadataUri = "".into();
         let block = test_events(
             &NoMetadata,
-            [StakeTableV2Events::ValidatorRegisteredV2(node.clone())],
+            [StakeTableV3Events::ValidatorRegisteredV2(node.clone())],
         )
         .await;
         assert_eq!(block.state.node_set[&node.account].metadata, None);
@@ -2021,8 +2222,8 @@ mod test {
         let mut node = validator_registered_event(rand::thread_rng());
         node.metadataUri = "https://testmetadata.com".to_string();
         let block: BlockData = test_events(
-            &ConstMetadata::with_key(node.blsVK.into()),
-            [StakeTableV2Events::ValidatorRegisteredV2(node.clone())],
+            &ConstMetadata::with_key(PubKey::try_from(node.blsVK).unwrap()),
+            [StakeTableV3Events::ValidatorRegisteredV2(node.clone())],
         )
         .await;
         assert_eq!(
@@ -2030,7 +2231,7 @@ mod test {
             Some(NodeMetadata {
                 uri: node.metadataUri.parse().unwrap(),
                 content: Some(NodeMetadataContent {
-                    pub_key: node.blsVK.into(),
+                    pub_key: PubKey::try_from(node.blsVK).unwrap(),
                     ..Default::default()
                 })
             })
@@ -2044,7 +2245,7 @@ mod test {
         let block: BlockData = test_events(
             // Use default metadata, not one with a public key corresponding to this node.
             &ConstMetadata::default(),
-            [StakeTableV2Events::ValidatorRegisteredV2(node.clone())],
+            [StakeTableV3Events::ValidatorRegisteredV2(node.clone())],
         )
         .await;
         assert_eq!(
@@ -2063,8 +2264,8 @@ mod test {
         let block = test_events(
             &ConstMetadata::default(),
             [
-                StakeTableV2Events::ValidatorRegisteredV2(node.clone()),
-                StakeTableV2Events::MetadataUriUpdated(MetadataUriUpdated {
+                StakeTableV3Events::ValidatorRegisteredV2(node.clone()),
+                StakeTableV3Events::MetadataUriUpdated(MetadataUriUpdated {
                     validator: node.account,
                     metadataUri: "".to_string(),
                 }),
@@ -2081,10 +2282,10 @@ mod test {
 
         let uri = "https://testmetadata.com";
         let block = test_events(
-            &ConstMetadata::with_key(node.blsVK.into()),
+            &ConstMetadata::with_key(PubKey::try_from(node.blsVK).unwrap()),
             [
-                StakeTableV2Events::ValidatorRegisteredV2(node.clone()),
-                StakeTableV2Events::MetadataUriUpdated(MetadataUriUpdated {
+                StakeTableV3Events::ValidatorRegisteredV2(node.clone()),
+                StakeTableV3Events::MetadataUriUpdated(MetadataUriUpdated {
                     validator: node.account,
                     metadataUri: uri.to_string(),
                 }),
@@ -2096,7 +2297,7 @@ mod test {
             Some(NodeMetadata {
                 uri: uri.parse().unwrap(),
                 content: Some(NodeMetadataContent {
-                    pub_key: node.blsVK.into(),
+                    pub_key: PubKey::try_from(node.blsVK).unwrap(),
                     ..Default::default()
                 })
             })
@@ -2113,8 +2314,8 @@ mod test {
             // Use default metadata, not one with a public key corresponding to this node.
             &ConstMetadata::default(),
             [
-                StakeTableV2Events::ValidatorRegisteredV2(node.clone()),
-                StakeTableV2Events::MetadataUriUpdated(MetadataUriUpdated {
+                StakeTableV3Events::ValidatorRegisteredV2(node.clone()),
+                StakeTableV3Events::MetadataUriUpdated(MetadataUriUpdated {
                     validator: node.account,
                     metadataUri: uri.to_string(),
                 }),
@@ -2134,7 +2335,7 @@ mod test {
     async fn test_exit_escrow_period_updated() {
         let block = test_events(
             &NoMetadata,
-            [StakeTableV2Events::ExitEscrowPeriodUpdated(
+            [StakeTableV3Events::ExitEscrowPeriodUpdated(
                 ExitEscrowPeriodUpdated {
                     newExitEscrowPeriod: 12345,
                 },
@@ -2151,13 +2352,13 @@ mod test {
         node.metadataUri = "".into();
 
         let input = BlockInput::empty(1)
-            .with_event(StakeTableV2Events::ValidatorRegisteredV2(node.clone()))
-            .with_event(StakeTableV2Events::ExitEscrowPeriodUpdated(
+            .with_event(StakeTableV3Events::ValidatorRegisteredV2(node.clone()))
+            .with_event(StakeTableV3Events::ExitEscrowPeriodUpdated(
                 ExitEscrowPeriodUpdated {
                     newExitEscrowPeriod: genesis.block().exit_escrow_period + 100,
                 },
             ))
-            .with_event(StakeTableV2Events::ValidatorExit(ValidatorExit {
+            .with_event(StakeTableV3Events::ValidatorExit(ValidatorExit {
                 validator: node.account,
             }));
         let block = genesis.next(&NoMetadata, &input).await;
@@ -2190,8 +2391,8 @@ mod test {
 
         // Register validator and delegate
         let events = vec![
-            StakeTableV2Events::ValidatorRegisteredV2(validator_reg.clone()),
-            StakeTableV2Events::Delegated(Delegated {
+            StakeTableV3Events::ValidatorRegisteredV2(validator_reg.clone()),
+            StakeTableV3Events::Delegated(Delegated {
                 delegator,
                 validator: validator_address,
                 amount: U256::from(1000),
@@ -2213,7 +2414,7 @@ mod test {
         let block2 = block1
             .next(
                 &NoMetadata,
-                &BlockInput::empty(2).with_event(StakeTableV2Events::Undelegated(Undelegated {
+                &BlockInput::empty(2).with_event(StakeTableV3Events::Undelegated(Undelegated {
                     delegator,
                     validator: validator_address,
                     amount: U256::from(400),
@@ -2243,7 +2444,7 @@ mod test {
         let block3 = block2
             .next(
                 &NoMetadata,
-                &BlockInput::empty(3).with_event(StakeTableV2Events::ValidatorExit(
+                &BlockInput::empty(3).with_event(StakeTableV3Events::ValidatorExit(
                     ValidatorExit {
                         validator: validator_address,
                     },
@@ -2273,7 +2474,7 @@ mod test {
         let block4 = block3
             .next(
                 &NoMetadata,
-                &BlockInput::empty(4).with_event(StakeTableV2Events::WithdrawalClaimed(
+                &BlockInput::empty(4).with_event(StakeTableV3Events::WithdrawalClaimed(
                     WithdrawalClaimed {
                         delegator,
                         validator: validator_address,
@@ -2298,7 +2499,7 @@ mod test {
         let block5 = block4
             .next(
                 &NoMetadata,
-                &BlockInput::empty(5).with_event(StakeTableV2Events::ValidatorExitClaimed(
+                &BlockInput::empty(5).with_event(StakeTableV3Events::ValidatorExitClaimed(
                     ValidatorExitClaimed {
                         delegator,
                         validator: validator_address,
@@ -2396,7 +2597,7 @@ mod test {
             .next(
                 &NoMetadata,
                 &BlockInput::empty(1)
-                    .with_event(StakeTableV2Events::ValidatorRegisteredV2(node.clone())),
+                    .with_event(StakeTableV3Events::ValidatorRegisteredV2(node.clone())),
             )
             .await;
         assert_eq!(
@@ -2411,7 +2612,7 @@ mod test {
         // blocks, we will refresh the node's metadata, which gives us another chance to load it
         // successfully.
         let content = NodeMetadataContent {
-            pub_key: node.blsVK.into(),
+            pub_key: PubKey::try_from(node.blsVK).unwrap(),
             name: Some("refreshed".into()),
             ..Default::default()
         };
@@ -2577,7 +2778,7 @@ mod test {
                 &fetcher,
                 block_id(METADATA_REFRESH_BLOCKS),
                 12 * METADATA_REFRESH_BLOCKS,
-                [&StakeTableV2Events::MetadataUriUpdated(MetadataUriUpdated {
+                [&StakeTableV3Events::MetadataUriUpdated(MetadataUriUpdated {
                     validator: node.address,
                     metadataUri: after.uri.to_string(),
                 })

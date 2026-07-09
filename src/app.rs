@@ -230,8 +230,8 @@ mod test {
     use tokio::{task::spawn, time::sleep};
 
     use crate::types::{common::U256, wallet::WalletDiff};
-    use hotshot_contract_adapter::sol_types::StakeTableV2::{
-        Delegated, StakeTableV2Events, Undelegated,
+    use hotshot_contract_adapter::sol_types::StakeTableV3::{
+        Delegated, StakeTableV3Events, Undelegated,
     };
 
     use crate::{
@@ -367,7 +367,7 @@ mod test {
         let mut inputs = VecStream::infinite();
         inputs.push(
             BlockInput::empty(2)
-                .with_event(StakeTableV2Events::ValidatorRegisteredV2(node.clone())),
+                .with_event(StakeTableV3Events::ValidatorRegisteredV2(node.clone())),
         );
         subscribe_until(&l1, inputs, |l1| l1.latest_l1_block().number == 2).await;
 
@@ -467,8 +467,8 @@ mod test {
 
         inputs.push(
             BlockInput::empty(2)
-                .with_event(StakeTableV2Events::ValidatorRegisteredV2(validator.clone()))
-                .with_event(StakeTableV2Events::Delegated(Delegated {
+                .with_event(StakeTableV3Events::ValidatorRegisteredV2(validator.clone()))
+                .with_event(StakeTableV3Events::Delegated(Delegated {
                     delegator,
                     validator: validator_address,
                     amount: U256::from(1000),
@@ -476,7 +476,7 @@ mod test {
         );
 
         inputs.push(
-            BlockInput::empty(3).with_event(StakeTableV2Events::Undelegated(Undelegated {
+            BlockInput::empty(3).with_event(StakeTableV3Events::Undelegated(Undelegated {
                 delegator,
                 validator: validator_address,
                 amount: U256::from(400),
