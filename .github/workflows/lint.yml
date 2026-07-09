@@ -40,5 +40,8 @@ jobs:
           shared-key: cargo-clippy
       - uses: extractions/setup-just@v3
 
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
       - name: Run clippy
         run: just lint
