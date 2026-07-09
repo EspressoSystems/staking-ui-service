@@ -33,7 +33,9 @@ alloy = { version = "1.0", features = [
 anyhow = "1"
 async-lock = "3.0"
 bigdecimal = "0.4.8"
-bitvec = "1"
+bitvec = { git = "https://github.com/EspressoSystems/bitvec-patch.git", features = [
+    "serde",
+] }
 clap = { version = "4.4", features = ["derive", "env"] }
 cld = "0.5"
 committable = { git = "https://github.com/EspressoSystems/commit.git", features = [
@@ -41,12 +43,12 @@ committable = { git = "https://github.com/EspressoSystems/commit.git", features 
 ] }
 derivative = "2"
 derive_more = "2.0"
-espresso-types = { git = "https://github.com/EspressoSystems/espresso-network.git", tag = "20260414" }
+espresso-types = { git = "https://github.com/EspressoSystems/espresso-network.git", tag = "20260707" }
 futures = "0.3"
 hickory-resolver = "0.25"
-hotshot-contract-adapter = { git = "https://github.com/EspressoSystems/espresso-network.git", tag = "20260414" }
-hotshot-query-service = { git = "https://github.com/EspressoSystems/espresso-network.git", tag = "20260414" }
-hotshot-types = { git = "https://github.com/EspressoSystems/espresso-network.git", tag = "20260414" }
+hotshot-contract-adapter = { git = "https://github.com/EspressoSystems/espresso-network.git", tag = "20260707" }
+hotshot-query-service = { git = "https://github.com/EspressoSystems/espresso-network.git", tag = "20260707" }
+hotshot-types = { git = "https://github.com/EspressoSystems/espresso-network.git", tag = "20260707" }
 im = { version = "15", features = ["serde"] }
 log-panics = { version = "2.0", features = ["with-backtrace"] }
 parking_lot = "0.12"
@@ -68,19 +70,19 @@ vbs = "0.1"
 
 # Testing dependencies
 async-trait = "0.1.89"
-espresso-contract-deployer = { git = "https://github.com/EspressoSystems/espresso-network.git", tag = "20260414", optional = true }
-espresso-node = { git = "https://github.com/EspressoSystems/espresso-network.git", tag = "20260414", features = [
+espresso-contract-deployer = { git = "https://github.com/EspressoSystems/espresso-network.git", tag = "20260707", optional = true }
+espresso-node = { git = "https://github.com/EspressoSystems/espresso-network.git", tag = "20260707", features = [
     "embedded-db",
     "testing",
 ], optional = true }
-hotshot-state-prover = { git = "https://github.com/EspressoSystems/espresso-network.git", tag = "20260414", optional = true }
+hotshot-state-prover = { git = "https://github.com/EspressoSystems/espresso-network.git", tag = "20260707", optional = true }
 jf-signature = { git = "https://github.com/EspressoSystems/jellyfish", tag = "jf-signature-v0.4.0", features = [
     "std",
 ], optional = true }
 pretty_assertions = { version = "1", optional = true }
 rand = { version = "0.8", optional = true }
-staking-cli = { git = "https://github.com/EspressoSystems/espresso-network.git", tag = "20260414", optional = true }
-versions = { git = "https://github.com/EspressoSystems/espresso-network.git", tag = "20260414", optional = true }
+staking-cli = { git = "https://github.com/EspressoSystems/espresso-network.git", tag = "20260707", optional = true }
+versions = { git = "https://github.com/EspressoSystems/espresso-network.git", tag = "20260707", optional = true }
 
 [build-dependencies]
 anyhow = "1"

@@ -525,18 +525,19 @@ impl EpochState {
         let active_nodes = nodes.keys().copied().collect::<Vec<_>>();
         let validators: Vec<_> = nodes.values().cloned().collect();
 
-        // Index active nodes by staking key.
+        // Index active nodes by staking key. `AuthenticatedValidator` guarantees a
+        // consensus key is present, so `stake_table_key()` never panics here.
         let node_index = nodes
             .values()
             .enumerate()
-            .map(|(i, node)| (node.stake_table_key, i))
+            .map(|(i, node)| (*node.stake_table_key(), i))
             .collect();
 
         // Pre-process a randomized committee for leader election.
         let entries = nodes
             .values()
             .map(|node| StakeTableEntry {
-                stake_key: node.stake_table_key,
+                stake_key: *node.stake_table_key(),
                 stake_amount: node.stake,
             })
             .collect();

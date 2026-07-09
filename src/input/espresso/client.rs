@@ -815,10 +815,9 @@ mod test {
     ) -> AuthenticatedValidatorMap {
         network
             .server
-            .consensus()
-            .read()
+            .consensus_handle()
+            .membership_coordinator()
             .await
-            .membership_coordinator
             .stake_table_for_epoch(Some(epoch))
             .await
             .unwrap()

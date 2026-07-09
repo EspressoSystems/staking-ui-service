@@ -106,8 +106,8 @@ impl EspressoClient for MockEspressoClient {
                 let stake = ESPTokenAmount::from(1);
                 let node = RegisteredValidator {
                     account,
-                    stake_table_key,
-                    state_ver_key,
+                    stake_table_key: Some(stake_table_key),
+                    state_ver_key: Some(state_ver_key),
                     x25519_key: None,
                     p2p_addr: None,
                     stake,

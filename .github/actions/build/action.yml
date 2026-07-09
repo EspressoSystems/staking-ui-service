@@ -24,6 +24,10 @@ runs:
     - uses: rui314/setup-mold@v1
     - uses: extractions/setup-just@v3
 
+    - name: Install protoc
+      shell: bash
+      run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
     - uses: Swatinem/rust-cache@v2
       with:
         save-if: ${{ github.ref == 'refs/heads/main'  }}

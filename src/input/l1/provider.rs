@@ -18,7 +18,7 @@ use alloy::{
 use hotshot_contract_adapter::sol_types::{
     EspToken,
     RewardClaim::RewardClaimEvents,
-    StakeTableV2::{self, StakeTableV2Events},
+    StakeTableV3::{self, StakeTableV3Events},
 };
 use tracing::instrument;
 
@@ -27,7 +27,7 @@ pub async fn load_genesis(
     provider: &impl Provider,
     stake_table: Address,
 ) -> Result<L1BlockSnapshot> {
-    let stake_table_contract = StakeTableV2::new(stake_table, provider);
+    let stake_table_contract = StakeTableV3::new(stake_table, provider);
 
     // Fetch the finalized block first.
     // This avoids a race condition where the initialized block could change
@@ -103,7 +103,7 @@ pub async fn get_initial_token_supply(
     chunk_size: u64,
 ) -> Result<ESPTokenAmount> {
     // Get the token contract from the stake table contract.
-    let stake_table_contract = StakeTableV2::new(stake_table, provider);
+    let stake_table_contract = StakeTableV3::new(stake_table, provider);
     let token_address =
         stake_table_contract.token().call().await.context(|| {
             Error::internal().context("getting token address from stake table contract")
@@ -278,7 +278,7 @@ pub(super) async fn get_events(
 
         // Try to decode stake table event
         if log.address() == stake_table_address {
-            let event = StakeTableV2Events::decode_raw_log(log.topics(), &log.data().data)
+            let event = StakeTableV3Events::decode_raw_log(log.topics(), &log.data().data)
                 .unwrap_or_else(|e| {
                     // This is a panic, not an error, as it should be impossible to successfully
                     // retrieve an event from the stake table address but not be able to decode it.
@@ -331,7 +331,7 @@ mod test {
 
     use crate::input::l1::testing::{
         ContractDeployment, DeploymentConfig, assert_events_eq,
-        validator_registered_event_with_account,
+        validator_registered_v3_event_with_account,
     };
 
     use super::*;
@@ -373,7 +373,7 @@ mod test {
             .connect_http(anvil.endpoint_url());
 
         let stake_table_address = deployment.stake_table_addr;
-        let contract = StakeTableV2::new(stake_table_address, &provider);
+        let contract = StakeTableV3::new(stake_table_address, &provider);
 
         // Change the exit escrow period, to verify that the genesis snapshot loads the exit escrow
         // period from the time when the contract was initialized, not what it is now.
@@ -429,21 +429,23 @@ mod test {
                     )
                     .connect_http(anvil.endpoint_url());
                 let address = provider.default_signer_address();
-                let node = validator_registered_event_with_account(
+                let node = validator_registered_v3_event_with_account(
                     StdRng::seed_from_u64(index as u64),
                     address,
                 );
-                let stake_table = StakeTableV2::new(deployment.stake_table_addr, provider.clone());
+                let stake_table = StakeTableV3::new(deployment.stake_table_addr, provider.clone());
                 tracing::info!(index, %address, "submitting registration");
                 async move {
                     let tx = stake_table
-                        .registerValidatorV2(
+                        .registerValidatorV3(
                             node.blsVK,
                             node.schnorrVK,
                             node.blsSig,
                             node.schnorrSig.clone(),
                             node.commission,
-                            "https://example.com/validator-metadata.json".to_string(),
+                            node.metadataUri.clone(),
+                            node.x25519Key,
+                            node.p2pAddr.clone(),
                         )
                         .send()
                         .await
@@ -454,7 +456,7 @@ mod test {
                     tracing::info!(index, "transaction mined");
 
                     let expected_event = L1Event::StakeTable(Arc::new(
-                        StakeTableV2Events::ValidatorRegisteredV2(node),
+                        StakeTableV3Events::ValidatorRegisteredV3(node),
                     ));
                     (receipt, expected_event)
                 }
@@ -580,7 +582,7 @@ mod test {
             .next()
             .unwrap()
             .1;
-        let stake_table_init_block = StakeTableV2::new(deployment.stake_table_addr, &provider)
+        let stake_table_init_block = StakeTableV3::new(deployment.stake_table_addr, &provider)
             .initializedAtBlock()
             .call()
             .await

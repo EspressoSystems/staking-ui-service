@@ -601,10 +601,10 @@ mod tests {
     use committable::Committable;
     use espresso_types::v0::StakeTableState;
     use futures::StreamExt;
-    use hotshot_contract_adapter::sol_types::StakeTableV2::{
+    use hotshot_contract_adapter::sol_types::StakeTableV3::{
         CommissionUpdated, ConsensusKeysUpdated, ConsensusKeysUpdatedV2, Delegated, Undelegated,
         UndelegatedV2, ValidatorExit, ValidatorExitClaimed, ValidatorExitV2, ValidatorRegistered,
-        ValidatorRegisteredV2, WithdrawalClaimed,
+        ValidatorRegisteredV2, ValidatorRegisteredV3, WithdrawalClaimed,
     };
     use staking_cli::demo::DelegationConfig;
     use std::time::Duration;
@@ -949,7 +949,10 @@ mod tests {
             for event in &block_input.events {
                 match event {
                     L1Event::StakeTable(stake_event) => {
-                        println!("Stream event: {stake_event:?}");
+                        println!(
+                            "Stream event: {}",
+                            serde_json::to_string(stake_event.as_ref()).unwrap()
+                        );
                         if let Ok(event) = (**stake_event).clone().try_into() {
                             match stake_table_state_from_stream.apply_event(event) {
                                 Ok(Ok(())) => {}
@@ -1050,7 +1053,8 @@ mod tests {
                                 }
                             }
                         } else {
-                            tracing::info!(?event, "skipping irrelevant contract event");
+                            let event = serde_json::to_string(event.as_ref()).unwrap();
+                            tracing::info!(%event, "skipping irrelevant contract event");
                         }
                     }
                     L1Event::Reward(_) => {}
@@ -1085,6 +1089,7 @@ mod tests {
             .events([
                 ValidatorRegistered::SIGNATURE,
                 ValidatorRegisteredV2::SIGNATURE,
+                ValidatorRegisteredV3::SIGNATURE,
                 ValidatorExit::SIGNATURE,
                 ValidatorExitV2::SIGNATURE,
                 ValidatorExitClaimed::SIGNATURE,
@@ -1250,11 +1255,11 @@ mod tests {
 
             assert_eq!(
                 node.staking_key.to_string(),
-                l1_validator.stake_table_key.to_string(),
+                l1_validator.stake_table_key.unwrap().to_string(),
                 "Staking key mismatch for validator {}: subscription={}, L1={}",
                 node.address,
                 node.staking_key,
-                l1_validator.stake_table_key
+                l1_validator.stake_table_key.unwrap()
             );
 
             let l1_commission_ratio = Ratio::new(l1_validator.commission as usize, 10_000);
