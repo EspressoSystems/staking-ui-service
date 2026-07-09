@@ -604,7 +604,7 @@ mod tests {
     use hotshot_contract_adapter::sol_types::StakeTableV3::{
         CommissionUpdated, ConsensusKeysUpdated, ConsensusKeysUpdatedV2, Delegated, Undelegated,
         UndelegatedV2, ValidatorExit, ValidatorExitClaimed, ValidatorExitV2, ValidatorRegistered,
-        ValidatorRegisteredV2, WithdrawalClaimed,
+        ValidatorRegisteredV2, ValidatorRegisteredV3, WithdrawalClaimed,
     };
     use staking_cli::demo::DelegationConfig;
     use std::time::Duration;
@@ -1089,6 +1089,7 @@ mod tests {
             .events([
                 ValidatorRegistered::SIGNATURE,
                 ValidatorRegisteredV2::SIGNATURE,
+                ValidatorRegisteredV3::SIGNATURE,
                 ValidatorExit::SIGNATURE,
                 ValidatorExitV2::SIGNATURE,
                 ValidatorExitClaimed::SIGNATURE,
