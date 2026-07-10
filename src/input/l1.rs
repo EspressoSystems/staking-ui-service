@@ -40,6 +40,7 @@ use crate::{
     },
 };
 
+pub mod decaf;
 pub mod metadata;
 pub mod options;
 pub mod provider;
