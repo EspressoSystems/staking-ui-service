@@ -25,7 +25,7 @@ pub const L1_CHAIN_ID: u64 = 11_155_111;
 /// `from + 1` and must never replay it.
 pub const GENESIS_BLOCK: u64 = 8_077_808;
 
-/// Last block of the V1 deployment, containing the V1 -> V3 upgrade transaction. Blocks up to and
+/// Last block of the V1 deployment, containing the V1 -> V2 upgrade transaction. Blocks up to and
 /// including this one are served from [`events`] and never fetched over RPC: the V1 encoding,
 /// notably the `Upgrade(address)` log in this block, is not decodable by
 /// `StakeTableV3Events::decode_raw_log`.
