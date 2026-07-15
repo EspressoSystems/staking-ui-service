@@ -169,13 +169,15 @@ mod test {
     use tide_disco::Url;
     use tokio::time::sleep;
 
+    use vbs::version::StaticVersion;
+
     use crate::{
         input::l1::{
             ResettableStream, RpcStream, Snapshot,
             provider::load_genesis,
             testing::{BackgroundStakeTableOps, ContractDeployment, NoMetadata, assert_events_eq},
         },
-        types::common::NodeSetEntry,
+        types::{common::NodeSetEntry, global::FullNodeSetSnapshot},
     };
 
     use super::*;
@@ -313,9 +315,8 @@ mod test {
         }
     }
 
-    /// Keccak over the node set, sorted by address, with the off-chain (mutable, not replayed)
-    /// metadata cleared.
-    fn node_set_hash(nodes: impl IntoIterator<Item = NodeSetEntry>) -> String {
+    /// Nodes sorted by address, with the off-chain (mutable, not replayed) metadata cleared.
+    fn canonical_nodes(nodes: impl IntoIterator<Item = NodeSetEntry>) -> Vec<NodeSetEntry> {
         let mut nodes: Vec<NodeSetEntry> = nodes
             .into_iter()
             .map(|mut node| {
@@ -324,40 +325,42 @@ mod test {
             })
             .collect();
         nodes.sort_by_key(|node| node.address);
-        alloy::primitives::keccak256(serde_json::to_string(&nodes).unwrap()).to_string()
+        nodes
     }
 
-    /// Replays the real Decaf stake table from genesis to [`PINNED_BLOCK`], covering post-upgrade
-    /// claims of V1-era undelegations against the embedded V1 state, and asserts the node set
-    /// matches what the live staking API (running the pre-embedding `release-decaf` code) served
-    /// at that block:
-    ///
-    /// ```sh
-    /// curl https://staking-api.decaf.testnet.espresso.network/v0/staking/nodes/all/<PINNED_HASH>
-    /// ```
-    ///
-    /// hashed with [`node_set_hash`].
+    /// Replays the real Decaf stake table from genesis to the current finalized block, covering
+    /// post-upgrade claims of V1-era undelegations against the embedded V1 state, and asserts the
+    /// node set matches the live staking API's snapshot at the same block.
     #[ignore]
     #[test_log::test(tokio::test)]
     async fn test_decaf_sepolia_full_replay() {
-        const PINNED_BLOCK: u64 = 11_277_610;
-        const PINNED_HASH: &str =
-            "80e934f93f7453d21992fd94a2bc1c9d8db7f995c58247dcbd0227dc4b383551";
-        const NODE_SET_HASH: &str =
-            "0xa4e9ef4ac99c82d70471baa106db550743a4169c8476e182a54ef5a3888332e4";
-
         let rpc_url: Url = std::env::var("DECAF_SEPOLIA_RPC_URL")
             .unwrap_or_else(|_| "https://sepolia.gateway.tenderly.co".into())
             .parse()
             .unwrap();
+        let api_url: Url = std::env::var("DECAF_STAKING_API_URL")
+            .unwrap_or_else(|_| {
+                "https://staking-api.decaf.testnet.espresso.network/v0/staking".into()
+            })
+            .parse()
+            .unwrap();
 
         let provider = ProviderBuilder::new().connect_http(rpc_url.clone());
-        let pinned = provider
-            .get_block(BlockId::number(PINNED_BLOCK))
+        let finalized = provider
+            .get_block(BlockId::finalized())
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(format!("{:x}", pinned.header.hash), PINNED_HASH);
+
+        // Fetch the reference snapshot before the slow replay; the API only serves it while the
+        // block is within its finalized-to-head window.
+        let api = surf_disco::Client::<Error, StaticVersion<0, 1>>::new(api_url);
+        let expected: FullNodeSetSnapshot = api
+            .get(&format!("nodes/all/{:x}", finalized.header.hash))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(expected.l1_block.hash, finalized.header.hash);
 
         let genesis_block = load_genesis(&provider, decaf::STAKE_TABLE).await.unwrap();
         let mut snapshot = Snapshot::empty(genesis_block);
@@ -374,7 +377,7 @@ mod test {
 
         for (id, (timestamp, block_events)) in events
             .into_iter()
-            .filter(|(id, _)| id.number <= PINNED_BLOCK)
+            .filter(|(id, _)| id.number <= finalized.header.number)
         {
             snapshot
                 .apply(&NoMetadata, id, timestamp, &block_events)
@@ -387,8 +390,8 @@ mod test {
             "replay finished"
         );
         assert_eq!(
-            node_set_hash(snapshot.node_set.values().cloned()),
-            NODE_SET_HASH
+            canonical_nodes(snapshot.node_set.values().cloned()),
+            canonical_nodes(expected.nodes)
         );
     }
 }
