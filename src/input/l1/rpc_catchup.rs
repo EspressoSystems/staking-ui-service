@@ -169,10 +169,13 @@ mod test {
     use tide_disco::Url;
     use tokio::time::sleep;
 
-    use crate::input::l1::{
-        ResettableStream, RpcStream, Snapshot,
-        provider::load_genesis,
-        testing::{BackgroundStakeTableOps, ContractDeployment, NoMetadata, assert_events_eq},
+    use crate::{
+        input::l1::{
+            ResettableStream, RpcStream, Snapshot,
+            provider::load_genesis,
+            testing::{BackgroundStakeTableOps, ContractDeployment, NoMetadata, assert_events_eq},
+        },
+        types::common::NodeSetEntry,
     };
 
     use super::*;
@@ -310,17 +313,52 @@ mod test {
         }
     }
 
-    /// Replays the real Decaf stake table from genesis, covering post-upgrade claims of V1-era
-    /// undelegations against the embedded V1 state.
+    /// Keccak over the node set, sorted by address, with the off-chain (mutable, not replayed)
+    /// metadata cleared.
+    fn node_set_hash(nodes: impl IntoIterator<Item = NodeSetEntry>) -> String {
+        let mut nodes: Vec<NodeSetEntry> = nodes
+            .into_iter()
+            .map(|mut node| {
+                node.metadata = None;
+                node
+            })
+            .collect();
+        nodes.sort_by_key(|node| node.address);
+        alloy::primitives::keccak256(serde_json::to_string(&nodes).unwrap()).to_string()
+    }
+
+    /// Replays the real Decaf stake table from genesis to [`PINNED_BLOCK`], covering post-upgrade
+    /// claims of V1-era undelegations against the embedded V1 state, and asserts the node set
+    /// matches what the live staking API (running the pre-embedding `release-decaf` code) served
+    /// at that block:
+    ///
+    /// ```sh
+    /// curl https://staking-api.decaf.testnet.espresso.network/v0/staking/nodes/all/<PINNED_HASH>
+    /// ```
+    ///
+    /// hashed with [`node_set_hash`].
     #[ignore]
     #[test_log::test(tokio::test)]
     async fn test_decaf_sepolia_full_replay() {
+        const PINNED_BLOCK: u64 = 11_277_610;
+        const PINNED_HASH: &str =
+            "80e934f93f7453d21992fd94a2bc1c9d8db7f995c58247dcbd0227dc4b383551";
+        const NODE_SET_HASH: &str =
+            "0xa4e9ef4ac99c82d70471baa106db550743a4169c8476e182a54ef5a3888332e4";
+
         let rpc_url: Url = std::env::var("DECAF_SEPOLIA_RPC_URL")
             .unwrap_or_else(|_| "https://sepolia.gateway.tenderly.co".into())
             .parse()
             .unwrap();
 
         let provider = ProviderBuilder::new().connect_http(rpc_url.clone());
+        let pinned = provider
+            .get_block(BlockId::number(PINNED_BLOCK))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(format!("{:x}", pinned.header.hash), PINNED_HASH);
+
         let genesis_block = load_genesis(&provider, decaf::STAKE_TABLE).await.unwrap();
         let mut snapshot = Snapshot::empty(genesis_block);
 
@@ -334,7 +372,10 @@ mod test {
         let events = catchup.fast_forward(snapshot.block.number()).await.unwrap();
         tracing::info!(blocks = events.len(), "replaying catchup events");
 
-        for (id, (timestamp, block_events)) in events {
+        for (id, (timestamp, block_events)) in events
+            .into_iter()
+            .filter(|(id, _)| id.number <= PINNED_BLOCK)
+        {
             snapshot
                 .apply(&NoMetadata, id, timestamp, &block_events)
                 .await;
@@ -343,9 +384,11 @@ mod test {
         tracing::info!(
             nodes = snapshot.node_set.len(),
             wallets = snapshot.wallets.len(),
-            "replay finished without panicking"
+            "replay finished"
         );
-        assert!(!snapshot.node_set.is_empty());
-        assert!(!snapshot.wallets.is_empty());
+        assert_eq!(
+            node_set_hash(snapshot.node_set.values().cloned()),
+            NODE_SET_HASH
+        );
     }
 }
