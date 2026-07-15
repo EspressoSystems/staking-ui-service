@@ -1,11 +1,11 @@
 //! Pre-upgrade StakeTable V1 event history for the Decaf testnet, committed as JSON.
 //!
 //! Decaf's stake table was upgraded from a V1 to a V3 deployment partway through its history (see
-//! [`LEGACY_CUTOFF_BLOCK`]). The V1 event encoding is not decodable by
-//! `StakeTableV3Events::decode_raw_log` (notably the legacy `Upgrade(address)` event has no V3
+//! [`CUTOFF_BLOCK`]). The V1 event encoding is not decodable by
+//! `StakeTableV3Events::decode_raw_log` (notably the V1 `Upgrade(address)` event has no V3
 //! equivalent), so replaying that range live from the RPC provider would panic. Instead, the
-//! events in that range are extracted once (see `src/bin/extract-decaf-legacy-events.rs`) and
-//! embedded here, to be injected during L1 catchup (see `rpc_catchup.rs`) rather than fetched.
+//! events in that range are extracted once (see `src/bin/extract-decaf-events.rs`) and embedded
+//! here, to be injected during L1 catchup (see `rpc_catchup.rs`) rather than fetched.
 
 use std::{
     collections::BTreeMap,
@@ -20,17 +20,25 @@ use super::L1Event;
 use crate::types::common::{L1BlockId, Timestamp};
 
 /// The Decaf StakeTable contract deployment carrying pre-upgrade V1 event history.
-pub const DECAF_STAKE_TABLE: Address = address!("0x40304fbe94d5e7d1492dd90c53a2d63e8506a037");
+pub const STAKE_TABLE: Address = address!("0x40304fbe94d5e7d1492dd90c53a2d63e8506a037");
+
+/// The chain the Decaf StakeTable is deployed on (Sepolia). The embedded block hashes are only
+/// valid on this chain.
+pub const CHAIN_ID: u64 = 11_155_111;
+
+/// The block the Decaf StakeTable contract was initialized at. Dropped from [`events`] entirely,
+/// since `fast_forward` starts scanning at `from + 1` and must never replay it.
+pub const GENESIS_BLOCK: u64 = 8_077_808;
 
 /// Last block using the V1 event encoding, i.e. the V1 -> V3 upgrade transaction. Blocks up to
-/// and including this one are served from [`legacy_events`] instead of fetched over RPC.
-pub const LEGACY_CUTOFF_BLOCK: u64 = 9_803_910;
+/// and including this one are served from [`events`] instead of fetched over RPC.
+pub const CUTOFF_BLOCK: u64 = 9_803_910;
 
-/// One L1 block's worth of pre-upgrade events, as embedded in `decaf_legacy_events.json`.
+/// One L1 block's worth of pre-upgrade events, as embedded in `decaf_v1_events.json`.
 ///
-/// Shared with `extract-decaf-legacy-events`, so serialization and deserialization cannot drift.
+/// Shared with `extract-decaf-events`, so serialization and deserialization cannot drift.
 #[derive(Clone, Serialize, Deserialize)]
-pub struct LegacyBlock {
+pub struct Block {
     pub number: u64,
     pub hash: BlockHash,
     pub parent: BlockHash,
@@ -38,40 +46,38 @@ pub struct LegacyBlock {
     pub events: Vec<StakeTableV3Events>,
 }
 
-static LEGACY_EVENTS: LazyLock<BTreeMap<L1BlockId, (Timestamp, Vec<L1Event>)>> =
-    LazyLock::new(|| {
-        let blocks: Vec<LegacyBlock> =
-            serde_json::from_str(include_str!("decaf_legacy_events.json"))
-                .expect("decaf_legacy_events.json must deserialize as Vec<LegacyBlock>");
-        blocks
-            .into_iter()
-            .map(|block| {
-                let id = L1BlockId {
-                    number: block.number,
-                    hash: block.hash,
-                    parent: block.parent,
-                };
-                let events = block
-                    .events
-                    .into_iter()
-                    .map(|event| L1Event::StakeTable(Arc::new(event)))
-                    .collect();
-                (id, (block.timestamp, events))
-            })
-            .collect()
-    });
+static EVENTS: LazyLock<BTreeMap<L1BlockId, (Timestamp, Vec<L1Event>)>> = LazyLock::new(|| {
+    let blocks: Vec<Block> = serde_json::from_str(include_str!("decaf_v1_events.json"))
+        .expect("decaf_v1_events.json must deserialize as Vec<Block>");
+    blocks
+        .into_iter()
+        .map(|block| {
+            let id = L1BlockId {
+                number: block.number,
+                hash: block.hash,
+                parent: block.parent,
+            };
+            let events = block
+                .events
+                .into_iter()
+                .map(|event| L1Event::StakeTable(Arc::new(event)))
+                .collect();
+            (id, (block.timestamp, events))
+        })
+        .collect()
+});
 
-/// Pre-upgrade legacy events, keyed by L1 block.
-pub fn legacy_events() -> &'static BTreeMap<L1BlockId, (Timestamp, Vec<L1Event>)> {
-    &LEGACY_EVENTS
+/// Pre-upgrade V1 events, keyed by L1 block.
+pub fn events() -> &'static BTreeMap<L1BlockId, (Timestamp, Vec<L1Event>)> {
+    &EVENTS
 }
 
-/// Legacy events in blocks `(from_exclusive, to_inclusive]`.
-pub fn legacy_events_between(
+/// V1 events in blocks `(from_exclusive, to_inclusive]`.
+pub fn events_between(
     from_exclusive: u64,
     to_inclusive: u64,
 ) -> impl Iterator<Item = (L1BlockId, (Timestamp, Vec<L1Event>))> {
-    legacy_events()
+    events()
         .iter()
         .filter(move |(id, _)| id.number > from_exclusive && id.number <= to_inclusive)
         .map(|(id, (timestamp, events))| (*id, (*timestamp, events.clone())))
@@ -91,17 +97,17 @@ mod test {
     };
 
     #[test_log::test]
-    fn test_legacy_events_embed_ok() {
+    fn test_events_embed_ok() {
         let mut delegated = 0;
         let mut registered = 0;
         let mut undelegated = 0;
         let mut withdrawal_claimed = 0;
         let mut validator_exit = 0;
 
-        for (_, events) in legacy_events().values() {
+        for (_, events) in events().values() {
             for event in events {
                 let L1Event::StakeTable(event) = event else {
-                    panic!("unexpected reward event in legacy data: {event:?}");
+                    panic!("unexpected reward event in V1 data: {event:?}");
                 };
                 match event.as_ref() {
                     StakeTableV3Events::Delegated(_) => delegated += 1,
@@ -109,9 +115,10 @@ mod test {
                     StakeTableV3Events::Undelegated(_) => undelegated += 1,
                     StakeTableV3Events::WithdrawalClaimed(_) => withdrawal_claimed += 1,
                     StakeTableV3Events::ValidatorExit(_) => validator_exit += 1,
+                    // `StakeTableV3Events` implements `Serialize` but not `Debug`.
                     other => panic!(
-                        "unexpected event type in legacy data: {}",
-                        serde_json::to_string(other).unwrap_or_default()
+                        "unexpected event type in V1 data: {}",
+                        serde_json::to_string(other).unwrap()
                     ),
                 }
             }
@@ -119,43 +126,37 @@ mod test {
 
         assert_eq!(delegated, 168);
         assert_eq!(registered, 140);
-        // 50 undelegations total; 3 were later claimed, each replacing a legacy `Withdrawal` event
+        // 50 undelegations total; 3 were later claimed, each replacing a V1 `Withdrawal` event
         // (which carries no validator) with a synthetic `WithdrawalClaimed` event. The other 47
-        // undelegations remain pending in state after replay (see `test_legacy_replay_clean_state`).
+        // undelegations remain pending in state after replay (see `test_replay_clean_state`).
         assert_eq!(undelegated, 50);
         assert_eq!(withdrawal_claimed, 3);
         assert_eq!(validator_exit, 1);
     }
 
     #[test_log::test]
-    fn test_legacy_events_between_ok() {
-        let (&first, _) = legacy_events()
-            .iter()
-            .next()
-            .expect("legacy events must be non-empty");
-        let (&last, _) = legacy_events()
+    fn test_events_between_ok() {
+        let (&first, _) = events().iter().next().expect("V1 events must be non-empty");
+        let (&last, _) = events()
             .iter()
             .next_back()
-            .expect("legacy events must be non-empty");
+            .expect("V1 events must be non-empty");
 
         // Everything is included when the range covers the whole dataset.
-        let all = legacy_events_between(first.number - 1, last.number).count();
-        assert_eq!(all, legacy_events().len());
+        let all = events_between(first.number - 1, last.number).count();
+        assert_eq!(all, events().len());
 
         // Nothing at or before `from_exclusive` is included.
-        let excluding_first = legacy_events_between(first.number, last.number).count();
-        assert_eq!(excluding_first, legacy_events().len() - 1);
+        let excluding_first = events_between(first.number, last.number).count();
+        assert_eq!(excluding_first, events().len() - 1);
 
         // Nothing past `to_inclusive` is included.
-        let none = legacy_events_between(first.number - 1, first.number - 1).count();
+        let none = events_between(first.number - 1, first.number - 1).count();
         assert_eq!(none, 0);
     }
 
     #[test_log::test(tokio::test)]
-    async fn test_legacy_replay_clean_state() {
-        // The real init block, dropped from `legacy_events` (`fast_forward` starts scanning at
-        // `from + 1`, so it must never be replayed).
-        const GENESIS_BLOCK: u64 = 8_077_808;
+    async fn test_replay_clean_state() {
         // `exitEscrowPeriod()` at the time of the real deployment's genesis.
         const EXIT_ESCROW_PERIOD: u64 = 604_800;
 
@@ -169,14 +170,12 @@ mod test {
             exit_escrow_period: EXIT_ESCROW_PERIOD,
         });
 
-        let blocks = legacy_events()
-            .iter()
-            .map(|(id, (timestamp, events))| BlockInput {
-                block: *id,
-                finalized: *id,
-                timestamp: *timestamp,
-                events: events.clone(),
-            });
+        let blocks = events().iter().map(|(id, (timestamp, events))| BlockInput {
+            block: *id,
+            finalized: *id,
+            timestamp: *timestamp,
+            events: events.clone(),
+        });
         let catchup = CatchupFromEvents::from_blocks(blocks);
 
         let state = State::new(
@@ -187,7 +186,7 @@ mod test {
             PrometheusMetrics::default(),
         )
         .await
-        .expect("replaying legacy events must not panic or error");
+        .expect("replaying V1 events must not panic or error");
 
         let snapshot = &state.blocks[0].state;
 

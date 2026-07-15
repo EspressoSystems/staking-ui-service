@@ -24,24 +24,22 @@ pub struct RpcCatchup {
     chunk_size: u64,
     retry_delay: Duration,
 
-    /// Pre-upgrade Decaf events, present only when catching up the Decaf stake table (see
-    /// [`decaf`]). The V1-era block range is served from here instead of the RPC provider.
-    legacy: Option<&'static BTreeMap<L1BlockId, (Timestamp, Vec<L1Event>)>>,
+    /// Whether this catchup targets the Decaf stake table (see [`decaf`]). If so, the V1-era
+    /// block range is served from embedded events instead of the RPC provider.
+    decaf: bool,
 }
 
 impl RpcCatchup {
     /// A catchup provider configured from the CLI.
     pub fn new(opt: &L1ClientOptions) -> Result<Self> {
         let provider = opt.provider()?.0;
-        let legacy =
-            (opt.stake_table_address == decaf::DECAF_STAKE_TABLE).then(decaf::legacy_events);
         Ok(Self {
             provider,
             stake_table_addr: opt.stake_table_address,
             reward_addr: opt.reward_contract_address,
             chunk_size: opt.l1_events_max_block_range,
             retry_delay: opt.l1_retry_delay,
-            legacy,
+            decaf: opt.stake_table_address == decaf::STAKE_TABLE,
         })
     }
 }
@@ -51,6 +49,24 @@ impl L1Catchup for RpcCatchup {
         &self,
         from: u64,
     ) -> Result<BTreeMap<L1BlockId, (Timestamp, Vec<L1Event>)>> {
+        if self.decaf {
+            // The embedded V1 events carry Sepolia block hashes; injecting them on any other
+            // chain would corrupt the state.
+            let chain_id = self
+                .provider
+                .get_chain_id()
+                .await
+                .context(|| Error::internal().context("getting chain ID"))?;
+            if chain_id != decaf::CHAIN_ID {
+                return Err(Error::internal().context(format!(
+                    "stake table address matches Decaf ({}) but chain ID is {chain_id}, \
+                     expected Sepolia ({})",
+                    decaf::STAKE_TABLE,
+                    decaf::CHAIN_ID,
+                )));
+            }
+        }
+
         let finalized = self
             .provider
             .get_block(BlockId::finalized())
@@ -67,18 +83,24 @@ impl L1Catchup for RpcCatchup {
             return Ok(Default::default());
         }
 
+        let target = finalized.number();
+        // On Decaf, the V1 range is served from embedded data (its final block emits an
+        // undecodable `Upgrade` event), so the RPC scan is clamped to start after it.
+        let rpc_from = if self.decaf {
+            from.max(decaf::CUTOFF_BLOCK)
+        } else {
+            from
+        };
+
         // Fetch events from the starting block to the new finalized block.
         tracing::info!(
             from,
-            to = finalized.number(),
+            rpc_from,
+            to = target,
             "fetching L1 events for catchup"
         );
 
-        // To avoid making large RPC calls, divide the range into smaller chunks. When replaying a
-        // legacy-gated stake table, the V1-era range is served from committed data instead (see
-        // `legacy_clamped_from`), so the RPC scan is clamped to start after it.
-        let target = finalized.number();
-        let rpc_from = legacy_clamped_from(from, self.legacy.is_some());
+        // To avoid making large RPC calls, divide the range into smaller chunks.
         let chunks = block_range_chunks(rpc_from + 1, target, self.chunk_size);
 
         let max_delay = self.retry_delay * 32;
@@ -108,22 +130,11 @@ impl L1Catchup for RpcCatchup {
             events.extend(chunk_events);
         }
 
-        if self.legacy.is_some() {
-            events.extend(decaf::legacy_events_between(from, target));
+        if self.decaf {
+            events.extend(decaf::events_between(from, target));
         }
 
         Ok(events)
-    }
-}
-
-/// Clamp the RPC scan's starting block so the legacy V1 event range is never fetched from the
-/// provider when legacy replay is active for this stake table (its final block emits an
-/// undecodable `Upgrade` event; see `decaf`).
-fn legacy_clamped_from(from: u64, legacy_active: bool) -> u64 {
-    if legacy_active {
-        from.max(decaf::LEGACY_CUTOFF_BLOCK)
-    } else {
-        from
     }
 }
 
@@ -200,93 +211,14 @@ mod test {
 
     #[test_log::test]
     fn test_decaf_gate_address_match() {
-        let catchup = RpcCatchup::new(&dummy_options(decaf::DECAF_STAKE_TABLE)).unwrap();
-        assert!(catchup.legacy.is_some());
+        let catchup = RpcCatchup::new(&dummy_options(decaf::STAKE_TABLE)).unwrap();
+        assert!(catchup.decaf);
     }
 
     #[test_log::test]
     fn test_decaf_gate_other_address() {
         let catchup = RpcCatchup::new(&dummy_options(Address::random())).unwrap();
-        assert!(catchup.legacy.is_none());
-    }
-
-    #[test_log::test]
-    fn test_legacy_clamped_from_inactive() {
-        // Without the gate active, the RPC scan range is untouched.
-        assert_eq!(legacy_clamped_from(0, false), 0);
-        assert_eq!(
-            legacy_clamped_from(decaf::LEGACY_CUTOFF_BLOCK + 1, false),
-            decaf::LEGACY_CUTOFF_BLOCK + 1
-        );
-    }
-
-    #[test_log::test]
-    fn test_legacy_clamped_from_cutoff_boundary() {
-        // Starting from genesis (or anywhere inside the legacy range), the RPC scan is clamped to
-        // begin exactly at the cutoff, so `block_range_chunks(rpc_from + 1, ..)` never requests
-        // the cutoff block itself (its `Upgrade` log cannot be decoded).
-        assert_eq!(legacy_clamped_from(0, true), decaf::LEGACY_CUTOFF_BLOCK);
-        assert_eq!(
-            legacy_clamped_from(decaf::LEGACY_CUTOFF_BLOCK, true),
-            decaf::LEGACY_CUTOFF_BLOCK
-        );
-    }
-
-    #[test_log::test]
-    fn test_legacy_clamped_from_past_cutoff() {
-        // Restarting from a snapshot already past the cutoff leaves the RPC range unchanged.
-        let from = decaf::LEGACY_CUTOFF_BLOCK + 1000;
-        assert_eq!(legacy_clamped_from(from, true), from);
-    }
-
-    #[test_log::test]
-    fn test_catchup_skips_legacy_range() {
-        // With the gate active, no chunk ever starts at or below the cutoff block.
-        let rpc_from = legacy_clamped_from(0, true);
-        let chunks = block_range_chunks(rpc_from + 1, decaf::LEGACY_CUTOFF_BLOCK + 10_000, 3);
-        for (from, _) in chunks {
-            assert!(from > decaf::LEGACY_CUTOFF_BLOCK);
-        }
-    }
-
-    #[test_log::test]
-    fn test_catchup_merges_legacy_events() {
-        let (&first, _) = decaf::legacy_events().iter().next().unwrap();
-        let (&last, _) = decaf::legacy_events().iter().next_back().unwrap();
-
-        let merged: BTreeMap<_, _> =
-            decaf::legacy_events_between(first.number - 1, last.number).collect();
-        assert_eq!(merged.len(), decaf::legacy_events().len());
-        // Ordered by block number, since `L1BlockId`'s `Ord` compares `number` first.
-        assert!(merged.keys().is_sorted_by_key(|id| id.number));
-    }
-
-    #[test_log::test]
-    fn test_catchup_restart_mid_legacy() {
-        let (&first, _) = decaf::legacy_events().iter().next().unwrap();
-        let (&last, _) = decaf::legacy_events().iter().next_back().unwrap();
-
-        // Restarting right at `first` merges everything strictly after it, and never re-applies
-        // `first` itself.
-        let merged: Vec<_> = decaf::legacy_events_between(first.number, last.number).collect();
-        assert!(merged.iter().all(|(id, _)| id.number > first.number));
-        assert_eq!(merged.len(), decaf::legacy_events().len() - 1);
-    }
-
-    #[test_log::test]
-    fn test_catchup_finalized_inside_legacy() {
-        let (&first, _) = decaf::legacy_events().iter().next().unwrap();
-
-        // A finalized head below the cutoff yields no RPC chunks (the clamped start is past the
-        // finalized target), and only legacy entries up to that head merge in.
-        let target = first.number;
-        let rpc_from = legacy_clamped_from(0, true);
-        let chunks = block_range_chunks(rpc_from + 1, target, 3).collect::<Vec<_>>();
-        assert!(chunks.is_empty());
-
-        let merged: Vec<_> = decaf::legacy_events_between(0, target).collect();
-        assert_eq!(merged.len(), 1);
-        assert_eq!(merged[0].0, first);
+        assert!(!catchup.decaf);
     }
 
     #[test_log::test(tokio::test(flavor = "multi_thread"))]
@@ -382,11 +314,10 @@ mod test {
         }
     }
 
-    /// The decisive proof that the Decaf-specific `release-decaf` branch can be retired: replaying
-    /// the real Decaf stake table from genesis through the current finalized block, live legacy
-    /// injection and all, must not panic. This is the only test that exercises the post-upgrade
+    /// Replays the real Decaf stake table from genesis through the current finalized block,
+    /// injecting the embedded V1 events. This exercises the post-upgrade
     /// `WithdrawalClaimed(undelegationId=0)` events (claims of V1-era undelegations) against the
-    /// hardcoded legacy state.
+    /// embedded V1 state.
     #[ignore]
     #[test_log::test(tokio::test)]
     async fn test_decaf_sepolia_full_replay() {
@@ -396,14 +327,12 @@ mod test {
             .unwrap();
 
         let provider = ProviderBuilder::new().connect_http(rpc_url.clone());
-        let genesis_block = load_genesis(&provider, decaf::DECAF_STAKE_TABLE)
-            .await
-            .unwrap();
+        let genesis_block = load_genesis(&provider, decaf::STAKE_TABLE).await.unwrap();
         let mut snapshot = Snapshot::empty(genesis_block);
 
         let options = L1ClientOptions {
             http_providers: vec![rpc_url],
-            stake_table_address: decaf::DECAF_STAKE_TABLE,
+            stake_table_address: decaf::STAKE_TABLE,
             reward_contract_address: Address::ZERO,
             ..Default::default()
         };
@@ -422,5 +351,7 @@ mod test {
             wallets = snapshot.wallets.len(),
             "replay finished without panicking"
         );
+        assert!(!snapshot.node_set.is_empty());
+        assert!(!snapshot.wallets.is_empty());
     }
 }

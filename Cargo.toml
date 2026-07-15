@@ -11,7 +11,7 @@ test = false
 required-features = ["rand"]
 
 [[bin]]
-name = "extract-decaf-legacy-events"
+name = "extract-decaf-events"
 test = false
 
 [features]

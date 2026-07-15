@@ -329,9 +329,12 @@ mod test {
     use staking_cli::DEV_MNEMONIC;
     use tide_disco::Url;
 
-    use crate::input::l1::testing::{
-        ContractDeployment, DeploymentConfig, assert_events_eq,
-        validator_registered_v3_event_with_account,
+    use crate::input::l1::{
+        decaf,
+        testing::{
+            ContractDeployment, DeploymentConfig, assert_events_eq,
+            validator_registered_v3_event_with_account,
+        },
     };
 
     use super::*;
@@ -640,10 +643,7 @@ mod test {
     async fn test_get_initial_token_supply_decaf() {
         let provider = ProviderBuilder::new()
             .connect_http("https://ethereum-sepolia.publicnode.com".parse().unwrap());
-        let stake_table: Address = "0x40304fbe94d5e7d1492dd90c53a2d63e8506a037"
-            .parse()
-            .unwrap();
-        let supply = get_initial_token_supply(&provider, stake_table, 100)
+        let supply = get_initial_token_supply(&provider, decaf::STAKE_TABLE, 100)
             .await
             .unwrap();
         assert_eq!(supply, parse_ether("10000000000").unwrap());

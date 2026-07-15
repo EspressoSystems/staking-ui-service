@@ -694,7 +694,7 @@ impl Snapshot {
                     (vec![FullNodeSetDiff::NodeUpdate(Arc::new(node))], vec![])
                 }
                 StakeTableV3Events::ValidatorRegistered(ev) => {
-                    tracing::warn!("received legacy ValidatorRegistered event");
+                    tracing::warn!("received V1 ValidatorRegistered event");
                     let node = match NodeSetEntry::try_from(ev) {
                         Ok(node) => node,
                         Err(err) => {
@@ -904,7 +904,7 @@ impl Snapshot {
 
                     (vec![node_diff], vec![(delegator, wallet_diff)])
                 }
-                // Legacy withdrawal event from the old StakeTable contract.
+                // V1 withdrawal event from the old StakeTable contract.
                 //
                 // The new StakeTableV3 contract emits `WithdrawalClaimed` and
                 // `ValidatorExitClaimed` events which include the validator address.
@@ -913,7 +913,7 @@ impl Snapshot {
                 // mainnet will have new stake table contract
                 StakeTableV3Events::Withdrawal(ev) => {
                     panic!(
-                        "Received legacy Withdrawal event account={}, amount={}. \
+                        "Received V1 Withdrawal event account={}, amount={}. \
                         This event is from the old StakeTable contract.
                         The StakeTableV3 contract emits WithdrawalClaimed and ValidatorExitClaimed instead.",
                         ev.account, ev.amount
