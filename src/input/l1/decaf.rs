@@ -1,11 +1,7 @@
-//! Pre-upgrade StakeTable V1 event history for the Decaf testnet, committed as JSON.
+//! Pre-upgrade StakeTable V1 events for the Decaf testnet, embedded as JSON.
 //!
-//! Decaf's stake table was upgraded from a V1 to a V3 deployment partway through its history (see
-//! [`CUTOFF_BLOCK`]). The V1 event encoding is not decodable by
-//! `StakeTableV3Events::decode_raw_log` (notably the V1 `Upgrade(address)` event has no V3
-//! equivalent), so replaying that range live from the RPC provider would panic. Instead, the
-//! events in that range are extracted once (see `src/bin/extract-decaf-events.rs`) and embedded
-//! here, to be injected during L1 catchup (see `rpc_catchup.rs`) rather than fetched.
+//! Extracted once by `extract-decaf-events` and injected during L1 catchup instead of fetched
+//! over RPC (see [`CUTOFF_BLOCK`]).
 
 use std::{
     collections::BTreeMap,
@@ -19,24 +15,23 @@ use serde::{Deserialize, Serialize};
 use super::L1Event;
 use crate::types::common::{L1BlockId, Timestamp};
 
-/// The Decaf StakeTable contract deployment carrying pre-upgrade V1 event history.
+/// The Decaf StakeTable deployment.
 pub const STAKE_TABLE: Address = address!("0x40304fbe94d5e7d1492dd90c53a2d63e8506a037");
 
-/// The chain the Decaf StakeTable is deployed on (Sepolia). The embedded block hashes are only
-/// valid on this chain.
+/// Sepolia, the only chain the embedded block hashes are valid on.
 pub const CHAIN_ID: u64 = 11_155_111;
 
-/// The block the Decaf StakeTable contract was initialized at. Dropped from [`events`] entirely,
-/// since `fast_forward` starts scanning at `from + 1` and must never replay it.
+/// Deployment block of the Decaf StakeTable. Excluded from [`events`]: catchup scans from
+/// `from + 1` and must never replay it.
 pub const GENESIS_BLOCK: u64 = 8_077_808;
 
-/// Last block using the V1 event encoding, i.e. the V1 -> V3 upgrade transaction. Blocks up to
-/// and including this one are served from [`events`] instead of fetched over RPC.
+/// Last block of the V1 deployment, containing the V1 -> V3 upgrade transaction. Blocks up to and
+/// including this one are served from [`events`] and never fetched over RPC: the V1 encoding,
+/// notably the `Upgrade(address)` log in this block, is not decodable by
+/// `StakeTableV3Events::decode_raw_log`.
 pub const CUTOFF_BLOCK: u64 = 9_803_910;
 
-/// One L1 block's worth of pre-upgrade events, as embedded in `decaf_v1_events.json`.
-///
-/// Shared with `extract-decaf-events`, so serialization and deserialization cannot drift.
+/// One block's V1 events, as serialized in `decaf_v1_events.json` by `extract-decaf-events`.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Block {
     pub number: u64,
@@ -126,9 +121,8 @@ mod test {
 
         assert_eq!(delegated, 168);
         assert_eq!(registered, 140);
-        // 50 undelegations total; 3 were later claimed, each replacing a V1 `Withdrawal` event
-        // (which carries no validator) with a synthetic `WithdrawalClaimed` event. The other 47
-        // undelegations remain pending in state after replay (see `test_replay_clean_state`).
+        // 3 of the 50 undelegations were claimed; the extractor replaces each claim's V1
+        // `Withdrawal` event with a synthetic `WithdrawalClaimed`.
         assert_eq!(undelegated, 50);
         assert_eq!(withdrawal_claimed, 3);
         assert_eq!(validator_exit, 1);
@@ -142,15 +136,12 @@ mod test {
             .next_back()
             .expect("V1 events must be non-empty");
 
-        // Everything is included when the range covers the whole dataset.
         let all = events_between(first.number - 1, last.number).count();
         assert_eq!(all, events().len());
 
-        // Nothing at or before `from_exclusive` is included.
         let excluding_first = events_between(first.number, last.number).count();
         assert_eq!(excluding_first, events().len() - 1);
 
-        // Nothing past `to_inclusive` is included.
         let none = events_between(first.number - 1, first.number - 1).count();
         assert_eq!(none, 0);
     }
@@ -190,12 +181,11 @@ mod test {
 
         let snapshot = &state.blocks[0].state;
 
-        // All 140 registrations parsed (a bad parse would have panicked on the first `Delegated`
-        // event referencing an unregistered validator); 1 later exits, leaving 139 active.
+        // 140 registered, 1 exited. A bad registration parse would have panicked on the first
+        // `Delegated` event referencing it.
         assert_eq!(snapshot.node_set.len(), 139);
 
-        // 50 undelegations total, 3 claimed by the synthetic `WithdrawalClaimed` events, leaving
-        // 47 pending.
+        // 50 undelegations, 3 claimed, 47 pending.
         let pending_undelegations: usize = snapshot
             .wallets
             .values()

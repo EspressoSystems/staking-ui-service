@@ -1,11 +1,6 @@
 //! Extract pre-upgrade StakeTable V1 events from the Decaf Sepolia deployment.
 //!
-//! Decaf's stake table was upgraded from a V1 to a V3 deployment at block
-//! [`decaf::CUTOFF_BLOCK`]. This one-off script fetches the V1-era logs, decodes the ones this
-//! service cares about, and writes them as an ordered JSON array shared with
-//! `src/input/l1/decaf.rs`, which embeds the output at `src/input/l1/decaf_v1_events.json` and
-//! replays it during L1 catchup instead of fetching it live (the V1 encoding is not decodable by
-//! `StakeTableV3Events::decode_raw_log`).
+//! One-off companion of `src/input/l1/decaf.rs`: writes the JSON embedded there.
 //!
 //! Run with `cargo run --bin extract-decaf-events -- --output
 //! src/input/l1/decaf_v1_events.json`.
@@ -57,8 +52,7 @@ async fn main() -> anyhow::Result<()> {
     let opt = Options::parse();
     let provider = ProviderBuilder::new().connect_http(opt.rpc_url.clone());
 
-    // The V1 `Upgrade(address)` event has no V3 equivalent, so it is the only log in the V1
-    // range that `decode_raw_log` is allowed to fail on.
+    // The only log `decode_raw_log` may fail on (see `decaf::CUTOFF_BLOCK`).
     let upgrade_topic0 = keccak256(b"Upgrade(address)");
 
     let mut events_by_block: BTreeMap<u64, Vec<StakeTableV3Events>> = BTreeMap::new();
@@ -139,16 +133,9 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Triage a decoded event: keep it, drop it, or fail the extraction.
-///
-/// `Ok(true)`: events this service tracks, kept in the V1 JSON (`Withdrawal` is transformed into
-/// a synthetic `WithdrawalClaimed`, see [`withdrawal_claimed`]).
-///
-/// `Ok(false)`: the events `handle_event` in `src/input/l1.rs` explicitly ignores as not relevant
-/// to this service.
-///
-/// Anything else mutates service state (`handle_event` applies it to the node set or wallets), so
-/// silently dropping it would diverge the replayed state: fail instead.
+/// Whether to keep an event in the JSON, mirroring `handle_event` in `src/input/l1.rs`: tracked
+/// events are kept, ignored events are dropped, and anything else mutates service state, so
+/// dropping it would diverge the replay: fail instead.
 fn keep(event: &StakeTableV3Events) -> anyhow::Result<bool> {
     match event {
         StakeTableV3Events::Delegated(_)
@@ -177,9 +164,8 @@ fn keep(event: &StakeTableV3Events) -> anyhow::Result<bool> {
     }
 }
 
-/// Replace a V1 `Withdrawal(account, amount)` event, which main's `handle_event` cannot
-/// process (it has no validator), with a synthetic `WithdrawalClaimed` carrying the validator
-/// address recovered from the claiming transaction's calldata.
+/// Replace a V1 `Withdrawal` event, which carries no validator, with a synthetic
+/// `WithdrawalClaimed` taking the validator from the claiming transaction's calldata.
 async fn withdrawal_claimed(
     provider: &impl Provider,
     log: &Log,

@@ -24,8 +24,7 @@ pub struct RpcCatchup {
     chunk_size: u64,
     retry_delay: Duration,
 
-    /// Whether this catchup targets the Decaf stake table (see [`decaf`]). If so, the V1-era
-    /// block range is served from embedded events instead of the RPC provider.
+    /// Serve the V1 range from [`decaf::events`] instead of the RPC provider.
     decaf: bool,
 }
 
@@ -50,8 +49,7 @@ impl L1Catchup for RpcCatchup {
         from: u64,
     ) -> Result<BTreeMap<L1BlockId, (Timestamp, Vec<L1Event>)>> {
         if self.decaf {
-            // The embedded V1 events carry Sepolia block hashes; injecting them on any other
-            // chain would corrupt the state.
+            // The embedded V1 events are only valid on Sepolia.
             let chain_id = self
                 .provider
                 .get_chain_id()
@@ -84,8 +82,7 @@ impl L1Catchup for RpcCatchup {
         }
 
         let target = finalized.number();
-        // On Decaf, the V1 range is served from embedded data (its final block emits an
-        // undecodable `Upgrade` event), so the RPC scan is clamped to start after it.
+        // The V1 range is never fetched over RPC (see `decaf::CUTOFF_BLOCK`).
         let rpc_from = if self.decaf {
             from.max(decaf::CUTOFF_BLOCK)
         } else {
@@ -198,8 +195,7 @@ mod test {
         assert_eq!(chunks, vec![(1, 1)]);
     }
 
-    /// A dummy provider URL. Constructing an [`RpcCatchup`] never connects eagerly, so this never
-    /// needs to be reachable.
+    /// [`RpcCatchup`] never connects eagerly, so the provider URL needs not be reachable.
     fn dummy_options(stake_table_address: Address) -> L1ClientOptions {
         L1ClientOptions {
             http_providers: vec!["http://localhost:1".parse().unwrap()],
@@ -314,10 +310,8 @@ mod test {
         }
     }
 
-    /// Replays the real Decaf stake table from genesis through the current finalized block,
-    /// injecting the embedded V1 events. This exercises the post-upgrade
-    /// `WithdrawalClaimed(undelegationId=0)` events (claims of V1-era undelegations) against the
-    /// embedded V1 state.
+    /// Replays the real Decaf stake table from genesis, covering post-upgrade claims of V1-era
+    /// undelegations against the embedded V1 state.
     #[ignore]
     #[test_log::test(tokio::test)]
     async fn test_decaf_sepolia_full_replay() {
