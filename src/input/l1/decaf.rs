@@ -86,6 +86,7 @@ mod test {
     use crate::{
         input::l1::{
             BlockInput, L1BlockSnapshot, Snapshot, State,
+            provider::GENESIS_EXIT_ESCROW_PERIOD,
             testing::{CatchupFromEvents, MemoryStorage, NoMetadata},
         },
         metrics::PrometheusMetrics,
@@ -148,9 +149,6 @@ mod test {
 
     #[test_log::test(tokio::test)]
     async fn test_replay_clean_state() {
-        // `exitEscrowPeriod()` at the time of the real deployment's genesis.
-        const EXIT_ESCROW_PERIOD: u64 = 604_800;
-
         let genesis = Snapshot::empty(L1BlockSnapshot {
             id: L1BlockId {
                 number: GENESIS_BLOCK,
@@ -158,7 +156,7 @@ mod test {
                 parent: BlockHash::ZERO,
             },
             timestamp: 0,
-            exit_escrow_period: EXIT_ESCROW_PERIOD,
+            exit_escrow_period: GENESIS_EXIT_ESCROW_PERIOD,
         });
 
         let blocks = events().iter().map(|(id, (timestamp, events))| BlockInput {
