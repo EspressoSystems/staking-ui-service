@@ -55,12 +55,12 @@ impl L1Catchup for RpcCatchup {
                 .get_chain_id()
                 .await
                 .context(|| Error::internal().context("getting chain ID"))?;
-            if chain_id != decaf::CHAIN_ID {
+            if chain_id != decaf::L1_CHAIN_ID {
                 return Err(Error::internal().context(format!(
                     "stake table address matches Decaf ({}) but chain ID is {chain_id}, \
                      expected Sepolia ({})",
                     decaf::STAKE_TABLE,
-                    decaf::CHAIN_ID,
+                    decaf::L1_CHAIN_ID,
                 )));
             }
         }

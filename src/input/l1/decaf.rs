@@ -18,8 +18,8 @@ use crate::types::common::{L1BlockId, Timestamp};
 /// The Decaf StakeTable deployment.
 pub const STAKE_TABLE: Address = address!("0x40304fbe94d5e7d1492dd90c53a2d63e8506a037");
 
-/// Sepolia, the only chain the embedded block hashes are valid on.
-pub const CHAIN_ID: u64 = 11_155_111;
+/// Decaf's L1 (Sepolia), the only chain the embedded block hashes are valid on.
+pub const L1_CHAIN_ID: u64 = 11_155_111;
 
 /// Deployment block of the Decaf StakeTable. Excluded from [`events`]: catchup scans from
 /// `from + 1` and must never replay it.
