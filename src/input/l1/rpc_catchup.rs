@@ -12,7 +12,7 @@ use tokio::time::sleep;
 use crate::{
     Error, Result,
     error::ResultExt,
-    input::l1::{L1Catchup, L1Event, options::L1ClientOptions, provider::get_events},
+    input::l1::{L1Catchup, L1Event, decaf, options::L1ClientOptions, provider::get_events},
     types::common::{Address, L1BlockId, Timestamp},
 };
 
@@ -23,6 +23,9 @@ pub struct RpcCatchup {
     reward_addr: Address,
     chunk_size: u64,
     retry_delay: Duration,
+
+    /// Serve the V1 range from [`decaf::events`] instead of the RPC provider.
+    decaf: bool,
 }
 
 impl RpcCatchup {
@@ -35,6 +38,7 @@ impl RpcCatchup {
             reward_addr: opt.reward_contract_address,
             chunk_size: opt.l1_events_max_block_range,
             retry_delay: opt.l1_retry_delay,
+            decaf: opt.stake_table_address == decaf::STAKE_TABLE,
         })
     }
 }
@@ -44,6 +48,23 @@ impl L1Catchup for RpcCatchup {
         &self,
         from: u64,
     ) -> Result<BTreeMap<L1BlockId, (Timestamp, Vec<L1Event>)>> {
+        if self.decaf {
+            // The embedded V1 events are only valid on Sepolia.
+            let chain_id = self
+                .provider
+                .get_chain_id()
+                .await
+                .context(|| Error::internal().context("getting chain ID"))?;
+            if chain_id != decaf::L1_CHAIN_ID {
+                return Err(Error::internal().context(format!(
+                    "stake table address matches Decaf ({}) but chain ID is {chain_id}, \
+                     expected Sepolia ({})",
+                    decaf::STAKE_TABLE,
+                    decaf::L1_CHAIN_ID,
+                )));
+            }
+        }
+
         let finalized = self
             .provider
             .get_block(BlockId::finalized())
@@ -60,16 +81,24 @@ impl L1Catchup for RpcCatchup {
             return Ok(Default::default());
         }
 
+        let target = finalized.number();
+        // The V1 range is never fetched over RPC (see `decaf::CUTOFF_BLOCK`).
+        let rpc_from = if self.decaf {
+            from.max(decaf::CUTOFF_BLOCK)
+        } else {
+            from
+        };
+
         // Fetch events from the starting block to the new finalized block.
         tracing::info!(
             from,
-            to = finalized.number(),
+            rpc_from,
+            to = target,
             "fetching L1 events for catchup"
         );
 
         // To avoid making large RPC calls, divide the range into smaller chunks.
-        let target = finalized.number();
-        let chunks = block_range_chunks(from + 1, target, self.chunk_size);
+        let chunks = block_range_chunks(rpc_from + 1, target, self.chunk_size);
 
         let max_delay = self.retry_delay * 32;
         let mut events = BTreeMap::new();
@@ -96,6 +125,10 @@ impl L1Catchup for RpcCatchup {
                 }
             };
             events.extend(chunk_events);
+        }
+
+        if self.decaf {
+            events.extend(decaf::events_between(from, target));
         }
 
         Ok(events)
@@ -130,14 +163,21 @@ mod test {
         time::Duration,
     };
 
-    use alloy::node_bindings::Anvil;
+    use alloy::{node_bindings::Anvil, providers::ProviderBuilder};
     use futures::StreamExt;
     use pretty_assertions::assert_eq;
+    use tide_disco::Url;
     use tokio::time::sleep;
 
-    use crate::input::l1::{
-        ResettableStream, RpcStream,
-        testing::{BackgroundStakeTableOps, ContractDeployment, assert_events_eq},
+    use vbs::version::StaticVersion;
+
+    use crate::{
+        input::l1::{
+            ResettableStream, RpcStream, Snapshot,
+            provider::load_genesis,
+            testing::{BackgroundStakeTableOps, ContractDeployment, NoMetadata, assert_events_eq},
+        },
+        types::{common::NodeSetEntry, global::FullNodeSetSnapshot},
     };
 
     use super::*;
@@ -158,6 +198,28 @@ mod test {
     fn test_block_range_chunks_small() {
         let chunks = block_range_chunks(1, 1, 10).collect::<Vec<_>>();
         assert_eq!(chunks, vec![(1, 1)]);
+    }
+
+    /// [`RpcCatchup`] never connects eagerly, so the provider URL needs not be reachable.
+    fn dummy_options(stake_table_address: Address) -> L1ClientOptions {
+        L1ClientOptions {
+            http_providers: vec!["http://localhost:1".parse().unwrap()],
+            stake_table_address,
+            reward_contract_address: Address::ZERO,
+            ..Default::default()
+        }
+    }
+
+    #[test_log::test]
+    fn test_decaf_gate_address_match() {
+        let catchup = RpcCatchup::new(&dummy_options(decaf::STAKE_TABLE)).unwrap();
+        assert!(catchup.decaf);
+    }
+
+    #[test_log::test]
+    fn test_decaf_gate_other_address() {
+        let catchup = RpcCatchup::new(&dummy_options(Address::random())).unwrap();
+        assert!(!catchup.decaf);
     }
 
     #[test_log::test(tokio::test(flavor = "multi_thread"))]
@@ -251,5 +313,85 @@ mod test {
                 assert_events_eq(event, event_from_stream);
             }
         }
+    }
+
+    /// Nodes sorted by address, with the off-chain (mutable, not replayed) metadata cleared.
+    fn canonical_nodes(nodes: impl IntoIterator<Item = NodeSetEntry>) -> Vec<NodeSetEntry> {
+        let mut nodes: Vec<NodeSetEntry> = nodes
+            .into_iter()
+            .map(|mut node| {
+                node.metadata = None;
+                node
+            })
+            .collect();
+        nodes.sort_by_key(|node| node.address);
+        nodes
+    }
+
+    /// Replays the real Decaf stake table from genesis to the current finalized block, covering
+    /// post-upgrade claims of V1-era undelegations against the embedded V1 state, and asserts the
+    /// node set matches the live staking API's snapshot at the same block.
+    #[ignore]
+    #[test_log::test(tokio::test)]
+    async fn test_decaf_sepolia_full_replay() {
+        let rpc_url: Url = std::env::var("DECAF_SEPOLIA_RPC_URL")
+            .unwrap_or_else(|_| "https://sepolia.gateway.tenderly.co".into())
+            .parse()
+            .unwrap();
+        let api_url: Url = std::env::var("DECAF_STAKING_API_URL")
+            .unwrap_or_else(|_| {
+                "https://staking-api.decaf.testnet.espresso.network/v0/staking".into()
+            })
+            .parse()
+            .unwrap();
+
+        let provider = ProviderBuilder::new().connect_http(rpc_url.clone());
+        let finalized = provider
+            .get_block(BlockId::finalized())
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Fetch the reference snapshot before the slow replay; the API only serves it while the
+        // block is within its finalized-to-head window.
+        let api = surf_disco::Client::<Error, StaticVersion<0, 1>>::new(api_url);
+        let expected: FullNodeSetSnapshot = api
+            .get(&format!("nodes/all/{:x}", finalized.header.hash))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(expected.l1_block.hash, finalized.header.hash);
+
+        let genesis_block = load_genesis(&provider, decaf::STAKE_TABLE).await.unwrap();
+        let mut snapshot = Snapshot::empty(genesis_block);
+
+        let options = L1ClientOptions {
+            http_providers: vec![rpc_url],
+            stake_table_address: decaf::STAKE_TABLE,
+            reward_contract_address: Address::ZERO,
+            ..Default::default()
+        };
+        let catchup = RpcCatchup::new(&options).unwrap();
+        let events = catchup.fast_forward(snapshot.block.number()).await.unwrap();
+        tracing::info!(blocks = events.len(), "replaying catchup events");
+
+        for (id, (timestamp, block_events)) in events
+            .into_iter()
+            .filter(|(id, _)| id.number <= finalized.header.number)
+        {
+            snapshot
+                .apply(&NoMetadata, id, timestamp, &block_events)
+                .await;
+        }
+
+        tracing::info!(
+            nodes = snapshot.node_set.len(),
+            wallets = snapshot.wallets.len(),
+            "replay finished"
+        );
+        assert_eq!(
+            canonical_nodes(snapshot.node_set.values().cloned()),
+            canonical_nodes(expected.nodes)
+        );
     }
 }

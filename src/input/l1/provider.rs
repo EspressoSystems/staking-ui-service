@@ -5,12 +5,12 @@ use std::{collections::BTreeMap, sync::Arc};
 use crate::{
     Error, Result,
     error::{ResultExt, ensure},
-    input::l1::{L1BlockSnapshot, L1Event},
+    input::l1::{L1BlockSnapshot, L1Event, decaf},
     types::common::{Address, ESPTokenAmount, L1BlockId, Timestamp},
 };
 use alloy::{
     eips::{BlockId, BlockNumberOrTag},
-    primitives::utils::format_ether,
+    primitives::{address, utils::format_ether},
     providers::Provider,
     rpc::types::{Filter, Log},
     sol_types::SolEventInterface,
@@ -21,6 +21,18 @@ use hotshot_contract_adapter::sol_types::{
     StakeTableV3::{self, StakeTableV3Events},
 };
 use tracing::instrument;
+
+const MAINNET_STAKE_TABLE: Address = address!("0xcef474d372b5b09defe2af187bf17338dc704451");
+
+/// `exitEscrowPeriod()` at the initialization block of the Decaf and mainnet deployments.
+pub const GENESIS_EXIT_ESCROW_PERIOD: u64 = 604_800;
+
+/// Hardcoded for known deployments because fetching it at the initialization block requires an
+/// archive node.
+fn genesis_exit_escrow_period(stake_table: Address) -> Option<u64> {
+    (stake_table == decaf::STAKE_TABLE || stake_table == MAINNET_STAKE_TABLE)
+        .then_some(GENESIS_EXIT_ESCROW_PERIOD)
+}
 
 /// Get the Espresso stake table genesis block.
 pub async fn load_genesis(
@@ -71,16 +83,18 @@ pub async fn load_genesis(
             Error::internal().context(format!("Init block {initialized_at_block} not found"))
         })?;
 
-    // Fetch the exitEscrowPeriod at the initialized block
-    let exit_escrow_period = stake_table_contract
-        .exitEscrowPeriod()
-        .block(BlockId::number(initialized_at_block))
-        .call()
-        .await
-        .map_err(|err| {
-            Error::internal().context(format!("Failed to fetch exitEscrowPeriod: {err}"))
-        })?
-        .to::<u64>();
+    let exit_escrow_period = match genesis_exit_escrow_period(stake_table) {
+        Some(period) => period,
+        None => stake_table_contract
+            .exitEscrowPeriod()
+            .block(BlockId::number(initialized_at_block))
+            .call()
+            .await
+            .map_err(|err| {
+                Error::internal().context(format!("Failed to fetch exitEscrowPeriod: {err}"))
+            })?
+            .to::<u64>(),
+    };
 
     let id = L1BlockId {
         number: initialized_at_block,
@@ -329,9 +343,12 @@ mod test {
     use staking_cli::DEV_MNEMONIC;
     use tide_disco::Url;
 
-    use crate::input::l1::testing::{
-        ContractDeployment, DeploymentConfig, assert_events_eq,
-        validator_registered_v3_event_with_account,
+    use crate::input::l1::{
+        decaf,
+        testing::{
+            ContractDeployment, DeploymentConfig, assert_events_eq,
+            validator_registered_v3_event_with_account,
+        },
     };
 
     use super::*;
@@ -640,10 +657,7 @@ mod test {
     async fn test_get_initial_token_supply_decaf() {
         let provider = ProviderBuilder::new()
             .connect_http("https://ethereum-sepolia.publicnode.com".parse().unwrap());
-        let stake_table: Address = "0x40304fbe94d5e7d1492dd90c53a2d63e8506a037"
-            .parse()
-            .unwrap();
-        let supply = get_initial_token_supply(&provider, stake_table, 100)
+        let supply = get_initial_token_supply(&provider, decaf::STAKE_TABLE, 100)
             .await
             .unwrap();
         assert_eq!(supply, parse_ether("10000000000").unwrap());

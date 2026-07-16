@@ -325,13 +325,13 @@ pub fn make_node(i: usize) -> NodeSetEntry {
 
 impl NodeSetEntry {
     pub fn from_event_no_metadata(event: &ValidatorRegisteredV2) -> Self {
-        let legacy = ValidatorRegistered {
+        let v1 = ValidatorRegistered {
             account: event.account,
             blsVk: event.blsVK,
             commission: event.commission,
             schnorrVk: event.schnorrVK,
         };
-        NodeSetEntry::try_from(&legacy).unwrap()
+        NodeSetEntry::try_from(&v1).unwrap()
     }
 }
 

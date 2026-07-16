@@ -10,6 +10,10 @@ name = "client-swarm"
 test = false
 required-features = ["rand"]
 
+[[bin]]
+name = "extract-decaf-events"
+test = false
+
 [features]
 default = []
 testing = [
