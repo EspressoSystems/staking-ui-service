@@ -753,6 +753,7 @@ impl Snapshot {
                                 let pending_exit = PendingWithdrawal {
                                     delegator: *wallet_address,
                                     node: validator,
+                                    undelegation_id: 0,
                                     amount: delegation.amount,
                                     available_time: exit_time,
                                 };
@@ -872,16 +873,22 @@ impl Snapshot {
                 }
                 ev
                 @ (StakeTableV3Events::Undelegated(_) | StakeTableV3Events::UndelegatedV2(_)) => {
-                    let (validator, delegator, amount, available_time) = match ev {
+                    // V1 undelegations have no ID. The contract identifies them as ID 0
+                    let (validator, delegator, undelegation_id, amount, available_time) = match ev {
                         StakeTableV3Events::Undelegated(e) => (
                             e.validator,
                             e.delegator,
+                            0,
                             e.amount,
                             timestamp + self.block.exit_escrow_period,
                         ),
-                        StakeTableV3Events::UndelegatedV2(e) => {
-                            (e.validator, e.delegator, e.amount, e.unlocksAt.to::<u64>())
-                        }
+                        StakeTableV3Events::UndelegatedV2(e) => (
+                            e.validator,
+                            e.delegator,
+                            e.undelegationId,
+                            e.amount,
+                            e.unlocksAt.to::<u64>(),
+                        ),
                         _ => unreachable!(),
                     };
 
@@ -897,6 +904,7 @@ impl Snapshot {
                     let pending_withdrawal = PendingWithdrawal {
                         delegator,
                         node: validator,
+                        undelegation_id,
                         amount,
                         available_time,
                     };
@@ -927,16 +935,20 @@ impl Snapshot {
                         )
                     });
 
-                    if !wallet.pending_undelegations.contains_key(&ev.validator) {
+                    if !wallet
+                        .pending_undelegations
+                        .contains_key(&(ev.validator, ev.undelegationId))
+                    {
                         panic!(
-                            "got WithdrawalClaimed but no pending undelegation for delegator {} validator {} amount {}",
-                            ev.delegator, ev.validator, ev.amount
+                            "got WithdrawalClaimed but no pending undelegation for delegator {} validator {} id {} amount {}",
+                            ev.delegator, ev.validator, ev.undelegationId, ev.amount
                         );
                     }
 
                     let withdrawal = Withdrawal {
                         delegator: ev.delegator,
                         node: ev.validator,
+                        undelegation_id: ev.undelegationId,
                         amount: ev.amount,
                     };
                     let wallet_diff = WalletDiff::UndelegationWithdrawal(withdrawal);
@@ -960,6 +972,7 @@ impl Snapshot {
                     let withdrawal = Withdrawal {
                         delegator: ev.delegator,
                         node: ev.validator,
+                        undelegation_id: 0,
                         amount: ev.amount,
                     };
                     let wallet_diff = WalletDiff::NodeExitWithdrawal(withdrawal);
@@ -1092,7 +1105,12 @@ pub struct Wallet {
     pub nodes: im::OrdMap<Address, Delegation>,
 
     /// Stake that has been undelegated but not yet withdrawn.
-    pub pending_undelegations: im::OrdMap<Address, PendingWithdrawal>,
+    ///
+    /// Keyed by node address and undelegation ID, since a wallet can have several concurrent
+    /// pending undelegations from the same node (e.g. batched calls in a single multisig
+    /// transaction). The ID alone is not unique across the map: undelegations created by the V1
+    /// contract all have ID 0, and are distinguished by node.
+    pub pending_undelegations: im::OrdMap<(Address, u64), PendingWithdrawal>,
 
     /// Stake previously delegated to nodes that have exited.
     pub pending_exits: im::OrdMap<Address, PendingWithdrawal>,
@@ -1156,10 +1174,13 @@ impl Wallet {
                 // Add to pending undelegations
                 if self
                     .pending_undelegations
-                    .insert(pending.node, *pending)
+                    .insert((pending.node, pending.undelegation_id), *pending)
                     .is_some()
                 {
-                    panic!("attempted to add duplicate pending undelegation for node {node}");
+                    panic!(
+                        "attempted to add duplicate pending undelegation {} for node {node}",
+                        pending.undelegation_id
+                    );
                 }
             }
             WalletDiff::NodeExited(pending) => {
@@ -1174,13 +1195,16 @@ impl Wallet {
             WalletDiff::UndelegationWithdrawal(withdrawal) => {
                 // Remove from pending undelegations
                 let node = withdrawal.node;
+                let id = withdrawal.undelegation_id;
                 let amount = withdrawal.amount;
                 if self
                     .pending_undelegations
-                    .remove(&withdrawal.node)
+                    .remove(&(withdrawal.node, withdrawal.undelegation_id))
                     .is_none()
                 {
-                    panic!("attempted to withdraw undelegation from node {node} amount: {amount}");
+                    panic!(
+                        "attempted to withdraw undelegation {id} from node {node} amount: {amount}"
+                    );
                 }
             }
             WalletDiff::NodeExitWithdrawal(withdrawal) => {
@@ -1400,8 +1424,8 @@ mod test {
     use espresso_types::{RegisteredValidatorMap, StakeTableState, v0_3::StakeTableEvent};
     use hotshot_contract_adapter::sol_types::StakeTableV3::{
         Delegated, ExitEscrowPeriodUpdated, MetadataUriUpdated, P2pAddrUpdated, Undelegated,
-        ValidatorExit, ValidatorExitClaimed, ValidatorRegisteredV2, WithdrawalClaimed,
-        X25519KeyUpdated,
+        UndelegatedV2, ValidatorExit, ValidatorExitClaimed, ValidatorRegisteredV2,
+        WithdrawalClaimed, X25519KeyUpdated,
     };
     use pretty_assertions::assert_eq;
     use reqwest::Url;
@@ -2434,7 +2458,7 @@ mod test {
         assert_eq!(
             wallet
                 .pending_undelegations
-                .get(&validator_address)
+                .get(&(validator_address, 0))
                 .unwrap()
                 .amount,
             U256::from(400)
@@ -2460,7 +2484,7 @@ mod test {
         assert_eq!(
             wallet
                 .pending_undelegations
-                .get(&validator_address)
+                .get(&(validator_address, 0))
                 .unwrap()
                 .amount,
             U256::from(400)
@@ -2514,6 +2538,116 @@ mod test {
         assert_eq!(wallet.nodes.len(), 0);
         assert_eq!(wallet.pending_undelegations.len(), 0);
         assert_eq!(wallet.pending_exits.len(), 0);
+    }
+
+    // Two undelegations from the same validator can be pending at the same time, e.g. batched
+    // calls in a single multisig transaction. They are distinguished by undelegation ID.
+    #[test_log::test(tokio::test)]
+    async fn test_concurrent_undelegations_from_same_validator() {
+        let delegator = Address::random();
+
+        let validator_reg = validator_registered_event(rand::thread_rng());
+        let validator_address = validator_reg.account;
+
+        let events = vec![
+            StakeTableV3Events::ValidatorRegisteredV2(validator_reg),
+            StakeTableV3Events::Delegated(Delegated {
+                delegator,
+                validator: validator_address,
+                amount: U256::from(1000),
+            }),
+        ];
+        let block1 = test_events(&NoMetadata, events).await;
+
+        // Two undelegations from the same validator in the same block (one transaction).
+        let block2 = block1
+            .next(
+                &NoMetadata,
+                &BlockInput::empty(3)
+                    .with_event(StakeTableV3Events::UndelegatedV2(UndelegatedV2 {
+                        delegator,
+                        validator: validator_address,
+                        undelegationId: 7,
+                        amount: U256::from(400),
+                        unlocksAt: U256::from(5000),
+                    }))
+                    .with_event(StakeTableV3Events::UndelegatedV2(UndelegatedV2 {
+                        delegator,
+                        validator: validator_address,
+                        undelegationId: 8,
+                        amount: U256::from(100),
+                        unlocksAt: U256::from(6000),
+                    })),
+            )
+            .await;
+
+        // Both undelegations are pending, tracked separately by ID.
+        let wallet = block2.state.wallets.get(&delegator).unwrap();
+        assert_eq!(
+            wallet.nodes.get(&validator_address).unwrap().amount,
+            U256::from(500)
+        );
+        assert_eq!(wallet.pending_undelegations.len(), 2);
+        let first = wallet
+            .pending_undelegations
+            .get(&(validator_address, 7))
+            .unwrap();
+        assert_eq!(first.amount, U256::from(400));
+        assert_eq!(first.available_time, 5000);
+        let second = wallet
+            .pending_undelegations
+            .get(&(validator_address, 8))
+            .unwrap();
+        assert_eq!(second.amount, U256::from(100));
+        assert_eq!(second.available_time, 6000);
+        assert_eq!(
+            block2.state.node_set.get(&validator_address).unwrap().stake,
+            U256::from(500)
+        );
+
+        // Claiming one undelegation removes exactly that one.
+        let block3 = block2
+            .next(
+                &NoMetadata,
+                &BlockInput::empty(4).with_event(StakeTableV3Events::WithdrawalClaimed(
+                    WithdrawalClaimed {
+                        delegator,
+                        validator: validator_address,
+                        undelegationId: 7,
+                        amount: U256::from(400),
+                    },
+                )),
+            )
+            .await;
+
+        let wallet = block3.state.wallets.get(&delegator).unwrap();
+        assert_eq!(wallet.pending_undelegations.len(), 1);
+        assert_eq!(
+            wallet
+                .pending_undelegations
+                .get(&(validator_address, 8))
+                .unwrap()
+                .amount,
+            U256::from(100)
+        );
+
+        // Claiming the other leaves none.
+        let block4 = block3
+            .next(
+                &NoMetadata,
+                &BlockInput::empty(5).with_event(StakeTableV3Events::WithdrawalClaimed(
+                    WithdrawalClaimed {
+                        delegator,
+                        validator: validator_address,
+                        undelegationId: 8,
+                        amount: U256::from(100),
+                    },
+                )),
+            )
+            .await;
+
+        let wallet = block4.state.wallets.get(&delegator).unwrap();
+        assert_eq!(wallet.pending_undelegations.len(), 0);
     }
 
     #[test_log::test(tokio::test(flavor = "multi_thread"))]

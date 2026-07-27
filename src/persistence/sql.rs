@@ -45,6 +45,9 @@ pub struct PersistenceOptions {
     pub max_connections: u32,
 }
 
+/// A `pending_withdrawals` row: node, undelegation ID, withdrawal type, amount, and unlock time.
+type PendingWithdrawalRow = (String, i64, String, String, i64);
+
 #[derive(Debug, Clone)]
 pub struct Persistence {
     pool: SqlitePool,
@@ -164,8 +167,9 @@ impl Persistence {
         .fetch_all(tx.as_mut())
         .await?;
 
-        let all_pending = sqlx::query_as::<_, (String, String, String, String, i64)>(
-            "SELECT delegator, node, withdrawal_type, amount, unlocks_at FROM pending_withdrawals",
+        let all_pending = sqlx::query_as::<_, (String, String, i64, String, String, i64)>(
+            "SELECT delegator, node, undelegation_id, withdrawal_type, amount, unlocks_at
+             FROM pending_withdrawals",
         )
         .fetch_all(tx.as_mut())
         .await?;
@@ -178,11 +182,11 @@ impl Persistence {
                 .push((node, amount));
         }
 
-        let mut pending_by_wallet: HashMap<String, Vec<(String, String, String, i64)>> =
-            HashMap::new();
-        for (delegator, node, withdrawal_type, amount, unlocks_at) in all_pending {
+        let mut pending_by_wallet: HashMap<String, Vec<PendingWithdrawalRow>> = HashMap::new();
+        for (delegator, node, undelegation_id, withdrawal_type, amount, unlocks_at) in all_pending {
             pending_by_wallet.entry(delegator).or_default().push((
                 node,
+                undelegation_id,
                 withdrawal_type,
                 amount,
                 unlocks_at,
@@ -217,7 +221,9 @@ impl Persistence {
             let mut pending_undelegations = im::OrdMap::new();
             let mut pending_exits = im::OrdMap::new();
             if let Some(pending_rows) = pending_by_wallet.remove(&wallet_address) {
-                for (node_str, withdrawal_type_str, amount_str, available_time) in pending_rows {
+                for (node_str, undelegation_id, withdrawal_type_str, amount_str, available_time) in
+                    pending_rows
+                {
                     let node: Address = node_str.parse().context("failed to parse node address")?;
                     let amount =
                         U256::from_str(&amount_str).context("failed to parse pending amount")?;
@@ -226,13 +232,15 @@ impl Persistence {
                     let withdrawal = PendingWithdrawal {
                         delegator: address,
                         node,
+                        undelegation_id: undelegation_id as u64,
                         amount,
                         available_time: available_time as u64,
                     };
 
                     match withdrawal_type {
                         WithdrawalType::Undelegation => {
-                            pending_undelegations.insert(node, withdrawal);
+                            pending_undelegations
+                                .insert((node, withdrawal.undelegation_id), withdrawal);
                         }
                         WithdrawalType::Exit => {
                             pending_exits.insert(node, withdrawal);
@@ -459,13 +467,14 @@ impl Persistence {
                 }
 
                 // Insert pending undelegation
-                // we expect this to fail if there's already a pending undelegation
+                // we expect this to fail if there's already a pending undelegation with this ID
                 sqlx::query(
-                    "INSERT INTO pending_withdrawals (delegator, node, withdrawal_type, amount, unlocks_at)
-                     VALUES ($1, $2, $3, $4, $5)",
+                    "INSERT INTO pending_withdrawals (delegator, node, undelegation_id, withdrawal_type, amount, unlocks_at)
+                     VALUES ($1, $2, $3, $4, $5, $6)",
                 )
                 .bind(withdrawal.delegator.to_string())
                 .bind(withdrawal.node.to_string())
+                .bind(withdrawal.undelegation_id as i64)
                 .bind(String::from(WithdrawalType::Undelegation))
                 .bind(withdrawal.amount.to_string())
                 .bind(withdrawal.available_time as i64)
@@ -494,11 +503,12 @@ impl Persistence {
                 // Insert pending exit with the amount from the withdrawal
                 // we expect this to fail if there is already a pending exit
                 sqlx::query(
-                    "INSERT INTO pending_withdrawals (delegator, node, withdrawal_type, amount, unlocks_at)
-                     VALUES ($1, $2, $3, $4, $5)",
+                    "INSERT INTO pending_withdrawals (delegator, node, undelegation_id, withdrawal_type, amount, unlocks_at)
+                     VALUES ($1, $2, $3, $4, $5, $6)",
                 )
                 .bind(withdrawal.delegator.to_string())
                 .bind(withdrawal.node.to_string())
+                .bind(withdrawal.undelegation_id as i64)
                 .bind(String::from(WithdrawalType::Exit))
                 .bind(withdrawal.amount.to_string())
                 .bind(withdrawal.available_time as i64)
@@ -509,10 +519,12 @@ impl Persistence {
                 // Delete the pending undelegation withdrawal
                 let result = sqlx::query(
                     "DELETE FROM pending_withdrawals
-                     WHERE delegator = $1 AND node = $2 AND withdrawal_type = 'undelegation'",
+                     WHERE delegator = $1 AND node = $2 AND undelegation_id = $3
+                       AND withdrawal_type = 'undelegation'",
                 )
                 .bind(withdrawal.delegator.to_string())
                 .bind(withdrawal.node.to_string())
+                .bind(withdrawal.undelegation_id as i64)
                 .execute(&mut **tx)
                 .await?;
 
@@ -1139,6 +1151,7 @@ mod tests {
                     WalletDiff::UndelegatedFromNode(PendingWithdrawal {
                         delegator: delegator1,
                         node: node1.address,
+                        undelegation_id: 1,
                         amount: U256::from(1000000u64),
                         available_time: 800,
                     }),
@@ -1146,6 +1159,7 @@ mod tests {
                     WalletDiff::UndelegationWithdrawal(Withdrawal {
                         delegator: delegator1,
                         node: node1.address,
+                        undelegation_id: 1,
                         amount: U256::from(1000000u64),
                     }),
                     // Delegator1 claims rewards
@@ -1171,6 +1185,7 @@ mod tests {
                     WalletDiff::UndelegatedFromNode(PendingWithdrawal {
                         delegator: delegator2,
                         node: node1.address,
+                        undelegation_id: 2,
                         amount: U256::from(500000u64),
                         available_time: 900,
                     }),
@@ -1251,6 +1266,7 @@ mod tests {
             vec![WalletDiff::NodeExited(PendingWithdrawal {
                 delegator: delegator3,
                 node: node4.address,
+                undelegation_id: 0,
                 amount: U256::from(8000000u64),
                 available_time: 1500,
             })],
@@ -1335,7 +1351,7 @@ mod tests {
         assert_eq!(
             loaded_wallet2
                 .pending_undelegations
-                .get(&node1.address)
+                .get(&(node1.address, 2))
                 .unwrap()
                 .amount,
             U256::from(500000u64)
@@ -1373,6 +1389,7 @@ mod tests {
                     WalletDiff::UndelegatedFromNode(PendingWithdrawal {
                         delegator: delegator1,
                         node: node1.address,
+                        undelegation_id: 3,
                         amount: U256::from(1000000u64),
                         available_time: 1100,
                     }),
@@ -1381,6 +1398,7 @@ mod tests {
                     WalletDiff::NodeExited(PendingWithdrawal {
                         delegator: delegator1,
                         node: node2.address,
+                        undelegation_id: 0,
                         amount: U256::from(3000000u64),
                         available_time: 1200,
                     }),
@@ -1396,6 +1414,7 @@ mod tests {
                     WalletDiff::NodeExited(PendingWithdrawal {
                         delegator: delegator2,
                         node: node2.address,
+                        undelegation_id: 0,
                         amount: U256::from(10000000u64),
                         available_time: 1200,
                     }),
@@ -1403,6 +1422,7 @@ mod tests {
                     WalletDiff::UndelegationWithdrawal(Withdrawal {
                         delegator: delegator2,
                         node: node1.address,
+                        undelegation_id: 2,
                         amount: U256::from(500000u64),
                     }),
                     // Delegator2 claims rewards
@@ -1416,6 +1436,7 @@ mod tests {
                     WalletDiff::NodeExitWithdrawal(Withdrawal {
                         delegator: delegator3,
                         node: node4.address,
+                        undelegation_id: 0,
                         amount: U256::from(8000000u64),
                     }),
                     // Delegator3 delegates to new node5
@@ -1500,7 +1521,7 @@ mod tests {
         assert_eq!(
             wallet1
                 .pending_undelegations
-                .get(&node1.address)
+                .get(&(node1.address, 3))
                 .unwrap()
                 .amount,
             U256::from(1000000u64)
@@ -1560,6 +1581,128 @@ mod tests {
         assert_eq!(wallet3.pending_undelegations.len(), 0);
         // NodeExitWithdrawal completed, so no more pending_exits
         assert_eq!(wallet3.pending_exits.len(), 0);
+    }
+
+    /// Two pending undelegations from the same node, distinguished by undelegation ID, survive a
+    /// save/load round trip and can be withdrawn independently.
+    #[test_log::test(tokio::test)]
+    async fn test_concurrent_pending_undelegations_same_node() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+
+        let options = PersistenceOptions {
+            path: db_path,
+            max_connections: 5,
+        };
+
+        let mut persistence = Persistence::new(&options).await.unwrap();
+
+        let node = make_node(1);
+        let delegator = Address::random();
+
+        persistence
+            .save_genesis(Snapshot::empty(block_snapshot(0)))
+            .await
+            .unwrap();
+
+        // Delegate, then undelegate twice from the same node in one block.
+        let wallet_diffs = [(
+            delegator,
+            vec![
+                WalletDiff::DelegatedToNode(Delegation {
+                    delegator,
+                    node: node.address,
+                    amount: U256::from(1000u64),
+                }),
+                WalletDiff::UndelegatedFromNode(PendingWithdrawal {
+                    delegator,
+                    node: node.address,
+                    undelegation_id: 7,
+                    amount: U256::from(400u64),
+                    available_time: 800,
+                }),
+                WalletDiff::UndelegatedFromNode(PendingWithdrawal {
+                    delegator,
+                    node: node.address,
+                    undelegation_id: 8,
+                    amount: U256::from(100u64),
+                    available_time: 900,
+                }),
+            ],
+        )]
+        .into_iter()
+        .collect();
+
+        persistence
+            .apply_updates(vec![Update {
+                block: block_snapshot(100),
+                node_set_diffs: vec![FullNodeSetDiff::NodeUpdate(Arc::new(node.clone()))],
+                wallet_diffs,
+            }])
+            .await
+            .unwrap();
+
+        let snapshot = persistence
+            .load_finalized_snapshot()
+            .await
+            .unwrap()
+            .unwrap();
+        let wallet = snapshot.wallets.get(&delegator).unwrap();
+        assert_eq!(
+            wallet.nodes.get(&node.address).unwrap().amount,
+            U256::from(500u64)
+        );
+        assert_eq!(wallet.pending_undelegations.len(), 2);
+        let first = wallet
+            .pending_undelegations
+            .get(&(node.address, 7))
+            .unwrap();
+        assert_eq!(first.amount, U256::from(400u64));
+        assert_eq!(first.available_time, 800);
+        let second = wallet
+            .pending_undelegations
+            .get(&(node.address, 8))
+            .unwrap();
+        assert_eq!(second.amount, U256::from(100u64));
+        assert_eq!(second.available_time, 900);
+
+        // Withdraw one of the two undelegations; only that one is removed.
+        let wallet_diffs = [(
+            delegator,
+            vec![WalletDiff::UndelegationWithdrawal(Withdrawal {
+                delegator,
+                node: node.address,
+                undelegation_id: 7,
+                amount: U256::from(400u64),
+            })],
+        )]
+        .into_iter()
+        .collect();
+
+        persistence
+            .apply_updates(vec![Update {
+                block: block_snapshot(101),
+                node_set_diffs: vec![],
+                wallet_diffs,
+            }])
+            .await
+            .unwrap();
+
+        let snapshot = persistence
+            .load_finalized_snapshot()
+            .await
+            .unwrap()
+            .unwrap();
+        let wallet = snapshot.wallets.get(&delegator).unwrap();
+        assert_eq!(wallet.pending_undelegations.len(), 1);
+        assert_eq!(
+            wallet
+                .pending_undelegations
+                .get(&(node.address, 8))
+                .unwrap()
+                .amount,
+            U256::from(100u64)
+        );
     }
 
     #[test_log::test(tokio::test(flavor = "multi_thread"))]
