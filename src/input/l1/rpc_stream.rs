@@ -19,7 +19,10 @@ use futures::{
 };
 use std::{
     pin::Pin,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     task::{Context, Poll},
     time::Duration,
 };
@@ -33,6 +36,12 @@ struct RpcStreamBuilder {
     /// Transport for switching between HTTP providers
     transport: SwitchingTransport,
     options: L1ClientOptions,
+    /// Index into `l1_ws_provider` for the next connection attempt, shared
+    /// across `establish_stream` calls so reconnects advance instead of
+    /// restarting at the first URL. `Relaxed` suffices because `establish_stream`
+    /// is only ever reached sequentially, from the single task driving the
+    /// stream (see `src/input/l1.rs:293-312`).
+    ws_provider_index: AtomicUsize,
 }
 
 /// An L1 event stream based on a standard JSON-RPC server.
@@ -59,6 +68,7 @@ impl RpcStreamBuilder {
             provider: Arc::new(provider),
             transport,
             options,
+            ws_provider_index: AtomicUsize::new(0),
         })
     }
 
@@ -107,12 +117,12 @@ impl RpcStreamBuilder {
             .connect_ws(WsConnect::new(url.clone()))
             .await
             .map_err(|err| {
-                tracing::warn!("Failed to connect WebSockets provider: {err:#}");
+                tracing::warn!(%url, "Failed to connect WebSockets provider: {err:#}");
                 Error::internal().context(format!("Failed to connect: {err}"))
             })?;
 
         let block_stream = ws.subscribe_blocks().await.map_err(|err| {
-            tracing::warn!("Failed to subscribe to blocks: {err:#}");
+            tracing::warn!(%url, "Failed to subscribe to blocks: {err:#}");
             Error::internal().context(format!("Failed to subscribe using ws: {err}"))
         })?;
         tracing::info!(%url, "Successfully connected to WebSocket provider and subscribed to blocks");
@@ -125,17 +135,20 @@ impl RpcStreamBuilder {
 
         let provider_for_fetch = provider.clone();
         let block_stream = block_stream.into_stream();
+        let url = url.clone();
 
         Ok(stream::unfold(
             (block_stream, last_block, ws),
             move |(mut stream, mut last_block_number, ws)| {
                 let provider = provider.clone();
+                let url = url.clone();
 
                 async move {
                     let head = match timeout(subscription_timeout, stream.next()).await {
                         Ok(item) => item?,
                         Err(err) => {
                             tracing::warn!(
+                                %url,
                                 ?subscription_timeout,
                                 "did not receive new L1 head within expected timeout: {err:#}",
                             );
@@ -243,32 +256,32 @@ impl RpcStreamBuilder {
     /// Establish a new block stream connection
     async fn establish_stream(&self, last_block: Option<u64>) -> BoxStream<'static, BlockInput> {
         // Try to establish connection with retries
-        for i in 0.. {
-            let res = match &self.options.l1_ws_provider {
+        loop {
+            let (target, res) = match &self.options.l1_ws_provider {
                 Some(urls) => {
-                    let provider_index = i % urls.len();
-                    let url = &urls[provider_index];
-                    self.create_ws_stream(url, last_block).await
+                    let provider_index =
+                        self.ws_provider_index.fetch_add(1, Ordering::Relaxed) % urls.len();
+                    let url = urls[provider_index].clone();
+                    let res = self.create_ws_stream(&url, last_block).await;
+                    (url.to_string(), res)
                 }
-                None => self.create_http_stream(last_block).await,
+                None => (
+                    "http".to_string(),
+                    self.create_http_stream(last_block).await,
+                ),
             };
 
             match res {
                 Ok(stream) => {
-                    tracing::info!(attempt = i, "Successfully established L1 block stream");
+                    tracing::info!("Successfully established L1 block stream");
                     return stream;
                 }
                 Err(err) => {
-                    tracing::warn!(
-                        attempt = i,
-                        "Failed to establish stream: {err}, retrying..."
-                    );
+                    tracing::warn!(url = %target, "Failed to establish stream: {err}, retrying...");
                     sleep(self.options.l1_retry_delay).await;
                 }
             }
         }
-
-        unreachable!("Infinite loop")
     }
 }
 
@@ -297,6 +310,8 @@ impl Stream for RpcStream {
 }
 
 impl ResettableStream for RpcStream {
+    /// Note: this advances the shared WS provider rotation index, so a reset may
+    /// reconnect via a different WS endpoint even if the current one is healthy.
     async fn reset(&mut self, block: u64) {
         tracing::info!("Resetting RpcStream to block {block}");
 
@@ -1324,5 +1339,37 @@ mod tests {
         // Now check that the higher-level stream with reconnects is still able to yield blocks.
         let mut stream = builder.build().await;
         stream.next().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[test_log::test]
+    async fn test_ws_provider_rotates_on_silent_stream() {
+        // Stuck anvil accepts the WS subscription but never mines a block, so it
+        // never pushes a new head.
+        let stuck_anvil = Anvil::new().spawn();
+        let stuck_ws_url = stuck_anvil.ws_endpoint().parse::<Url>().unwrap();
+
+        let live_anvil = Anvil::new().block_time(1).spawn();
+        let live_ws_url = live_anvil.ws_endpoint().parse::<Url>().unwrap();
+        let live_http_url = live_anvil.endpoint().parse::<Url>().unwrap();
+
+        let options = L1ClientOptions {
+            l1_ws_provider: Some(vec![stuck_ws_url, live_ws_url]),
+            http_providers: vec![live_http_url],
+            subscription_timeout: Duration::from_secs(1),
+            l1_retry_delay: Duration::from_millis(100),
+            stake_table_address: Address::ZERO,
+            reward_contract_address: Address::ZERO,
+            ..Default::default()
+        };
+
+        let mut stream = RpcStream::new(options).await.unwrap();
+
+        let block_input = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("stream never rotated off the stuck WS provider")
+            .expect("stream ended unexpectedly");
+
+        assert!(block_input.block.number > 0);
     }
 }
