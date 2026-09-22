@@ -19,15 +19,22 @@ use futures::{
 };
 use std::{
     pin::Pin,
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
+    sync::{Arc, Mutex},
     task::{Context, Poll},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tide_disco::Url;
 use tokio::time::{sleep, timeout};
+
+/// Rotation state for `l1_ws_provider`: which index to use for the next
+/// connection attempt, and (mirroring `SwitchingTransport`'s revert-to-primary
+/// behavior for HTTP) an optional scheduled time to fall back to the primary
+/// (index 0) after having failed over to a backup.
+#[derive(Default)]
+struct WsRotationState {
+    index: usize,
+    revert_at: Option<Instant>,
+}
 
 /// Builder for creating an RpcStream.
 struct RpcStreamBuilder {
@@ -36,12 +43,10 @@ struct RpcStreamBuilder {
     /// Transport for switching between HTTP providers
     transport: SwitchingTransport,
     options: L1ClientOptions,
-    /// Index into `l1_ws_provider` for the next connection attempt, shared
-    /// across `establish_stream` calls so reconnects advance instead of
-    /// restarting at the first URL. `Relaxed` suffices because `establish_stream`
-    /// is only ever reached sequentially, from the single task driving the
-    /// stream (see `src/input/l1.rs:293-312`).
-    ws_provider_index: AtomicUsize,
+    /// Guarded by a plain `Mutex`, not an atomic: `establish_stream` is only
+    /// ever reached sequentially, from the single task driving the stream (see
+    /// `src/input/l1.rs:293-312`), so contention is a non-issue.
+    ws_rotation: Mutex<WsRotationState>,
 }
 
 /// An L1 event stream based on a standard JSON-RPC server.
@@ -68,7 +73,7 @@ impl RpcStreamBuilder {
             provider: Arc::new(provider),
             transport,
             options,
-            ws_provider_index: AtomicUsize::new(0),
+            ws_rotation: Mutex::new(WsRotationState::default()),
         })
     }
 
@@ -259,9 +264,7 @@ impl RpcStreamBuilder {
         loop {
             let (target, res) = match &self.options.l1_ws_provider {
                 Some(urls) => {
-                    let provider_index =
-                        self.ws_provider_index.fetch_add(1, Ordering::Relaxed) % urls.len();
-                    let url = urls[provider_index].clone();
+                    let url = self.select_ws_provider(urls);
                     let res = self.create_ws_stream(&url, last_block).await;
                     (url.to_string(), res)
                 }
@@ -282,6 +285,31 @@ impl RpcStreamBuilder {
                 }
             }
         }
+    }
+
+    /// Pick the WS provider for the next connection attempt, applying a
+    /// scheduled revert-to-primary if due, and scheduling one if this pick
+    /// fails over away from the primary.
+    fn select_ws_provider(&self, urls: &[Url]) -> Url {
+        let mut rotation = self.ws_rotation.lock().expect("ws_rotation lock poisoned");
+
+        if let Some(revert_at) = rotation.revert_at
+            && Instant::now() >= revert_at
+        {
+            rotation.index = 0;
+            rotation.revert_at = None;
+        }
+
+        let index = rotation.index % urls.len();
+        rotation.index = rotation.index.wrapping_add(1);
+
+        if index == 0 {
+            rotation.revert_at = None;
+        } else if rotation.revert_at.is_none() {
+            rotation.revert_at = Some(Instant::now() + self.options.l1_failover_revert);
+        }
+
+        urls[index].clone()
     }
 }
 
@@ -311,7 +339,8 @@ impl Stream for RpcStream {
 
 impl ResettableStream for RpcStream {
     /// Note: this advances the shared WS provider rotation index, so a reset may
-    /// reconnect via a different WS endpoint even if the current one is healthy.
+    /// reconnect via a different WS endpoint even if the current one is healthy;
+    /// a due revert-to-primary (see `WsRotationState`) can also bring it back.
     async fn reset(&mut self, block: u64) {
         tracing::info!("Resetting RpcStream to block {block}");
 
@@ -1371,5 +1400,97 @@ mod tests {
             .expect("stream ended unexpectedly");
 
         assert!(block_input.block.number > 0);
+    }
+
+    #[tokio::test]
+    #[test_log::test]
+    async fn test_ws_provider_reverts_to_primary_after_failover_revert() {
+        // Primary is "stuck": it accepts the WS subscription but never mines, so
+        // it never pushes a new head and the subscription silently stalls.
+        let stuck_anvil = Anvil::new().spawn();
+        let stuck_ws_url = stuck_anvil.ws_endpoint().parse::<Url>().unwrap();
+
+        let live_anvil = Anvil::new().block_time(1).spawn();
+        let live_ws_url = live_anvil.ws_endpoint().parse::<Url>().unwrap();
+        let live_http_url = live_anvil.endpoint().parse::<Url>().unwrap();
+
+        // Subscription timeout is comfortably larger than the backup's block
+        // time so normal mining jitter never causes a spurious timeout.
+        let subscription_timeout = Duration::from_secs(2);
+        let retry_delay = Duration::from_millis(100);
+        let failover_revert = Duration::from_millis(1500);
+        let options = L1ClientOptions {
+            l1_ws_provider: Some(vec![stuck_ws_url, live_ws_url]),
+            http_providers: vec![live_http_url],
+            subscription_timeout,
+            l1_retry_delay: retry_delay,
+            l1_failover_revert: failover_revert,
+            stake_table_address: Address::ZERO,
+            reward_contract_address: Address::ZERO,
+            ..Default::default()
+        };
+
+        let mut stream = RpcStream::new(options).await.unwrap();
+        let builder = stream.builder.clone();
+
+        // RpcStream only makes progress (timeouts, reconnects) while something
+        // is polling it, same as `State::subscribe` does in production. Drive
+        // it in the background so the assertions below can use real time.
+        let driver = tokio::spawn(async move { while stream.next().await.is_some() {} });
+
+        tokio::time::sleep(subscription_timeout + retry_delay + Duration::from_millis(300)).await;
+        {
+            let rotation = builder.ws_rotation.lock().unwrap();
+            assert_eq!(rotation.index, 2, "should have failed over to the backup");
+            assert!(
+                rotation.revert_at.is_some(),
+                "failing over to a backup should schedule a revert-to-primary"
+            );
+        }
+
+        // Wait past the revert deadline while the backup is still healthy: the
+        // revert is only applied lazily on the next reconnect, so nothing
+        // should happen yet.
+        tokio::time::sleep(failover_revert + Duration::from_millis(500)).await;
+        {
+            let rotation = builder.ws_rotation.lock().unwrap();
+            assert_eq!(rotation.index, 2, "should still be on the backup");
+        }
+
+        let live_provider =
+            ProviderBuilder::new().connect_http(live_anvil.endpoint().parse::<Url>().unwrap());
+        live_provider.anvil_set_interval_mining(0).await.unwrap();
+
+        // The primary is permanently stuck, so once reverted it will time out
+        // again and round-robin will bounce straight back to the backup; poll
+        // for the reverted state instead of sampling once at a fixed time, to
+        // reliably catch that `subscription_timeout`-wide window rather than
+        // requiring a hand-tuned sleep to land inside it.
+        let reverted = tokio::time::timeout(
+            subscription_timeout * 2 + retry_delay * 2 + Duration::from_secs(1),
+            async {
+                loop {
+                    // With plain round-robin (no revert), the raw counter would
+                    // keep advancing (0, 1, 2, ...) and never return to 1 here,
+                    // coincidentally selecting the primary anyway on this
+                    // particular 2-URL cycle but not resetting the counter.
+                    let reset = {
+                        let rotation = builder.ws_rotation.lock().unwrap();
+                        rotation.index == 1 && rotation.revert_at.is_none()
+                    };
+                    if reset {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            },
+        )
+        .await;
+        driver.abort();
+
+        assert!(
+            reverted.is_ok(),
+            "should have reset the rotation to the primary and cleared the revert schedule"
+        );
     }
 }
