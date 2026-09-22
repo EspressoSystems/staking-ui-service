@@ -34,11 +34,11 @@ use hotshot_query_service::data_source::{SqlDataSource, sql::testing::TmpDb};
 use hotshot_types::{
     data::{EpochNumber, QuorumProposal2, QuorumProposalWrapper, ViewNumber},
     drb::DrbResult,
+    light_client::StateVerKey,
     simple_certificate::QuorumCertificate2,
     traits::signature_key::{SignatureKey, StateSignatureKey},
     utils::{epoch_from_block_number, is_transition_block, transition_block_for_epoch},
 };
-use jf_signature::schnorr::VerKey;
 use rand::{RngCore, SeedableRng, rngs::StdRng};
 use staking_cli::{
     DEV_MNEMONIC,
@@ -101,7 +101,7 @@ impl EspressoClient for MockEspressoClient {
                 let account = Address::from_word(address_bytes);
 
                 let stake_table_key = PubKey::generated_from_seed_indexed(seed, i).0;
-                let state_ver_key = VerKey::generated_from_seed_indexed(seed, i).0;
+                let state_ver_key = StateVerKey::generated_from_seed_indexed(seed, i).0;
 
                 let stake = ESPTokenAmount::from(1);
                 let node = RegisteredValidator {

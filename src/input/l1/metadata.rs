@@ -362,6 +362,20 @@ mod test {
     use vbs::version::{StaticVersion, StaticVersionType};
     use warp::Filter;
 
+    /// `hotshot_query_service::metrics::PrometheusMetrics::export` is now inherent rather than
+    /// a `tide_disco::metrics::Metrics` impl, so `Api::metrics`'s `T: Metrics` bound needs this
+    /// wrapper to delegate back to it.
+    #[derive(Clone)]
+    struct QueryServiceMetrics(PrometheusMetrics);
+
+    impl tide_disco::metrics::Metrics for QueryServiceMetrics {
+        type Error = hotshot_query_service::metrics::MetricsError;
+
+        fn export(&self) -> Result<String, Self::Error> {
+            self.0.export()
+        }
+    }
+
     #[test_log::test]
     fn test_parse_prometheus_all_fields() {
         let pub_key = PubKey::generated_from_seed_indexed(Default::default(), 42).0;
@@ -754,7 +768,9 @@ mod test {
                 .set(1);
         }
 
-        let mut app = tide_disco::App::<_, Error>::with_state(Arc::new(RwLock::new(metrics)));
+        let mut app = tide_disco::App::<_, Error>::with_state(Arc::new(RwLock::new(
+            QueryServiceMetrics(metrics),
+        )));
         let api = toml! {
             [route.metadata]
             PATH = ["/metadata"]
@@ -830,7 +846,7 @@ mod test {
                 .create(vec![expected.client_version.clone().unwrap()])
                 .set(1);
         }
-        let metrics_text = tide_disco::metrics::Metrics::export(&metrics).unwrap();
+        let metrics_text = metrics.export().unwrap();
 
         let json_route = {
             let json = json_content.clone();

@@ -47,12 +47,9 @@ use hotshot_contract_adapter::{
 };
 use hotshot_state_prover::v1::mock_ledger::STAKE_TABLE_CAPACITY_FOR_TEST;
 use hotshot_types::{
-    light_client::{StateKeyPair, StateVerKey, hash_bytes_to_field},
-    signature_key::BLSKeyPair,
-    traits::signature_key::{SignatureKey, StateSignatureKey},
+    light_client::StateKeyPair, signature_key::BLSKeyPair, traits::signature_key::SignatureKey,
     x25519,
 };
-use jf_signature::{SignatureScheme, schnorr::SchnorrSignatureScheme};
 use pretty_assertions::assert_eq;
 use rand::{CryptoRng, Rng, RngCore, SeedableRng, rngs::StdRng, seq::IteratorRandom};
 use staking_cli::demo::{DelegationConfig, StakingKeySet, StakingTransactions};
@@ -669,25 +666,18 @@ pub fn validator_registered_event_with_account(
 ) -> ValidatorRegisteredV2 {
     let index = rng.next_u64();
     let (bls_vk, bls_sk) = PubKey::generated_from_seed_indexed(Default::default(), index);
-    let (schnorr_vk, schnorr_sk) =
-        StateVerKey::generated_from_seed_indexed(Default::default(), index);
+    let schnorr_key_pair = StateKeyPair::generate_from_seed_indexed(Default::default(), index);
 
     let auth_msg = account.abi_encode();
     let bls_sig = PubKey::sign(&bls_sk, &auth_msg).unwrap();
-    let schnorr_sig = SchnorrSignatureScheme::sign(
-        &(),
-        &schnorr_sk,
-        [hash_bytes_to_field(&auth_msg).unwrap()],
-        &mut rng,
-    )
-    .unwrap();
+    let schnorr_sig = sign_address_schnorr(&schnorr_key_pair, account);
 
     let commission = rng.gen_range(0..COMMISSION_BASIS_POINTS);
 
     ValidatorRegisteredV2 {
         account,
         blsVK: bls_vk.into(),
-        schnorrVK: schnorr_vk.into(),
+        schnorrVK: schnorr_key_pair.ver_key().into(),
         commission,
         blsSig: G1PointSol::from(bls_sig).into(),
         schnorrSig: StateSignatureSol::from(schnorr_sig).into(),
@@ -1012,6 +1002,7 @@ impl ContractDeployment {
                     x25519: x25519::Keypair::generated_from_seed_indexed(seed, index as u64)
                         .unwrap(),
                     p2p_addr: "127.0.0.1:8080".parse().unwrap(),
+                    metadata_uri: None,
                 }
             })
             .collect()
@@ -1158,6 +1149,7 @@ impl BackgroundTaskState {
                 x25519: x25519::Keypair::generated_from_seed_indexed(seed, self.validator_index)
                     .unwrap(),
                 p2p_addr: "127.0.0.1:8080".parse().unwrap(),
+                metadata_uri: None,
             }],
             None,
             DelegationConfig::MultipleDelegators,
