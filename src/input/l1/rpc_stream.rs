@@ -19,12 +19,20 @@ use futures::{
 };
 use std::{
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, Mutex},
     task::{Context, Poll},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tide_disco::Url;
 use tokio::time::{sleep, timeout};
+
+/// `revert_at` arms only once a backup delivers a head, not when picked, so
+/// backups that never prove healthy don't block reaching later ones.
+#[derive(Default)]
+struct WsRotationState {
+    index: usize,
+    revert_at: Option<Instant>,
+}
 
 /// Builder for creating an RpcStream.
 struct RpcStreamBuilder {
@@ -33,6 +41,10 @@ struct RpcStreamBuilder {
     /// Transport for switching between HTTP providers
     transport: SwitchingTransport,
     options: L1ClientOptions,
+    /// Mutex not atomic: only ever accessed sequentially, from the single task
+    /// driving the stream (`src/input/l1.rs:293-312`). Arc so it can be cloned
+    /// into `create_ws_stream`'s 'static closures.
+    ws_rotation: Arc<Mutex<WsRotationState>>,
 }
 
 /// An L1 event stream based on a standard JSON-RPC server.
@@ -59,22 +71,25 @@ impl RpcStreamBuilder {
             provider: Arc::new(provider),
             transport,
             options,
+            ws_rotation: Arc::new(Mutex::new(WsRotationState::default())),
         })
     }
 
     /// Build the RpcStream
     async fn build(self) -> RpcStream {
         let builder = Arc::new(self);
-        let stream = builder.clone().stream_with_reconnect(None).await;
+        let stream = builder.clone().stream_with_reconnect(None, false).await;
         RpcStream { stream, builder }
     }
 
-    /// Create the stream wrapper with reconnection
+    /// `advance` applies only to the first connection attempt; a stream that
+    /// ends after connecting always advances on reconnect.
     async fn stream_with_reconnect(
         self: Arc<Self>,
         last_block: Option<u64>,
+        advance: bool,
     ) -> BoxStream<'static, BlockInput> {
-        let stream = self.establish_stream(last_block).await;
+        let stream = self.establish_stream(last_block, advance).await;
 
         stream::unfold(
             (self.clone(), stream, last_block),
@@ -88,7 +103,7 @@ impl RpcStreamBuilder {
                         None => {
                             sleep(builder.options.l1_retry_delay).await;
                             tracing::warn!("L1 block stream ended, reconnecting...");
-                            stream = builder.establish_stream(last_block).await;
+                            stream = builder.establish_stream(last_block, true).await;
                             tracing::info!("Successfully reconnected to L1 block stream");
                         }
                     }
@@ -101,18 +116,19 @@ impl RpcStreamBuilder {
     async fn create_ws_stream(
         &self,
         url: &Url,
+        is_primary: bool,
         last_block: Option<u64>,
     ) -> Result<BoxStream<'static, BlockInput>> {
         let ws = ProviderBuilder::new()
             .connect_ws(WsConnect::new(url.clone()))
             .await
             .map_err(|err| {
-                tracing::warn!("Failed to connect WebSockets provider: {err:#}");
+                tracing::warn!(%url, "Failed to connect WebSockets provider: {err:#}");
                 Error::internal().context(format!("Failed to connect: {err}"))
             })?;
 
         let block_stream = ws.subscribe_blocks().await.map_err(|err| {
-            tracing::warn!("Failed to subscribe to blocks: {err:#}");
+            tracing::warn!(%url, "Failed to subscribe to blocks: {err:#}");
             Error::internal().context(format!("Failed to subscribe using ws: {err}"))
         })?;
         tracing::info!(%url, "Successfully connected to WebSocket provider and subscribed to blocks");
@@ -122,20 +138,26 @@ impl RpcStreamBuilder {
         let provider = self.provider.clone();
         let stake_table_address = self.options.stake_table_address;
         let reward_contract_address = self.options.reward_contract_address;
+        let ws_rotation = self.ws_rotation.clone();
+        let failover_revert = self.options.l1_failover_revert;
 
         let provider_for_fetch = provider.clone();
         let block_stream = block_stream.into_stream();
+        let url = url.clone();
 
         Ok(stream::unfold(
             (block_stream, last_block, ws),
             move |(mut stream, mut last_block_number, ws)| {
                 let provider = provider.clone();
+                let url = url.clone();
+                let ws_rotation = ws_rotation.clone();
 
                 async move {
                     let head = match timeout(subscription_timeout, stream.next()).await {
                         Ok(item) => item?,
                         Err(err) => {
                             tracing::warn!(
+                                %url,
                                 ?subscription_timeout,
                                 "did not receive new L1 head within expected timeout: {err:#}",
                             );
@@ -145,6 +167,7 @@ impl RpcStreamBuilder {
                             return None;
                         }
                     };
+                    arm_ws_failover_revert(&ws_rotation, is_primary, failover_revert);
                     let blocks =
                         process_block_header(provider, &mut last_block_number, head, retry_delay);
                     Some((blocks, (stream, last_block_number, ws)))
@@ -240,35 +263,76 @@ impl RpcStreamBuilder {
         .boxed())
     }
 
-    /// Establish a new block stream connection
-    async fn establish_stream(&self, last_block: Option<u64>) -> BoxStream<'static, BlockInput> {
-        // Try to establish connection with retries
-        for i in 0.. {
-            let res = match &self.options.l1_ws_provider {
+    /// A connect/subscribe failure always advances on retry, regardless of
+    /// the `advance` argument.
+    async fn establish_stream(
+        &self,
+        last_block: Option<u64>,
+        advance: bool,
+    ) -> BoxStream<'static, BlockInput> {
+        let mut advance = advance;
+        loop {
+            let (target, res) = match &self.options.l1_ws_provider {
                 Some(urls) => {
-                    let provider_index = i % urls.len();
-                    let url = &urls[provider_index];
-                    self.create_ws_stream(url, last_block).await
+                    let (url, is_primary) = self.select_ws_provider(urls, advance);
+                    let res = self.create_ws_stream(&url, is_primary, last_block).await;
+                    (url.to_string(), res)
                 }
-                None => self.create_http_stream(last_block).await,
+                None => (
+                    "http".to_string(),
+                    self.create_http_stream(last_block).await,
+                ),
             };
 
             match res {
                 Ok(stream) => {
-                    tracing::info!(attempt = i, "Successfully established L1 block stream");
+                    tracing::info!("Successfully established L1 block stream");
                     return stream;
                 }
                 Err(err) => {
-                    tracing::warn!(
-                        attempt = i,
-                        "Failed to establish stream: {err}, retrying..."
-                    );
+                    tracing::warn!(url = %target, "Failed to establish stream: {err}, retrying...");
                     sleep(self.options.l1_retry_delay).await;
+                    advance = true;
                 }
             }
         }
+    }
 
-        unreachable!("Infinite loop")
+    /// A due revert takes priority over `advance`. Returns the URL and
+    /// whether it is the primary (index 0).
+    fn select_ws_provider(&self, urls: &[Url], advance: bool) -> (Url, bool) {
+        let mut rotation = self.ws_rotation.lock().expect("ws_rotation lock poisoned");
+
+        if let Some(revert_at) = rotation.revert_at
+            && Instant::now() >= revert_at
+        {
+            rotation.index = 0;
+            rotation.revert_at = None;
+        } else if advance {
+            rotation.index = rotation.index.wrapping_add(1);
+        }
+
+        let index = rotation.index % urls.len();
+        if index == 0 {
+            rotation.revert_at = None;
+        }
+
+        (urls[index].clone(), index == 0)
+    }
+}
+
+/// No-op for the primary or if already armed.
+fn arm_ws_failover_revert(
+    rotation: &Mutex<WsRotationState>,
+    is_primary: bool,
+    failover_revert: Duration,
+) {
+    if is_primary {
+        return;
+    }
+    let mut rotation = rotation.lock().expect("ws_rotation lock poisoned");
+    if rotation.revert_at.is_none() {
+        rotation.revert_at = Some(Instant::now() + failover_revert);
     }
 }
 
@@ -297,6 +361,8 @@ impl Stream for RpcStream {
 }
 
 impl ResettableStream for RpcStream {
+    /// Does not advance the WS provider rotation; a reorg says nothing about
+    /// provider health.
     async fn reset(&mut self, block: u64) {
         tracing::info!("Resetting RpcStream to block {block}");
 
@@ -307,7 +373,7 @@ impl ResettableStream for RpcStream {
         self.stream = self
             .builder
             .clone()
-            .stream_with_reconnect(Some(block))
+            .stream_with_reconnect(Some(block), false)
             .await;
 
         tracing::warn!(
@@ -1318,11 +1384,193 @@ mod tests {
         provider.anvil_set_interval_mining(10).await.unwrap();
 
         // Ensure timeout actually happens.
-        let mut stream = builder.create_ws_stream(&ws_url, None).await.unwrap();
+        let mut stream = builder.create_ws_stream(&ws_url, true, None).await.unwrap();
         assert!(stream.next().await.is_none());
 
         // Now check that the higher-level stream with reconnects is still able to yield blocks.
         let mut stream = builder.build().await;
         stream.next().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[test_log::test]
+    async fn test_ws_provider_rotates_on_silent_stream() {
+        // Stuck anvil accepts the WS subscription but never mines a block, so it
+        // never pushes a new head.
+        let stuck_anvil = Anvil::new().spawn();
+        let stuck_ws_url = stuck_anvil.ws_endpoint().parse::<Url>().unwrap();
+
+        let live_anvil = Anvil::new().block_time(1).spawn();
+        let live_ws_url = live_anvil.ws_endpoint().parse::<Url>().unwrap();
+        let live_http_url = live_anvil.endpoint().parse::<Url>().unwrap();
+
+        let options = L1ClientOptions {
+            l1_ws_provider: Some(vec![stuck_ws_url, live_ws_url]),
+            http_providers: vec![live_http_url],
+            subscription_timeout: Duration::from_secs(1),
+            l1_retry_delay: Duration::from_millis(100),
+            stake_table_address: Address::ZERO,
+            reward_contract_address: Address::ZERO,
+            ..Default::default()
+        };
+
+        let mut stream = RpcStream::new(options).await.unwrap();
+
+        let block_input = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("stream never rotated off the stuck WS provider")
+            .expect("stream ended unexpectedly");
+
+        assert!(block_input.block.number > 0);
+    }
+
+    #[tokio::test]
+    #[test_log::test]
+    async fn test_ws_provider_reverts_to_primary_after_failover_revert() {
+        let stuck_anvil = Anvil::new().spawn();
+        let stuck_ws_url = stuck_anvil.ws_endpoint().parse::<Url>().unwrap();
+
+        let live_anvil = Anvil::new().block_time(1).spawn();
+        let live_ws_url = live_anvil.ws_endpoint().parse::<Url>().unwrap();
+        let live_http_url = live_anvil.endpoint().parse::<Url>().unwrap();
+
+        // Comfortably larger than block_time to avoid spurious timeouts.
+        let subscription_timeout = Duration::from_secs(2);
+        let retry_delay = Duration::from_millis(100);
+        let failover_revert = Duration::from_millis(1500);
+        let options = L1ClientOptions {
+            l1_ws_provider: Some(vec![stuck_ws_url, live_ws_url]),
+            http_providers: vec![live_http_url],
+            subscription_timeout,
+            l1_retry_delay: retry_delay,
+            l1_failover_revert: failover_revert,
+            stake_table_address: Address::ZERO,
+            reward_contract_address: Address::ZERO,
+            ..Default::default()
+        };
+
+        let mut stream = RpcStream::new(options).await.unwrap();
+        let builder = stream.builder.clone();
+
+        // RpcStream only progresses while polled; drive it in the background.
+        let driver = tokio::spawn(async move { while stream.next().await.is_some() {} });
+
+        // Margin covers the primary timeout, reconnect, and backup's block time.
+        tokio::time::sleep(subscription_timeout + retry_delay + Duration::from_millis(1200)).await;
+        {
+            let rotation = builder.ws_rotation.lock().unwrap();
+            assert_eq!(rotation.index, 1, "should have failed over to the backup");
+            assert!(
+                rotation.revert_at.is_some(),
+                "a backup that proved healthy should schedule a revert-to-primary"
+            );
+        }
+
+        // Revert is applied lazily on next reconnect, not proactively.
+        tokio::time::sleep(failover_revert + Duration::from_millis(500)).await;
+        {
+            let rotation = builder.ws_rotation.lock().unwrap();
+            assert_eq!(rotation.index, 1, "should still be on the backup");
+        }
+
+        let live_provider =
+            ProviderBuilder::new().connect_http(live_anvil.endpoint().parse::<Url>().unwrap());
+        live_provider.anvil_set_interval_mining(0).await.unwrap();
+
+        // Poll: the reverted state is a transient window (primary is stuck, so
+        // it bounces back to the backup after another timeout).
+        let reverted = tokio::time::timeout(
+            subscription_timeout * 2 + retry_delay * 2 + Duration::from_secs(1),
+            async {
+                loop {
+                    let reset = {
+                        let rotation = builder.ws_rotation.lock().unwrap();
+                        rotation.index == 0 && rotation.revert_at.is_none()
+                    };
+                    if reset {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            },
+        )
+        .await;
+        driver.abort();
+
+        assert!(
+            reverted.is_ok(),
+            "should have reset the rotation to the primary and cleared the revert schedule"
+        );
+    }
+
+    /// Two never-healthy providers must not block reaching a third.
+    #[tokio::test]
+    #[test_log::test]
+    async fn test_ws_provider_rotation_reaches_third_provider() {
+        let stuck_anvil_1 = Anvil::new().spawn();
+        let stuck_ws_url_1 = stuck_anvil_1.ws_endpoint().parse::<Url>().unwrap();
+
+        let stuck_anvil_2 = Anvil::new().spawn();
+        let stuck_ws_url_2 = stuck_anvil_2.ws_endpoint().parse::<Url>().unwrap();
+
+        let live_anvil = Anvil::new().block_time(1).spawn();
+        let live_ws_url = live_anvil.ws_endpoint().parse::<Url>().unwrap();
+        let live_http_url = live_anvil.endpoint().parse::<Url>().unwrap();
+
+        let subscription_timeout = Duration::from_secs(1);
+        let retry_delay = Duration::from_millis(100);
+        let options = L1ClientOptions {
+            l1_ws_provider: Some(vec![stuck_ws_url_1, stuck_ws_url_2, live_ws_url]),
+            http_providers: vec![live_http_url],
+            subscription_timeout,
+            l1_retry_delay: retry_delay,
+            l1_failover_revert: Duration::from_millis(500), // < subscription_timeout + retry_delay
+            stake_table_address: Address::ZERO,
+            reward_contract_address: Address::ZERO,
+            ..Default::default()
+        };
+
+        let mut stream = RpcStream::new(options).await.unwrap();
+
+        let block_input = tokio::time::timeout(Duration::from_secs(10), stream.next())
+            .await
+            .expect("stream never reached the third (live) WS provider")
+            .expect("stream ended unexpectedly");
+
+        assert!(block_input.block.number > 0);
+    }
+
+    #[tokio::test]
+    #[test_log::test]
+    async fn test_reset_does_not_advance_ws_rotation() {
+        let anvil_1 = Anvil::new().block_time(1).spawn();
+        let ws_url_1 = anvil_1.ws_endpoint().parse::<Url>().unwrap();
+        let http_url_1 = anvil_1.endpoint().parse::<Url>().unwrap();
+
+        let anvil_2 = Anvil::new().block_time(1).spawn();
+        let ws_url_2 = anvil_2.ws_endpoint().parse::<Url>().unwrap();
+
+        let options = L1ClientOptions {
+            l1_ws_provider: Some(vec![ws_url_1, ws_url_2]),
+            http_providers: vec![http_url_1],
+            l1_retry_delay: Duration::from_millis(100),
+            stake_table_address: Address::ZERO,
+            reward_contract_address: Address::ZERO,
+            ..Default::default()
+        };
+
+        let mut stream = RpcStream::new(options).await.unwrap();
+        let block = stream.next().await.expect("stream ended unexpectedly");
+
+        let index_before = stream.builder.ws_rotation.lock().unwrap().index;
+
+        stream.reset(block.block.number).await;
+        stream.next().await.expect("stream ended unexpectedly");
+
+        let index_after = stream.builder.ws_rotation.lock().unwrap().index;
+        assert_eq!(
+            index_before, index_after,
+            "reset must not advance the WS provider rotation"
+        );
     }
 }
