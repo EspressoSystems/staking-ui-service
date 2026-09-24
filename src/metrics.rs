@@ -148,9 +148,9 @@ impl PrometheusMetrics {
              NaN until the first Espresso block has been processed after startup.",
         );
 
-        // Espresso raw timestamps start unset (unlike L1, there is no startup snapshot to seed
-        // them from). NaN, rather than the default 0 (1970), keeps the derived age gauges from
-        // misreporting a huge stall before the first block is processed.
+        // NaN rather than 0 (1970), so age gauges do not report a huge stall before the first block.
+        l1_last_update_timestamp_seconds.set(f64::NAN);
+        l1_block_timestamp_seconds.set(f64::NAN);
         espresso_last_update_timestamp_seconds.set(f64::NAN);
         espresso_block_timestamp_seconds.set(f64::NAN);
 
