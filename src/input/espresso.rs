@@ -27,7 +27,7 @@ use tracing::instrument;
 use crate::{
     Error, Result,
     error::ensure,
-    metrics::PrometheusMetrics,
+    metrics::{self, PrometheusMetrics},
     types::{
         common::{ActiveNodeSetEntry, Address, ESPTokenAmount, EpochAndBlock, Ratio},
         global::{ActiveNodeSetDiff, ActiveNodeSetSnapshot, ActiveNodeSetUpdate},
@@ -384,6 +384,7 @@ impl<S: EspressoPersistence, C: EspressoClient> State<S, C> {
             number: height,
             view: leaf.view_number().u64(),
             epoch,
+            timestamp_millis: leaf.block_header().timestamp_millis(),
         };
         Ok((block, update, rewards))
     }
@@ -439,6 +440,13 @@ impl<S: EspressoPersistence, C: EspressoClient> State<S, C> {
             self.metrics
                 .active_validators
                 .set(block.epoch.active_nodes.len() as f64);
+
+            self.metrics
+                .espresso_last_update_timestamp_seconds
+                .set(metrics::unix_now_secs());
+            self.metrics
+                .espresso_block_timestamp_seconds
+                .set(block.timestamp_millis as f64 / 1000.0);
         }
     }
 
@@ -474,6 +482,9 @@ struct BlockState {
 
     /// The epoch this block belongs to.
     epoch: Arc<EpochState>,
+
+    /// Unix timestamp (milliseconds) of this block, from the leaf header.
+    timestamp_millis: u64,
 }
 
 /// Stake table related data that remains static for an entire epoch.
@@ -966,6 +977,15 @@ mod test {
                     voters: signers,
                 }]
             }
+        );
+
+        // Metrics gauge should be in seconds, not the header's raw milliseconds.
+        let expected_block_timestamp_secs = leaf.block_header().timestamp_millis() as f64 / 1000.0;
+        let block_timestamp_secs = state.metrics().espresso_block_timestamp_seconds.get();
+        assert!(
+            (block_timestamp_secs - expected_block_timestamp_secs).abs() < 86_400.0,
+            "espresso_block_timestamp_seconds {block_timestamp_secs} not within a day of leaf \
+             timestamp {expected_block_timestamp_secs}"
         );
     }
 

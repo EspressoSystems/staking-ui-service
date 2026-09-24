@@ -29,7 +29,7 @@ use tracing::instrument;
 use crate::{
     error::{Error, Result, ensure},
     input::l1::metadata::{METADATA_REFRESH_BLOCKS, MetadataFetcher},
-    metrics::PrometheusMetrics,
+    metrics::{self, PrometheusMetrics},
     types::{
         common::{
             Address, Delegation, ESPTokenAmount, L1BlockId, L1BlockInfo, NodeExit, NodeMetadata,
@@ -166,6 +166,13 @@ impl<S: L1Persistence, M: MetadataFetcher> State<S, M> {
         self.metrics
             .node_count
             .set(latest.state.node_set.len() as f64);
+
+        self.metrics
+            .l1_last_update_timestamp_seconds
+            .set(metrics::unix_now_secs());
+        self.metrics
+            .l1_block_timestamp_seconds
+            .set(latest.block().timestamp() as f64);
     }
 
     pub fn metrics(&self) -> &PrometheusMetrics {
