@@ -90,6 +90,27 @@ impl Persistence {
         Ok(())
     }
 
+    /// Begin a transaction that holds the database write lock from the start.
+    ///
+    /// Use this for any transaction that reads before it writes. A plain deferred transaction
+    /// starts as a reader and upgrades to a writer at its first write statement. In WAL mode, if
+    /// another connection committed a write since the read started, the upgrade fails immediately
+    /// with `SQLITE_BUSY` ("database is locked") without honoring the busy timeout, because the
+    /// transaction's snapshot is stale. Taking the write lock before any read instead makes a
+    /// concurrent writer wait (up to the busy timeout) and then proceed.
+    ///
+    /// The proper way to do this is `BEGIN IMMEDIATE`, but our sqlx version does not let us
+    /// customize the `BEGIN` statement. Instead, we run a write statement with no effect before
+    /// any read, so the first lock the transaction acquires is the write lock.
+    async fn begin_write(&self) -> Result<sqlx::Transaction<'static, sqlx::Sqlite>> {
+        let mut tx = self.pool.begin().await.context("acquiring connection")?;
+        sqlx::query("UPDATE l1_block SET number = number WHERE false")
+            .execute(tx.as_mut())
+            .await
+            .context("acquiring write lock")?;
+        Ok(tx)
+    }
+
     /// Load the finalized snapshot from the database.
     ///
     /// Returns `None` if no snapshot exists (i.e., database is empty).
@@ -607,7 +628,7 @@ impl L1Persistence for Persistence {
 
     #[instrument(skip(self, updates))]
     async fn apply_updates(&mut self, updates: Vec<Update>) -> Result<()> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
 
         let mut latest_l1_block = None;
         for update in &updates {
@@ -819,7 +840,7 @@ impl EspressoPersistence for Persistence {
         update: ActiveNodeSetUpdate,
         rewards: RewardDistribution,
     ) -> Result<()> {
-        let mut tx = self.pool.begin().await.context("acquiring connection")?;
+        let mut tx = self.begin_write().await?;
 
         // In rare cases, this update or a later one may have already been processed. This can only
         // happen outside the control of this program, since we do have an exclusive lock on the
@@ -2298,5 +2319,52 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(snapshot.node_set[&node.address].metadata, Some(metadata));
+    }
+
+    /// A read-then-write transaction must wait for a concurrent writer, not fail with
+    /// "database is locked".
+    #[test_log::test(tokio::test)]
+    async fn test_concurrent_read_then_write() {
+        let temp_dir = TempDir::new().unwrap();
+        let options = PersistenceOptions {
+            path: temp_dir.path().join("test.db"),
+            max_connections: 5,
+        };
+        let persistence = Persistence::new(&options).await.unwrap();
+
+        // Hold the write lock with an uncommitted write.
+        let mut tx_a = persistence.begin_write().await.unwrap();
+        sqlx::query("INSERT INTO lifetime_rewards (address, amount) VALUES ('a', '1')")
+            .execute(tx_a.as_mut())
+            .await
+            .unwrap();
+
+        // Start a second transaction that reads, then writes.
+        let task = tokio::spawn({
+            let persistence = persistence.clone();
+            async move {
+                let mut tx_b = persistence.begin_write().await?;
+                let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM lifetime_rewards")
+                    .fetch_one(tx_b.as_mut())
+                    .await?;
+                sqlx::query("INSERT INTO lifetime_rewards (address, amount) VALUES ('b', '2')")
+                    .execute(tx_b.as_mut())
+                    .await?;
+                tx_b.commit().await?;
+                Ok::<_, Error>(count)
+            }
+        });
+
+        // Commit the first transaction while the second is waiting.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        tx_a.commit().await.unwrap();
+
+        // The second transaction succeeds, and its read sees the first transaction's write.
+        assert_eq!(task.await.unwrap().unwrap(), 1);
+        let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM lifetime_rewards")
+            .fetch_one(&persistence.pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 2);
     }
 }
