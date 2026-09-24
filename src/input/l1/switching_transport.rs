@@ -177,6 +177,34 @@ impl SingleTransportStatus {
     }
 }
 
+/// What a transport response actually means, once a JSON-RPC error body carried by a non-2xx
+/// response is no longer hidden behind `Ok` (alloy 2.4.1 drops the HTTP status once the body
+/// parses as JSON-RPC).
+enum ResponseOutcome {
+    Success,
+    RateLimited,
+    Failure,
+}
+
+/// alloy folds a non-2xx response into `Ok` whenever the body parses as JSON-RPC, dropping the
+/// status and any `Retry-After` header, so the payload is the only rate-limit signal left.
+fn is_rate_limit_body(res: &ResponsePacket) -> bool {
+    res.as_error()
+        .is_some_and(|e| e.code == 429 || e.message == "Too Many Requests")
+}
+
+/// Score a transport response for provider health from its payload, not the `Result` arm it
+/// arrived in.
+fn classify(response: &ResponsePacket) -> ResponseOutcome {
+    if is_rate_limit_body(response) {
+        ResponseOutcome::RateLimited
+    } else if response.is_error() {
+        ResponseOutcome::Failure
+    } else {
+        ResponseOutcome::Success
+    }
+}
+
 impl Service<RequestPacket> for SwitchingTransport {
     type Error = RpcError<TransportErrorKind>;
     type Response = ResponsePacket;
@@ -236,8 +264,29 @@ impl Service<RequestPacket> for SwitchingTransport {
             // Call the inner client, match on the result
             match current_transport.client.call(req).await {
                 Ok(res) => {
-                    // If it's okay, log the success to the status
-                    current_transport.status.write().log_success();
+                    // alloy 2.4.1 returns a non-2xx response with a parseable JSON-RPC error
+                    // body as `Ok`, so health is scored off the payload, not this `Result` arm.
+                    match classify(&res) {
+                        ResponseOutcome::Success => {
+                            current_transport.status.write().log_success();
+                        }
+                        ResponseOutcome::RateLimited => {
+                            current_transport.status.write().rate_limited_until =
+                                Some(Instant::now() + self_clone.opt.rate_limit_delay());
+                        }
+                        ResponseOutcome::Failure => {
+                            tracing::warn!(?res, "L1 client error");
+                            if current_transport
+                                .status
+                                .write()
+                                .log_failure(&self_clone.opt)
+                            {
+                                tracing::info!("Switching to next L1 provider due to failures");
+                                self_clone
+                                    .switch_to(current_transport.generation + 1, current_transport);
+                            }
+                        }
+                    }
                     Ok(res)
                 }
                 Err(err) => {
@@ -271,5 +320,43 @@ impl Service<RequestPacket> for SwitchingTransport {
                 }
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    fn packet(body: &str) -> ResponsePacket {
+        serde_json::from_str(body).expect("valid JSON-RPC response fixture")
+    }
+
+    #[test]
+    fn classify_success_response() {
+        let res = packet(r#"{"jsonrpc":"2.0","id":1,"result":"0x1"}"#);
+        assert!(matches!(classify(&res), ResponseOutcome::Success));
+    }
+
+    #[test]
+    fn classify_non_2xx_error_body_as_failure() {
+        // alloy 2.4.1 surfaces this as `Ok`, discarding the non-2xx HTTP status.
+        let res = packet(
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32600,"message":"App is inactive"}}"#,
+        );
+        assert!(matches!(classify(&res), ResponseOutcome::Failure));
+    }
+
+    #[test]
+    fn classify_rate_limit_body_by_code() {
+        let res = packet(r#"{"jsonrpc":"2.0","id":1,"error":{"code":429,"message":"exceeded"}}"#);
+        assert!(matches!(classify(&res), ResponseOutcome::RateLimited));
+    }
+
+    #[test]
+    fn classify_rate_limit_body_by_message() {
+        let res = packet(
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32005,"message":"Too Many Requests"}}"#,
+        );
+        assert!(matches!(classify(&res), ResponseOutcome::RateLimited));
     }
 }

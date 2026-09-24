@@ -460,6 +460,20 @@ impl Client {
     }
 }
 
+/// `hotshot_query_service::metrics::PrometheusMetrics::export` is now inherent rather than a
+/// `tide_disco::metrics::Metrics` impl, so `Api::metrics`'s `T: Metrics` bound needs this
+/// wrapper to delegate back to it.
+#[derive(Clone)]
+struct QueryServiceMetrics(PrometheusMetrics);
+
+impl tide_disco::metrics::Metrics for QueryServiceMetrics {
+    type Error = hotshot_query_service::metrics::MetricsError;
+
+    fn export(&self) -> Result<String, Self::Error> {
+        self.0.export()
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -480,7 +494,7 @@ async fn main() -> anyhow::Result<()> {
     let (send_result, recv_result) = unbounded();
     let client = InstrumentedHTTPClient::new(opt.url.join("/v0/staking/")?, send_result);
 
-    let mut app = App::<_, Error>::with_state(Arc::new(RwLock::new(registry)));
+    let mut app = App::<_, Error>::with_state(Arc::new(RwLock::new(QueryServiceMetrics(registry))));
     app.module::<Error, StaticVersion<0, 1>>("status", api)?
         .metrics("metrics", |_, registry| {
             async move { Ok(std::borrow::Cow::Borrowed(registry)) }.boxed()
