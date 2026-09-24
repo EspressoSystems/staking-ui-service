@@ -643,9 +643,11 @@ mod test {
             },
 
             // Recover fast from the connection this test intentionally disrupts. The HTTP
-            // timeout keeps its default: client construction fetches config/hotshot, which
-            // needs longer than the stream timeout while the server is still starting.
+            // timeout must clear the ~4s the axum API server takes between binding its port
+            // and accepting: TestNetwork::new returns inside that window, so the
+            // config/hotshot fetch in QueryServiceClient::new hangs until the server is up.
             stream_timeout: Duration::from_secs(1),
+            http_timeout: Duration::from_secs(10),
             ..QueryServiceOptions::new(format!("http://localhost:{port}").parse().unwrap())
         };
         let client = QueryServiceClient::new(opt, DEFAULT_TOKEN_SUPPLY)
