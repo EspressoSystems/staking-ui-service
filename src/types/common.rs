@@ -151,6 +151,11 @@ pub struct PendingWithdrawal {
     /// The node which was previously delegated to, which stake is now being withdrawn.
     pub node: Address,
 
+    /// The ID the stake table contract assigned to the undelegation.
+    ///
+    /// 0 for V1 undelegations (which had no IDs) and for node exits.
+    pub undelegation_id: u64,
+
     /// The amount of stake pending withdrawal.
     pub amount: ESPTokenAmount,
 
@@ -168,6 +173,11 @@ pub struct Withdrawal {
 
     /// The node which was previously delegated to, which stake is now withdrawn.
     pub node: Address,
+
+    /// The ID of the undelegation that was claimed.
+    ///
+    /// 0 for V1 undelegations (which had no IDs) and for node exits.
+    pub undelegation_id: u64,
 
     /// The amount of stake.
     pub amount: ESPTokenAmount,

@@ -96,10 +96,16 @@ A representation of short binary strings consisting of:
 {
     "delegator": Hex,
     "node": Hex,
+    "undelegation_id": integer,
     "amount": BigInt,
     "available_time": integer
 }
 ```
+
+`undelegation_id` is the ID the stake table contract assigned to the undelegation. It distinguishes
+multiple pending undelegations from the same node; a `Withdrawal` completing one of them carries the
+same ID. Undelegations created by the V1 contract have ID 0, as do pending withdrawals caused by a
+node exit rather than an undelegation.
 
 ### `Withdrawal`
 
@@ -107,9 +113,13 @@ A representation of short binary strings consisting of:
 {
     "delegator": Hex,
     "node": Hex,
+    "undelegation_id": integer,
     "amount": BigInt
 }
 ```
+
+`undelegation_id` identifies the pending undelegation this withdrawal completes. Always 0 for
+withdrawals of stake released by a node exit.
 """
 
 [route.l1_block_latest]
