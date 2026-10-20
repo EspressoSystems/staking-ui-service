@@ -345,7 +345,10 @@ pub fn parse_metadata_uri(uri: &str) -> Option<Url> {
 mod test {
     use std::{borrow::Cow, str::FromStr, sync::Arc};
 
-    use crate::types::common::{ImageSet, RatioSet};
+    use crate::{
+        metrics::QueryServiceMetrics,
+        types::common::{ImageSet, RatioSet},
+    };
 
     use super::*;
 
@@ -361,8 +364,6 @@ mod test {
     use toml::toml;
     use vbs::version::{StaticVersion, StaticVersionType};
     use warp::Filter;
-
-    use crate::metrics::QueryServiceMetrics;
 
     #[test_log::test]
     fn test_parse_prometheus_all_fields() {

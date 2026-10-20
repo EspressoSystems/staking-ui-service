@@ -227,8 +227,9 @@ const MAX_CONSECUTIVE_RATE_LIMITS: usize = 2;
 /// Cap on a server-requested `Retry-After`, matching alloy's `MAX_BACKOFF_HINT`.
 const MAX_RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(300);
 
-/// Infura reuses `-32005` for result-count rejections and rate limits, so this matches on the
-/// message.
+type TransportResult = std::result::Result<ResponsePacket, RpcError<TransportErrorKind>>;
+
+/// Whether the request asks for more results than the provider's cap.
 fn is_request_rejection(err: &ErrorPayload) -> bool {
     err.message.contains("query returned more than")
 }
@@ -237,40 +238,32 @@ fn is_request_rejection(err: &ErrorPayload) -> bool {
 ///
 /// alloy returns a non-2xx response whose body parses as a JSON-RPC error as `Ok`, dropping the
 /// HTTP status and `Retry-After`, so the payload decides the outcome.
-fn classify(
-    result: &std::result::Result<ResponsePacket, RpcError<TransportErrorKind>>,
-) -> ResponseOutcome {
-    use ResponseOutcome::*;
+fn classify(result: &TransportResult) -> ResponseOutcome {
     match result {
         Ok(res) => match res.as_error() {
-            None => Success,
+            None => ResponseOutcome::Success,
             // Checked before `is_retry_err`, which treats every `-32005` as a rate limit.
-            Some(err) if is_request_rejection(err) => RequestRejected,
-            Some(err) if err.is_retry_err() => RateLimited { retry_after: None },
-            Some(_) => Failure,
+            Some(err) if is_request_rejection(err) => ResponseOutcome::RequestRejected,
+            Some(err) if err.is_retry_err() => ResponseOutcome::RateLimited { retry_after: None },
+            Some(_) => ResponseOutcome::Failure,
         },
         Err(RpcError::Transport(kind))
             if kind
                 .as_http_error()
                 .is_some_and(HttpError::is_rate_limit_err) =>
         {
-            RateLimited {
+            ResponseOutcome::RateLimited {
                 retry_after: kind.retry_after(),
             }
         }
-        Err(_) => Failure,
+        Err(_) => ResponseOutcome::Failure,
     }
 }
 
 impl Service<RequestPacket> for SwitchingTransport {
     type Error = RpcError<TransportErrorKind>;
     type Response = ResponsePacket;
-    type Future = Pin<
-        Box<
-            dyn Future<Output = std::result::Result<ResponsePacket, RpcError<TransportErrorKind>>>
-                + Send,
-        >,
-    >;
+    type Future = Pin<Box<dyn Future<Output = TransportResult> + Send>>;
 
     fn poll_ready(
         &mut self,
@@ -306,41 +299,43 @@ impl Service<RequestPacket> for SwitchingTransport {
 
             // If we've been rate limited, back off until the limit (hopefully) expires.
             let rate_limit_until = current_transport.status.read().rate_limited_until;
-            if let Some(t) = rate_limit_until {
-                if t > Instant::now() {
-                    // Return an error with a non-standard code to indicate client-side rate limit.
-                    return Err(RpcError::Transport(TransportErrorKind::Custom(
-                        "Rate limit exceeded".into(),
-                    )));
-                } else {
-                    // Reset the rate limit if we are passed it so we don't check every time
-                    current_transport.status.write().rate_limited_until = None;
-                }
+            if rate_limit_until.is_some_and(|t| t > Instant::now()) {
+                // Return an error with a non-standard code to indicate client-side rate limit.
+                return Err(RpcError::Transport(TransportErrorKind::Custom(
+                    "Rate limit exceeded".into(),
+                )));
             }
 
             let result = current_transport.client.call(req).await;
+            let error = result.as_ref().ok().and_then(ResponsePacket::as_error);
+            let transport_err = result.as_ref().err();
             let should_switch = match classify(&result) {
                 ResponseOutcome::Success => {
                     current_transport.status.write().log_success();
                     false
                 }
                 ResponseOutcome::RequestRejected => {
-                    tracing::warn!(?result, "L1 rejected the request");
+                    tracing::warn!(?error, "L1 rejected the request");
                     false
                 }
                 ResponseOutcome::RateLimited { retry_after } => {
                     let backoff = retry_after.map_or(self_clone.opt.rate_limit_delay(), |d| {
                         d.min(MAX_RATE_LIMIT_BACKOFF)
                     });
-                    let should_switch = current_transport
-                        .status
-                        .write()
-                        .log_rate_limit(Instant::now() + backoff);
-                    tracing::debug!(?backoff, should_switch, "L1 rate limited");
+                    let mut status = current_transport.status.write();
+                    let should_switch = status.log_rate_limit(Instant::now() + backoff);
+                    if should_switch {
+                        tracing::warn!(
+                            consecutive = status.consecutive_rate_limits,
+                            "L1 still rate limiting after its own backoff, failing over"
+                        );
+                    } else {
+                        tracing::debug!(?backoff, "L1 rate limited");
+                    }
                     should_switch
                 }
                 ResponseOutcome::Failure => {
-                    tracing::warn!(?result, "L1 client error");
+                    tracing::warn!(?error, ?transport_err, "L1 client error");
                     current_transport
                         .status
                         .write()
@@ -350,7 +345,7 @@ impl Service<RequestPacket> for SwitchingTransport {
 
             // Only one caller sees `true`, so this switches at most once per generation.
             if should_switch {
-                tracing::info!("Switching to next L1 provider due to failures");
+                tracing::info!("Switching to next L1 provider");
                 self_clone.switch_to(current_transport.generation + 1, current_transport);
             }
 
@@ -373,6 +368,7 @@ mod test {
     const SUCCESS: &str = r#"{"jsonrpc":"2.0","id":1,"result":"0x1"}"#;
     const RATE_LIMITED: &str =
         r#"{"jsonrpc":"2.0","id":1,"error":{"code":429,"message":"Too Many Requests"}}"#;
+    const RESULT_CAP: &str = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32005,"message":"query returned more than 10000 results. Try with this block range [0x1500000, 0x15000FA]."}}"#;
 
     fn packet(body: &str) -> ResponsePacket {
         serde_json::from_str(body).expect("valid JSON-RPC response fixture")
@@ -453,10 +449,10 @@ mod test {
 
     #[test]
     fn classify_result_cap_as_rejection() {
-        let res = packet(
-            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32005,"message":"query returned more than 10000 results. Try with this block range [0x1500000, 0x15000FA]."}}"#,
+        assert_eq!(
+            classify(&Ok(packet(RESULT_CAP))),
+            ResponseOutcome::RequestRejected
         );
-        assert_eq!(classify(&Ok(res)), ResponseOutcome::RequestRejected);
     }
 
     #[test]
@@ -535,5 +531,23 @@ mod test {
             MAX_CONSECUTIVE_RATE_LIMITS
         );
         assert_eq!(backup_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_request_rejection_does_not_fail_over() {
+        let opt = L1ClientOptions {
+            l1_consecutive_failure_tolerance: 1,
+            ..Default::default()
+        };
+        let (mut transport, primary_hits, backup_hits) =
+            transport(StatusCode::OK, RESULT_CAP, opt).await;
+
+        for _ in 0..3 {
+            let res = transport.call(request()).await.unwrap();
+            assert!(res.is_error());
+        }
+        assert_eq!(generation(&transport), 0);
+        assert_eq!(primary_hits.load(Ordering::SeqCst), 3);
+        assert_eq!(backup_hits.load(Ordering::SeqCst), 0);
     }
 }
