@@ -44,7 +44,8 @@ use staking_cli::{
     DEV_MNEMONIC,
     demo::{DelegationConfig, StakingTransactions},
 };
-use vbs::version::Version;
+use surf_disco::Client;
+use vbs::version::{StaticVersion, Version};
 use versions::Upgrade;
 
 use crate::{
@@ -433,6 +434,16 @@ impl EspressoPersistence for MemoryStorage {
 
 pub const EPOCH_HEIGHT: u64 = 20;
 
+/// Wait until the API server of a test network on `port` accepts requests.
+///
+/// `TestNetwork::new` returns after the server binds its port but before it accepts, so requests
+/// sent in that window hang for several seconds.
+pub async fn wait_for_api(port: u16) {
+    Client::<Error, StaticVersion<0, 1>>::new(format!("http://localhost:{port}").parse().unwrap())
+        .connect(None)
+        .await;
+}
+
 pub async fn start_pos_network(
     port: u16,
 ) -> (
@@ -496,6 +507,7 @@ pub async fn start_pos_network(
         .states([state])
         .build();
     let network = TestNetwork::new(config, UPGRADE).await;
+    wait_for_api(port).await;
 
     (network, deployment, storage)
 }

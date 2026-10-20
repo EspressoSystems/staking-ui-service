@@ -254,7 +254,7 @@ mod test {
     use hotshot_query_service::data_source::SqlDataSource;
     use hotshot_query_service::testing::mocks::MOCK_UPGRADE;
     use portpicker::pick_unused_port;
-    use staking_ui_service::input::espresso::testing::start_pos_network;
+    use staking_ui_service::input::espresso::testing::{start_pos_network, wait_for_api};
     use staking_ui_service::types::common::{ESPTokenAmount, L1BlockId};
     use staking_ui_service::types::global::{ActiveNodeSetSnapshot, FullNodeSetSnapshot};
     use staking_ui_service::{Error, input::l1::testing::ContractDeployment};
@@ -407,6 +407,7 @@ mod test {
             .network_config(test_config)
             .build();
         let mut network = TestNetwork::new(config, MOCK_UPGRADE).await;
+        wait_for_api(espresso_port).await;
 
         // Start staking service.
         let port = pick_unused_port().unwrap();

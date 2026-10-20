@@ -503,7 +503,10 @@ mod test {
 
     use crate::input::espresso::{
         State,
-        testing::{DEFAULT_TOKEN_SUPPLY, EPOCH_HEIGHT, MemoryStorage, UPGRADE, start_pos_network},
+        testing::{
+            DEFAULT_TOKEN_SUPPLY, EPOCH_HEIGHT, MemoryStorage, UPGRADE, start_pos_network,
+            wait_for_api,
+        },
     };
     use crate::metrics::PrometheusMetrics;
 
@@ -576,6 +579,7 @@ mod test {
                 )
                 .build();
             let mut network = TestNetwork::new(config, UPGRADE).await;
+            wait_for_api(port).await;
 
             let opt = QueryServiceOptions::new(format!("http://localhost:{port}").parse().unwrap());
             let client = QueryServiceClient::new(opt, DEFAULT_TOKEN_SUPPLY)
@@ -603,6 +607,7 @@ mod test {
             .network_config(TestConfigBuilder::default().build())
             .build();
         let network = TestNetwork::new(config, UPGRADE).await;
+        wait_for_api(port).await;
 
         let opt = QueryServiceOptions::new(format!("http://localhost:{port}").parse().unwrap());
         let client = QueryServiceClient::new(opt, DEFAULT_TOKEN_SUPPLY)
@@ -634,6 +639,7 @@ mod test {
             .network_config(TestConfigBuilder::default().build())
             .build();
         let mut network = TestNetwork::new(config, UPGRADE).await;
+        wait_for_api(port).await;
 
         let opt = QueryServiceOptions {
             polling_interval: if ws {
@@ -642,12 +648,10 @@ mod test {
                 Some(Duration::from_secs(1))
             },
 
-            // Recover fast from the connection this test intentionally disrupts. The HTTP
-            // timeout must clear the ~4s the axum API server takes between binding its port
-            // and accepting: TestNetwork::new returns inside that window, so the
-            // config/hotshot fetch in QueryServiceClient::new hangs until the server is up.
+            // Have a fast timeout since this test is going to intentionally disrupt the connection,
+            // and we want it to recover and finish quickly.
             stream_timeout: Duration::from_secs(1),
-            http_timeout: Duration::from_secs(10),
+            http_timeout: Duration::from_secs(1),
             ..QueryServiceOptions::new(format!("http://localhost:{port}").parse().unwrap())
         };
         let client = QueryServiceClient::new(opt, DEFAULT_TOKEN_SUPPLY)
