@@ -532,7 +532,7 @@ mod test {
     #[test_log::test(tokio::test(flavor = "multi_thread"))]
     async fn test_epochs() {
         let port = pick_unused_port().expect("No ports free");
-        let (mut network, _, _storage) = start_pos_network(port).await;
+        let (mut network, _, _storage) = start_pos_network(port, UPGRADE).await;
 
         let opt = QueryServiceOptions::new(format!("http://localhost:{port}").parse().unwrap());
         let client = QueryServiceClient::new(opt, DEFAULT_TOKEN_SUPPLY)
@@ -742,7 +742,7 @@ mod test {
     #[test_log::test(tokio::test(flavor = "multi_thread"))]
     async fn test_with_state() {
         let port = pick_unused_port().expect("No ports free");
-        let (mut network, _, _storage) = start_pos_network(port).await;
+        let (mut network, _, _storage) = start_pos_network(port, UPGRADE).await;
         let first_epoch = *network
             .server
             .decided_leaf()

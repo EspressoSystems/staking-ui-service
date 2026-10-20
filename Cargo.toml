@@ -93,6 +93,7 @@ vergen = { version = "8", features = ["build", "git", "gitcl"] }
 staking-ui-service = { path = ".", features = ["testing"] }
 
 portpicker = "0.1"
+rstest = "0.28.0"
 tempfile = "3"
 test-log = { version = "0.2", features = [
     "color",

@@ -64,7 +64,7 @@ use crate::{
     },
 };
 
-pub(super) const UPGRADE: Upgrade = Upgrade::trivial(Version { major: 0, minor: 4 });
+pub const UPGRADE: Upgrade = Upgrade::trivial(Version { major: 0, minor: 4 });
 
 /// An Espresso client pre-loaded with a stake table and a series of leaves.
 #[derive(Clone, Debug)]
@@ -450,6 +450,7 @@ pub async fn wait_for_api(port: u16) {
 
 pub async fn start_pos_network(
     port: u16,
+    upgrade: Upgrade,
 ) -> (
     TestNetwork<impl PersistenceOptions, 1>,
     ContractDeployment,
@@ -510,7 +511,7 @@ pub async fn start_pos_network(
         .network_config(test_config)
         .states([state])
         .build();
-    let network = TestNetwork::new(config, UPGRADE).await;
+    let network = TestNetwork::new(config, upgrade).await;
     wait_for_api(port).await;
 
     (network, deployment, storage)
