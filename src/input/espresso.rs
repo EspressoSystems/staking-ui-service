@@ -866,10 +866,14 @@ mod test {
     use crate::input::espresso::client::{QueryServiceClient, QueryServiceOptions};
     use crate::persistence::sql::{Persistence, PersistenceOptions};
     use alloy::primitives::U256;
+    use rstest::rstest;
     use surf_disco::Client as HttpClient;
     use tempfile::NamedTempFile;
     use testing::start_pos_network;
-    use vbs::version::StaticVersion;
+    use vbs::version::{StaticVersion, Version};
+    use versions::{
+        DRB_AND_HEADER_UPGRADE_VERSION, EPOCH_REWARD_VERSION, NEW_PROTOCOL_VERSION, Upgrade,
+    };
 
     use alloy::transports::http::reqwest::StatusCode;
     use async_lock::Semaphore;
@@ -1435,10 +1439,15 @@ mod test {
             );
         }
     }
+    #[rstest]
+    #[case::v4(DRB_AND_HEADER_UPGRADE_VERSION)]
+    #[case::v5(EPOCH_REWARD_VERSION)]
+    #[case::v6(NEW_PROTOCOL_VERSION)]
     #[test_log::test(tokio::test(flavor = "multi_thread"))]
-    async fn test_wallet_block_rewards_e2e_test() {
+    async fn test_wallet_block_rewards_e2e_test(#[case] version: Version) {
         let espresso_port = portpicker::pick_unused_port().expect("No free ports");
-        let (network, _storage, _deployment) = start_pos_network(espresso_port).await;
+        let (network, _storage, _deployment) =
+            start_pos_network(espresso_port, Upgrade::trivial(version)).await;
 
         tracing::info!("Started Espresso network on port {espresso_port}");
 

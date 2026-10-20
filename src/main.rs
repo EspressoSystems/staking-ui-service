@@ -254,7 +254,8 @@ mod test {
     use hotshot_query_service::data_source::SqlDataSource;
     use hotshot_query_service::testing::mocks::MOCK_UPGRADE;
     use portpicker::pick_unused_port;
-    use staking_ui_service::input::espresso::testing::{start_pos_network, wait_for_api};
+    use rstest::rstest;
+    use staking_ui_service::input::espresso::testing::{UPGRADE, start_pos_network, wait_for_api};
     use staking_ui_service::types::common::{ESPTokenAmount, L1BlockId};
     use staking_ui_service::types::global::{ActiveNodeSetSnapshot, FullNodeSetSnapshot};
     use staking_ui_service::{Error, input::l1::testing::ContractDeployment};
@@ -263,7 +264,10 @@ mod test {
     use tempfile::tempdir;
     use tide_disco::{Error as _, StatusCode};
     use tokio::{task::spawn, time::sleep};
-    use vbs::version::StaticVersion;
+    use vbs::version::{StaticVersion, Version};
+    use versions::{
+        DRB_AND_HEADER_UPGRADE_VERSION, EPOCH_REWARD_VERSION, NEW_PROTOCOL_VERSION, Upgrade,
+    };
 
     use super::*;
 
@@ -279,12 +283,17 @@ mod test {
         panic!("metric {name} not found");
     }
 
+    #[rstest]
+    #[case::v4(DRB_AND_HEADER_UPGRADE_VERSION)]
+    #[case::v5(EPOCH_REWARD_VERSION)]
+    #[case::v6(NEW_PROTOCOL_VERSION)]
     #[test_log::test(tokio::test(flavor = "multi_thread"))]
-    async fn e2e_smoke_test() {
+    async fn e2e_smoke_test(#[case] version: Version) {
         let port = pick_unused_port().unwrap();
         let tmp = tempdir().unwrap();
         let espresso_port = pick_unused_port().unwrap();
-        let (mut network, deployment, _storage) = start_pos_network(espresso_port).await;
+        let (mut network, deployment, _storage) =
+            start_pos_network(espresso_port, Upgrade::trivial(version)).await;
         let espresso_url = format!("http://localhost:{espresso_port}").parse().unwrap();
 
         let opt = Options {
@@ -478,7 +487,7 @@ mod test {
         let port = pick_unused_port().unwrap();
         let tmp = tempdir().unwrap();
         let espresso_port = pick_unused_port().unwrap();
-        let (mut network, deployment, _storage) = start_pos_network(espresso_port).await;
+        let (mut network, deployment, _storage) = start_pos_network(espresso_port, UPGRADE).await;
         let espresso_url = format!("http://localhost:{espresso_port}").parse().unwrap();
 
         let opt = Options {
