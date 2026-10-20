@@ -728,7 +728,11 @@ mod test {
     ) {
         for i in range {
             tracing::info!(i, "wait for leaf");
-            let leaf = leaves.next().await.unwrap().0;
+            let leaf = timeout(Duration::from_secs(60), leaves.next())
+                .await
+                .unwrap_or_else(|_| panic!("no leaf {i} within 60s"))
+                .unwrap()
+                .0;
             assert_eq!(leaf.height(), i);
             assert_eq!(leaf, client.leaf(i).await.unwrap());
         }

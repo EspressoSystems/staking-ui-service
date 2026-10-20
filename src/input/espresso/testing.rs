@@ -7,6 +7,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
+    time::Duration,
 };
 
 use alloy::{
@@ -439,9 +440,12 @@ pub const EPOCH_HEIGHT: u64 = 20;
 /// `TestNetwork::new` returns after the server binds its port but before it accepts, so requests
 /// sent in that window hang for several seconds.
 pub async fn wait_for_api(port: u16) {
-    Client::<Error, StaticVersion<0, 1>>::new(format!("http://localhost:{port}").parse().unwrap())
-        .connect(None)
-        .await;
+    let ready = Client::<Error, StaticVersion<0, 1>>::new(
+        format!("http://localhost:{port}").parse().unwrap(),
+    )
+    .connect(Some(Duration::from_secs(60)))
+    .await;
+    assert!(ready, "test network API on port {port} not ready after 60s");
 }
 
 pub async fn start_pos_network(
