@@ -34,6 +34,54 @@ Most common development tasks are invocable through `just`. For example:
 
 Run `just` by itself to see a list of all possible commands.
 
+### Branches
+
+There are three long-lived branches:
+
+- `main` is the main development branch. Almost all work should be done as PRs targeting `main`
+- `release-mainnet` is where we make releases to be deployed on Espresso mainnet. When changes on
+  `main` are stable enough and it's time to cut a release, rebase `release-mainnet`:
+
+  ```sh
+  git checkout release-mainnet
+  git pull
+  git rebase origin/main
+  git push
+  ```
+
+  Note that `release-mainnet` always tracks `main` and we never push or cherry-pick commits directly
+  to `release-mainnet`, so the rebase should always be a fast-forward, and force pushing should
+  never be required.
+
+  Once rebased, you can make a release tag in YYYYMMDD[-optional-description] format:
+
+  ```sh
+  git checkout release-mainnet
+  git tag 19700101
+  git push origin 19700101
+  ```
+
+  This will trigger the building of a Docker image with the same tag.
+
+- `release-decaf` is a branch that should always be a few commits ahead of `main`. It represents the
+  latest development, but with a few patches to handle Decaf-specific edge cases (mostly related to
+  the initial version of PoS which was never deployed in mainnet). To test changes in Decaf, make
+  sure `release-decaf` is up to date:
+
+  ```sh
+  git checkout release-decaf
+  git pull --rebase
+  git rebase origin/main
+  git push --force
+  ```
+
+  Note that because `release-decaf` is always _ahead_ of `main`, rebasing will require a force push.
+  Thus, it is important to ensure after rebasing that `release-decaf` has the expected commits
+  (`main` plus a few).
+
+  This will trigger the building of a Docker image with the `release-decaf` tag, which can be
+  deployed in Decaf for testing.
+
 ## Running
 
 The service can be run either as a native executable or as a Docker container. To build and run
