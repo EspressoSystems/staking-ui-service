@@ -523,7 +523,7 @@ mod test {
         testing::TestConfigBuilder,
     };
     use espresso_types::traits::PersistenceOptions;
-    use hotshot_query_service::data_source::SqlDataSource;
+    use hotshot_query_service::{data_source::SqlDataSource, testing::mocks::MOCK_UPGRADE};
     use hotshot_types::{data::EpochNumber, traits::block_contents::BlockHeader};
     use portpicker::pick_unused_port;
     use surf_disco::{Error, StatusCode};
@@ -626,7 +626,8 @@ mod test {
         let port = pick_unused_port().unwrap();
 
         // We need persistence so that we can restart the network and have it resume where it left
-        // off.
+        // off. Runs at MOCK_UPGRADE (0.1 -> 0.2): with espresso-network 0.6.3.x a single node
+        // restarted at 0.4 cannot fetch its forgotten fee accounts and never decides again.
         let storage = DataSource::create_storage().await;
         let persistence =
             <DataSource as TestableSequencerDataSource>::persistence_options(&storage);
@@ -638,7 +639,7 @@ mod test {
             .persistences([persistence.clone()])
             .network_config(TestConfigBuilder::default().build())
             .build();
-        let mut network = TestNetwork::new(config, UPGRADE).await;
+        let mut network = TestNetwork::new(config, MOCK_UPGRADE).await;
         wait_for_api(port).await;
 
         let opt = QueryServiceOptions {
@@ -699,7 +700,7 @@ mod test {
             .persistences([persistence])
             .network_config(TestConfigBuilder::default().build())
             .build();
-        let mut network = TestNetwork::new(config, UPGRADE).await;
+        let mut network = TestNetwork::new(config, MOCK_UPGRADE).await;
 
         // The same stream should pick up exactly where we left off.
         wait_for_leaves(&client, &mut leaves, next_leaf..next_leaf + 5).await;
