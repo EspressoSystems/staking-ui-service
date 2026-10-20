@@ -362,19 +362,7 @@ mod test {
     use vbs::version::{StaticVersion, StaticVersionType};
     use warp::Filter;
 
-    /// `hotshot_query_service::metrics::PrometheusMetrics::export` is now inherent rather than
-    /// a `tide_disco::metrics::Metrics` impl, so `Api::metrics`'s `T: Metrics` bound needs this
-    /// wrapper to delegate back to it.
-    #[derive(Clone)]
-    struct QueryServiceMetrics(PrometheusMetrics);
-
-    impl tide_disco::metrics::Metrics for QueryServiceMetrics {
-        type Error = hotshot_query_service::metrics::MetricsError;
-
-        fn export(&self) -> Result<String, Self::Error> {
-            self.0.export()
-        }
-    }
+    use crate::metrics::QueryServiceMetrics;
 
     #[test_log::test]
     fn test_parse_prometheus_all_fields() {

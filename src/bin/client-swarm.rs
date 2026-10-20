@@ -28,6 +28,7 @@ use staking_ui_service::{
         EspressoClient,
         client::{QueryServiceClient, QueryServiceOptions},
     },
+    metrics::QueryServiceMetrics,
     types::{
         common::L1BlockId,
         global::{
@@ -457,20 +458,6 @@ impl Client {
     fn sample_duration(&mut self, from: Duration) -> Duration {
         let jitter = self.rng.gen_range(-self.opt.jitter..=self.opt.jitter) as f64;
         Duration::from_millis(((from.as_millis() as f64) * (1f64 + jitter)) as u64)
-    }
-}
-
-/// `hotshot_query_service::metrics::PrometheusMetrics::export` is now inherent rather than a
-/// `tide_disco::metrics::Metrics` impl, so `Api::metrics`'s `T: Metrics` bound needs this
-/// wrapper to delegate back to it.
-#[derive(Clone)]
-struct QueryServiceMetrics(PrometheusMetrics);
-
-impl tide_disco::metrics::Metrics for QueryServiceMetrics {
-    type Error = hotshot_query_service::metrics::MetricsError;
-
-    fn export(&self) -> Result<String, Self::Error> {
-        self.0.export()
     }
 }
 

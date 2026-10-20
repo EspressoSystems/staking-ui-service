@@ -2,7 +2,23 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use hotshot_query_service::metrics::{
+    MetricsError, PrometheusMetrics as QueryServicePrometheusMetrics,
+};
 use prometheus::{Encoder, Gauge, IntGaugeVec, Opts, Registry, TextEncoder};
+
+/// Adapts hotshot-query-service's `PrometheusMetrics`, whose `export` is inherent, to the
+/// `tide_disco::metrics::Metrics` bound of `Api::metrics`.
+#[derive(Clone)]
+pub struct QueryServiceMetrics(pub QueryServicePrometheusMetrics);
+
+impl tide_disco::metrics::Metrics for QueryServiceMetrics {
+    type Error = MetricsError;
+
+    fn export(&self) -> Result<String, Self::Error> {
+        self.0.export()
+    }
+}
 
 /// Current Unix time in seconds, as a float for use directly in gauges.
 pub fn unix_now_secs() -> f64 {
