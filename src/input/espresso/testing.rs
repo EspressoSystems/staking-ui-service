@@ -7,6 +7,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
+    time::Duration,
 };
 
 use alloy::{
@@ -34,17 +35,18 @@ use hotshot_query_service::data_source::{SqlDataSource, sql::testing::TmpDb};
 use hotshot_types::{
     data::{EpochNumber, QuorumProposal2, QuorumProposalWrapper, ViewNumber},
     drb::DrbResult,
+    light_client::StateVerKey,
     simple_certificate::QuorumCertificate2,
     traits::signature_key::{SignatureKey, StateSignatureKey},
     utils::{epoch_from_block_number, is_transition_block, transition_block_for_epoch},
 };
-use jf_signature::schnorr::VerKey;
 use rand::{RngCore, SeedableRng, rngs::StdRng};
 use staking_cli::{
     DEV_MNEMONIC,
     demo::{DelegationConfig, StakingTransactions},
 };
-use vbs::version::Version;
+use surf_disco::Client;
+use vbs::version::{StaticVersion, Version};
 use versions::Upgrade;
 
 use crate::{
@@ -101,7 +103,7 @@ impl EspressoClient for MockEspressoClient {
                 let account = Address::from_word(address_bytes);
 
                 let stake_table_key = PubKey::generated_from_seed_indexed(seed, i).0;
-                let state_ver_key = VerKey::generated_from_seed_indexed(seed, i).0;
+                let state_ver_key = StateVerKey::generated_from_seed_indexed(seed, i).0;
 
                 let stake = ESPTokenAmount::from(1);
                 let node = RegisteredValidator {
@@ -433,6 +435,19 @@ impl EspressoPersistence for MemoryStorage {
 
 pub const EPOCH_HEIGHT: u64 = 20;
 
+/// Wait until the API server of a test network on `port` accepts requests.
+///
+/// `TestNetwork::new` returns after the server binds its port but before it accepts, so requests
+/// sent in that window hang for several seconds.
+pub async fn wait_for_api(port: u16) {
+    let ready = Client::<Error, StaticVersion<0, 1>>::new(
+        format!("http://localhost:{port}").parse().unwrap(),
+    )
+    .connect(Some(Duration::from_secs(60)))
+    .await;
+    assert!(ready, "test network API on port {port} not ready after 60s");
+}
+
 pub async fn start_pos_network(
     port: u16,
 ) -> (
@@ -496,6 +511,7 @@ pub async fn start_pos_network(
         .states([state])
         .build();
     let network = TestNetwork::new(config, UPGRADE).await;
+    wait_for_api(port).await;
 
     (network, deployment, storage)
 }

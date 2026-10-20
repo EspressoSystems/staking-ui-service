@@ -503,7 +503,10 @@ mod test {
 
     use crate::input::espresso::{
         State,
-        testing::{DEFAULT_TOKEN_SUPPLY, EPOCH_HEIGHT, MemoryStorage, UPGRADE, start_pos_network},
+        testing::{
+            DEFAULT_TOKEN_SUPPLY, EPOCH_HEIGHT, MemoryStorage, UPGRADE, start_pos_network,
+            wait_for_api,
+        },
     };
     use crate::metrics::PrometheusMetrics;
 
@@ -520,7 +523,7 @@ mod test {
         testing::TestConfigBuilder,
     };
     use espresso_types::traits::PersistenceOptions;
-    use hotshot_query_service::data_source::SqlDataSource;
+    use hotshot_query_service::{data_source::SqlDataSource, testing::mocks::MOCK_UPGRADE};
     use hotshot_types::{data::EpochNumber, traits::block_contents::BlockHeader};
     use portpicker::pick_unused_port;
     use surf_disco::{Error, StatusCode};
@@ -576,6 +579,7 @@ mod test {
                 )
                 .build();
             let mut network = TestNetwork::new(config, UPGRADE).await;
+            wait_for_api(port).await;
 
             let opt = QueryServiceOptions::new(format!("http://localhost:{port}").parse().unwrap());
             let client = QueryServiceClient::new(opt, DEFAULT_TOKEN_SUPPLY)
@@ -603,6 +607,7 @@ mod test {
             .network_config(TestConfigBuilder::default().build())
             .build();
         let network = TestNetwork::new(config, UPGRADE).await;
+        wait_for_api(port).await;
 
         let opt = QueryServiceOptions::new(format!("http://localhost:{port}").parse().unwrap());
         let client = QueryServiceClient::new(opt, DEFAULT_TOKEN_SUPPLY)
@@ -621,7 +626,8 @@ mod test {
         let port = pick_unused_port().unwrap();
 
         // We need persistence so that we can restart the network and have it resume where it left
-        // off.
+        // off. Runs at MOCK_UPGRADE (0.1 -> 0.2): with espresso-network 0.6.3.x a single node
+        // restarted at 0.4 cannot fetch its forgotten fee accounts and never decides again.
         let storage = DataSource::create_storage().await;
         let persistence =
             <DataSource as TestableSequencerDataSource>::persistence_options(&storage);
@@ -633,7 +639,8 @@ mod test {
             .persistences([persistence.clone()])
             .network_config(TestConfigBuilder::default().build())
             .build();
-        let mut network = TestNetwork::new(config, UPGRADE).await;
+        let mut network = TestNetwork::new(config, MOCK_UPGRADE).await;
+        wait_for_api(port).await;
 
         let opt = QueryServiceOptions {
             polling_interval: if ws {
@@ -693,7 +700,7 @@ mod test {
             .persistences([persistence])
             .network_config(TestConfigBuilder::default().build())
             .build();
-        let mut network = TestNetwork::new(config, UPGRADE).await;
+        let mut network = TestNetwork::new(config, MOCK_UPGRADE).await;
 
         // The same stream should pick up exactly where we left off.
         wait_for_leaves(&client, &mut leaves, next_leaf..next_leaf + 5).await;
@@ -722,7 +729,11 @@ mod test {
     ) {
         for i in range {
             tracing::info!(i, "wait for leaf");
-            let leaf = leaves.next().await.unwrap().0;
+            let leaf = timeout(Duration::from_secs(60), leaves.next())
+                .await
+                .unwrap_or_else(|_| panic!("no leaf {i} within 60s"))
+                .unwrap()
+                .0;
             assert_eq!(leaf.height(), i);
             assert_eq!(leaf, client.leaf(i).await.unwrap());
         }
@@ -819,13 +830,10 @@ mod test {
             .membership_coordinator()
             .await
             .stake_table_for_epoch(Some(epoch))
-            .await
             .unwrap()
             .coordinator
             .membership()
-            .read()
-            .await
-            .active_validators(&epoch)
+            .active_validators(epoch)
             .unwrap()
     }
 }

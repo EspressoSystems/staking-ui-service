@@ -3,12 +3,16 @@
 use super::options::L1ClientOptions;
 use crate::Result;
 use alloy::{
-    rpc::json_rpc::{RequestPacket, ResponsePacket},
-    transports::{RpcError, TransportErrorKind, http::Http},
+    rpc::json_rpc::{ErrorPayload, RequestPacket, ResponsePacket},
+    transports::{HttpError, RpcError, TransportErrorKind, http::Http},
 };
 use futures::Future;
 use parking_lot::RwLock;
-use std::{pin::Pin, sync::Arc, time::Instant};
+use std::{
+    pin::Pin,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tide_disco::Url;
 use tokio::sync::Notify;
 use tower_service::Service;
@@ -41,6 +45,7 @@ pub(crate) struct SingleTransport {
 pub(crate) struct SingleTransportStatus {
     last_failure: Option<Instant>,
     consecutive_failures: usize,
+    consecutive_rate_limits: usize,
     rate_limited_until: Option<Instant>,
     /// Whether or not this current transport is being shut down (switching to the next transport)
     shutting_down: bool,
@@ -117,6 +122,30 @@ impl SingleTransportStatus {
     /// Log a successful call to the inner transport
     fn log_success(&mut self) {
         self.consecutive_failures = 0;
+        self.consecutive_rate_limits = 0;
+    }
+
+    /// Log a rate limit, backing off until `until`. Returns whether or not the transport should
+    /// be switched to the next URL.
+    ///
+    /// Only a rate limit arriving after the previous backoff elapsed counts towards
+    /// [`MAX_CONSECUTIVE_RATE_LIMITS`]. Requests already in flight when a backoff started say
+    /// nothing new about the provider.
+    fn log_rate_limit(&mut self, until: Instant) -> bool {
+        let outlived_backoff = self
+            .rate_limited_until
+            .is_none_or(|prev| Instant::now() >= prev);
+        self.rate_limited_until = Some(until);
+        if !outlived_backoff {
+            return false;
+        }
+
+        self.consecutive_rate_limits += 1;
+        if self.shutting_down || self.consecutive_rate_limits < MAX_CONSECUTIVE_RATE_LIMITS {
+            return false;
+        }
+        self.shutting_down = true;
+        true
     }
 
     /// Log a failure to call the inner transport. Returns whether or not the transport should be switched to the next URL
@@ -177,15 +206,64 @@ impl SingleTransportStatus {
     }
 }
 
+/// Provider health signal of a single transport response.
+#[derive(Debug, PartialEq, Eq)]
+enum ResponseOutcome {
+    Success,
+    /// Back off rather than fail over, up to [`MAX_CONSECUTIVE_RATE_LIMITS`].
+    RateLimited {
+        retry_after: Option<Duration>,
+    },
+    /// The request itself is over the provider's result cap. Every provider rejects it the same
+    /// way, so it counts as neither success nor failure.
+    RequestRejected,
+    Failure,
+}
+
+/// Rate limits, each arriving after the previous backoff elapsed, before a provider is treated as
+/// failed. Bounds how long the client stays on a provider whose quota is exhausted.
+const MAX_CONSECUTIVE_RATE_LIMITS: usize = 2;
+
+/// Cap on a server-requested `Retry-After`, matching alloy's `MAX_BACKOFF_HINT`.
+const MAX_RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(300);
+
+type TransportResult = std::result::Result<ResponsePacket, RpcError<TransportErrorKind>>;
+
+/// Whether the request asks for more results than the provider's cap.
+fn is_request_rejection(err: &ErrorPayload) -> bool {
+    err.message.contains("query returned more than")
+}
+
+/// Score a transport result for provider health.
+///
+/// alloy returns a non-2xx response whose body parses as a JSON-RPC error as `Ok`, dropping the
+/// HTTP status and `Retry-After`, so the payload decides the outcome.
+fn classify(result: &TransportResult) -> ResponseOutcome {
+    match result {
+        Ok(res) => match res.as_error() {
+            None => ResponseOutcome::Success,
+            // Checked before `is_retry_err`, which treats every `-32005` as a rate limit.
+            Some(err) if is_request_rejection(err) => ResponseOutcome::RequestRejected,
+            Some(err) if err.is_retry_err() => ResponseOutcome::RateLimited { retry_after: None },
+            Some(_) => ResponseOutcome::Failure,
+        },
+        Err(RpcError::Transport(kind))
+            if kind
+                .as_http_error()
+                .is_some_and(HttpError::is_rate_limit_err) =>
+        {
+            ResponseOutcome::RateLimited {
+                retry_after: kind.retry_after(),
+            }
+        }
+        Err(_) => ResponseOutcome::Failure,
+    }
+}
+
 impl Service<RequestPacket> for SwitchingTransport {
     type Error = RpcError<TransportErrorKind>;
     type Response = ResponsePacket;
-    type Future = Pin<
-        Box<
-            dyn Future<Output = std::result::Result<ResponsePacket, RpcError<TransportErrorKind>>>
-                + Send,
-        >,
-    >;
+    type Future = Pin<Box<dyn Future<Output = TransportResult> + Send>>;
 
     fn poll_ready(
         &mut self,
@@ -221,55 +299,255 @@ impl Service<RequestPacket> for SwitchingTransport {
 
             // If we've been rate limited, back off until the limit (hopefully) expires.
             let rate_limit_until = current_transport.status.read().rate_limited_until;
-            if let Some(t) = rate_limit_until {
-                if t > Instant::now() {
-                    // Return an error with a non-standard code to indicate client-side rate limit.
-                    return Err(RpcError::Transport(TransportErrorKind::Custom(
-                        "Rate limit exceeded".into(),
-                    )));
-                } else {
-                    // Reset the rate limit if we are passed it so we don't check every time
-                    current_transport.status.write().rate_limited_until = None;
-                }
+            if rate_limit_until.is_some_and(|t| t > Instant::now()) {
+                // Return an error with a non-standard code to indicate client-side rate limit.
+                return Err(RpcError::Transport(TransportErrorKind::Custom(
+                    "Rate limit exceeded".into(),
+                )));
             }
 
-            // Call the inner client, match on the result
-            match current_transport.client.call(req).await {
-                Ok(res) => {
-                    // If it's okay, log the success to the status
+            let result = current_transport.client.call(req).await;
+            let error = result.as_ref().ok().and_then(ResponsePacket::as_error);
+            let transport_err = result.as_ref().err();
+            let should_switch = match classify(&result) {
+                ResponseOutcome::Success => {
                     current_transport.status.write().log_success();
-                    Ok(res)
+                    false
                 }
-                Err(err) => {
-                    // Treat rate limited errors specially; these should not cause failover, but instead
-                    // should only cause us to temporarily back off on making requests to the RPC
-                    // server.
-                    if let RpcError::ErrorResp(e) = &err {
-                        // 429 == Too Many Requests
-                        if e.code == 429 {
-                            current_transport.status.write().rate_limited_until =
-                                Some(Instant::now() + self_clone.opt.rate_limit_delay());
-                            return Err(err);
-                        }
+                ResponseOutcome::RequestRejected => {
+                    tracing::warn!(?error, "L1 rejected the request");
+                    false
+                }
+                ResponseOutcome::RateLimited { retry_after } => {
+                    let backoff = retry_after.map_or(self_clone.opt.rate_limit_delay(), |d| {
+                        d.min(MAX_RATE_LIMIT_BACKOFF)
+                    });
+                    let mut status = current_transport.status.write();
+                    let should_switch = status.log_rate_limit(Instant::now() + backoff);
+                    if should_switch {
+                        tracing::warn!(
+                            consecutive = status.consecutive_rate_limits,
+                            "L1 still rate limiting after its own backoff, failing over"
+                        );
+                    } else {
+                        tracing::debug!(?backoff, "L1 rate limited");
                     }
-
-                    // Log the error and indicate a failure
-                    tracing::warn!(?err, "L1 client error");
-
-                    // If the transport should switch, do so. We don't need to worry about
-                    // race conditions here, since it will only return true once.
-                    if current_transport
+                    should_switch
+                }
+                ResponseOutcome::Failure => {
+                    tracing::warn!(?error, ?transport_err, "L1 client error");
+                    current_transport
                         .status
                         .write()
                         .log_failure(&self_clone.opt)
-                    {
-                        tracing::info!("Switching to next L1 provider due to failures");
-                        self_clone.switch_to(current_transport.generation + 1, current_transport);
-                    }
-
-                    Err(err)
                 }
+            };
+
+            // Only one caller sees `true`, so this switches at most once per generation.
+            if should_switch {
+                tracing::info!("Switching to next L1 provider");
+                self_clone.switch_to(current_transport.generation + 1, current_transport);
             }
+
+            result
         })
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use alloy::rpc::json_rpc::{Id, Request};
+    use std::{
+        net::Ipv4Addr,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+    use tokio::net::TcpListener;
+    use warp::{Filter, http::StatusCode};
+
+    const SUCCESS: &str = r#"{"jsonrpc":"2.0","id":1,"result":"0x1"}"#;
+    const RATE_LIMITED: &str =
+        r#"{"jsonrpc":"2.0","id":1,"error":{"code":429,"message":"Too Many Requests"}}"#;
+    const RESULT_CAP: &str = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32005,"message":"query returned more than 10000 results. Try with this block range [0x1500000, 0x15000FA]."}}"#;
+
+    fn packet(body: &str) -> ResponsePacket {
+        serde_json::from_str(body).expect("valid JSON-RPC response fixture")
+    }
+
+    fn request() -> RequestPacket {
+        Request::new("eth_blockNumber", Id::Number(1), ())
+            .serialize()
+            .unwrap()
+            .into()
+    }
+
+    /// Serve `body` with `status` on a local port and count the requests it receives.
+    async fn mock_provider(status: StatusCode, body: &'static str) -> (Url, Arc<AtomicUsize>) {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        let route = warp::any().map(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            warp::reply::with_status(
+                warp::reply::with_header(body, "content-type", "application/json"),
+                status,
+            )
+        });
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(warp::serve(route).incoming(listener).run());
+        (format!("http://{addr}").parse().unwrap(), hits)
+    }
+
+    /// A transport whose primary provider answers with `status` and `body`, backed by a healthy
+    /// second provider.
+    async fn transport(
+        status: StatusCode,
+        body: &'static str,
+        opt: L1ClientOptions,
+    ) -> (SwitchingTransport, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let (primary, primary_hits) = mock_provider(status, body).await;
+        let (backup, backup_hits) = mock_provider(StatusCode::OK, SUCCESS).await;
+        let transport = SwitchingTransport::new(L1ClientOptions {
+            http_providers: vec![primary, backup],
+            ..opt
+        })
+        .unwrap();
+        (transport, primary_hits, backup_hits)
+    }
+
+    fn generation(transport: &SwitchingTransport) -> usize {
+        transport.current_transport.read().generation
+    }
+
+    #[test]
+    fn classify_success_response() {
+        assert_eq!(classify(&Ok(packet(SUCCESS))), ResponseOutcome::Success);
+    }
+
+    #[test]
+    fn classify_error_body_as_failure() {
+        let res = packet(
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32600,"message":"App is inactive"}}"#,
+        );
+        assert_eq!(classify(&Ok(res)), ResponseOutcome::Failure);
+    }
+
+    #[test]
+    fn classify_rate_limit_body() {
+        assert_eq!(
+            classify(&Ok(packet(RATE_LIMITED))),
+            ResponseOutcome::RateLimited { retry_after: None }
+        );
+        let infura = packet(
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32005,"message":"project ID request rate exceeded"}}"#,
+        );
+        assert_eq!(
+            classify(&Ok(infura)),
+            ResponseOutcome::RateLimited { retry_after: None }
+        );
+    }
+
+    #[test]
+    fn classify_result_cap_as_rejection() {
+        assert_eq!(
+            classify(&Ok(packet(RESULT_CAP))),
+            ResponseOutcome::RequestRejected
+        );
+    }
+
+    #[test]
+    fn classify_non_json_429_with_retry_after() {
+        let retry_after = Duration::from_secs(7);
+        let err = TransportErrorKind::http_error_with_retry_after(
+            429,
+            "rate limited".into(),
+            Some(retry_after),
+        );
+        assert_eq!(
+            classify(&Err(err)),
+            ResponseOutcome::RateLimited {
+                retry_after: Some(retry_after)
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dead_key_fails_over() {
+        let dead_key =
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32600,"message":"invalid API key"}}"#;
+        let (mut transport, primary_hits, backup_hits) =
+            transport(StatusCode::UNAUTHORIZED, dead_key, Default::default()).await;
+
+        // The second failure within `l1_frequent_failure_tolerance` triggers the switch.
+        for _ in 0..2 {
+            transport.call(request()).await.unwrap();
+        }
+        assert_eq!(generation(&transport), 1);
+
+        let res = transport.call(request()).await.unwrap();
+        assert!(!res.is_error());
+        assert_eq!(primary_hits.load(Ordering::SeqCst), 2);
+        assert_eq!(backup_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_rate_limit_backs_off() {
+        let opt = L1ClientOptions {
+            l1_rate_limit_delay: Some(Duration::from_secs(60)),
+            ..Default::default()
+        };
+        let (mut transport, primary_hits, backup_hits) =
+            transport(StatusCode::TOO_MANY_REQUESTS, RATE_LIMITED, opt).await;
+
+        transport.call(request()).await.unwrap();
+        let err = transport.call(request()).await.unwrap_err();
+        assert!(err.to_string().contains("Rate limit exceeded"), "{err}");
+
+        assert_eq!(generation(&transport), 0);
+        assert_eq!(primary_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(backup_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn test_repeated_rate_limits_fail_over() {
+        let delay = Duration::from_millis(50);
+        let opt = L1ClientOptions {
+            l1_rate_limit_delay: Some(delay),
+            ..Default::default()
+        };
+        let (mut transport, primary_hits, backup_hits) =
+            transport(StatusCode::TOO_MANY_REQUESTS, RATE_LIMITED, opt).await;
+
+        for _ in 0..MAX_CONSECUTIVE_RATE_LIMITS {
+            transport.call(request()).await.unwrap();
+            tokio::time::sleep(delay).await;
+        }
+        assert_eq!(generation(&transport), 1);
+
+        let res = transport.call(request()).await.unwrap();
+        assert!(!res.is_error());
+        assert_eq!(
+            primary_hits.load(Ordering::SeqCst),
+            MAX_CONSECUTIVE_RATE_LIMITS
+        );
+        assert_eq!(backup_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_request_rejection_does_not_fail_over() {
+        let opt = L1ClientOptions {
+            l1_consecutive_failure_tolerance: 1,
+            ..Default::default()
+        };
+        let (mut transport, primary_hits, backup_hits) =
+            transport(StatusCode::OK, RESULT_CAP, opt).await;
+
+        for _ in 0..3 {
+            let res = transport.call(request()).await.unwrap();
+            assert!(res.is_error());
+        }
+        assert_eq!(generation(&transport), 0);
+        assert_eq!(primary_hits.load(Ordering::SeqCst), 3);
+        assert_eq!(backup_hits.load(Ordering::SeqCst), 0);
     }
 }

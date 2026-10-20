@@ -28,6 +28,7 @@ use staking_ui_service::{
         EspressoClient,
         client::{QueryServiceClient, QueryServiceOptions},
     },
+    metrics::QueryServiceMetrics,
     types::{
         common::L1BlockId,
         global::{
@@ -480,7 +481,7 @@ async fn main() -> anyhow::Result<()> {
     let (send_result, recv_result) = unbounded();
     let client = InstrumentedHTTPClient::new(opt.url.join("/v0/staking/")?, send_result);
 
-    let mut app = App::<_, Error>::with_state(Arc::new(RwLock::new(registry)));
+    let mut app = App::<_, Error>::with_state(Arc::new(RwLock::new(QueryServiceMetrics(registry))));
     app.module::<Error, StaticVersion<0, 1>>("status", api)?
         .metrics("metrics", |_, registry| {
             async move { Ok(std::borrow::Cow::Borrowed(registry)) }.boxed()

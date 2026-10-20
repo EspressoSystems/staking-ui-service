@@ -345,7 +345,10 @@ pub fn parse_metadata_uri(uri: &str) -> Option<Url> {
 mod test {
     use std::{borrow::Cow, str::FromStr, sync::Arc};
 
-    use crate::types::common::{ImageSet, RatioSet};
+    use crate::{
+        metrics::QueryServiceMetrics,
+        types::common::{ImageSet, RatioSet},
+    };
 
     use super::*;
 
@@ -754,7 +757,9 @@ mod test {
                 .set(1);
         }
 
-        let mut app = tide_disco::App::<_, Error>::with_state(Arc::new(RwLock::new(metrics)));
+        let mut app = tide_disco::App::<_, Error>::with_state(Arc::new(RwLock::new(
+            QueryServiceMetrics(metrics),
+        )));
         let api = toml! {
             [route.metadata]
             PATH = ["/metadata"]
@@ -830,7 +835,7 @@ mod test {
                 .create(vec![expected.client_version.clone().unwrap()])
                 .set(1);
         }
-        let metrics_text = tide_disco::metrics::Metrics::export(&metrics).unwrap();
+        let metrics_text = metrics.export().unwrap();
 
         let json_route = {
             let json = json_content.clone();

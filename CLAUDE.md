@@ -36,7 +36,7 @@ This project uses `just` as the command runner. All commands should be run from 
 
 - Tests use `cargo nextest` rather than standard `cargo test`
 - The project uses Nix for dependency management (`nix develop` for a dev shell)
-- Minimum Rust version: 1.90
+- Minimum Rust version: 1.94.1
 - Docker builds only work on Linux; Mac users should use published images
 
 ## Architecture Overview
